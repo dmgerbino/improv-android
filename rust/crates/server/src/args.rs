@@ -1,0 +1,38 @@
+//! `improv-server`'s command line. Declarations only: `improv_cli`'s man page
+//! generator includes this file to build `improv-server(1)` from it.
+
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "improv-server",
+    // Not argv[0]: "improv.exe" on Windows would change every help text.
+    bin_name = "improv-server",
+    version,
+    about = "JSON HTTP API over an Improv model",
+    long_about = "Serve one model over HTTP/1.1 as JSON."
+)]
+pub struct Cli {
+    /// The model: a store file, postgres://USER@HOST/DB?model=NAME, or
+    /// duckdb:FILE?model=NAME, which the server holds open while it runs
+    #[arg(value_name = "model", default_value = "improv.db")]
+    pub model: String,
+    /// The address to listen on
+    #[arg(
+        value_name = "addr",
+        env = "IMPROV_ADDR",
+        default_value = "127.0.0.1:3000"
+    )]
+    pub addr: String,
+    /// Also serve the files in DIR (a web front end's build) at /, beside
+    /// the API; off by default
+    #[arg(long = "static", value_name = "DIR")]
+    pub static_dir: Option<std::path::PathBuf>,
+    /// Serve HTTPS with this certificate chain (PEM, the server's
+    /// certificate first); needs --tls-key
+    #[arg(long, value_name = "FILE", requires = "tls_key")]
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// The private key of --tls-cert (PEM: PKCS#8, PKCS#1 or SEC1)
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    pub tls_key: Option<std::path::PathBuf>,
+}

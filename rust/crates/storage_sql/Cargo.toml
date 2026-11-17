@@ -1,0 +1,39 @@
+[package]
+name = "improv_storage_sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "improv_storage_sql"
+path = "src/lib.rs"
+
+[dependencies]
+improv_core_model = { path = "../core_model" }
+improv_data_source = { path = "../data_source" }
+# The Postgres transport (TLS, sslmode), shared with the model store.
+improv_storage_pg = { path = "../storage_pg" }
+thiserror.workspace = true
+serde.workspace = true
+postgres = "0.19"
+
+[dependencies.duckdb]
+# Bundled DuckDB 2.0. It reads files 1.x wrote, but a file it creates is
+# 2.0-only (storage version 69; 1.5 reads up to 68).
+version = "1.20000.1"
+features = ["bundled"]
+
+[dependencies.rusqlite]
+# 0.41, Mentat's line: mentatdb 1.20.0 needs rusqlite ~0.41, and a second
+# bundled libsqlite3-sys cannot link beside it (`links = "sqlite3"`). Move
+# with Mentat. 0.41 bundles SQLite 3.54.1 (RUSTSEC-2026-0459).
+version = "0.41"
+features = ["bundled"]
+
+[dev-dependencies]
+serde_json.workspace = true
+
+# `cargo llvm-cov` on nightly sets `--cfg coverage_nightly`; test modules are
+# `coverage(off)` so the report measures library code only.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

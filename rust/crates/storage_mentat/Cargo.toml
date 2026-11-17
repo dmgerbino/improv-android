@@ -1,0 +1,28 @@
+[package]
+name = "improv_storage_mentat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "improv_storage_mentat"
+path = "src/lib.rs"
+
+[dependencies]
+improv_core_model = { path = "../core_model" }
+chrono.workspace = true
+mentat.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Test-only: proves load_partial's output is an ordinary Model that
+# engine::dataflow::evaluate needs zero changes to consume (no runtime
+# dependency; storage_mentat's public API has no engine coupling).
+improv_engine = { path = "../engine" }
+
+# `cargo llvm-cov` on nightly sets `--cfg coverage_nightly`; test modules are
+# `coverage(off)` so the report measures library code only.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

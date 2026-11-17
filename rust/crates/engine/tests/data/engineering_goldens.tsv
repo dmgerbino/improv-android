@@ -1,0 +1,565 @@
+formula	expected	source
+BIN2DEC("1100100")	100	LibreOffice
+BIN2DEC("1111111111")	-1	LibreOffice
+BIN2DEC(101)	5	LibreOffice
+BIN2DEC("")	0	LibreOffice
+BIN2DEC("11111111111")	{"error": "#NUM!"}	LibreOffice
+BIN2DEC("2")	{"error": "#NUM!"}	LibreOffice
+BIN2HEX("11111011",4)	"00FB"	LibreOffice
+BIN2HEX("1110")	"E"	LibreOffice
+BIN2HEX("1111111111")	"FFFFFFFFFF"	LibreOffice
+BIN2HEX("1111111111",3)	"FFFFFFFFFF"	LibreOffice
+BIN2HEX("1",0)	{"error": "#NUM!"}	LibreOffice
+BIN2HEX("1",10.9)	"0000000001"	LibreOffice
+BIN2OCT("1001",3)	"011"	LibreOffice
+BIN2OCT("1100100")	"144"	LibreOffice
+BIN2OCT("1111111111")	"7777777777"	LibreOffice
+BIN2OCT("1001",1)	{"error": "#NUM!"}	LibreOffice
+DEC2BIN(9,4)	"1001"	LibreOffice
+DEC2BIN(-100)	"1110011100"	LibreOffice
+DEC2BIN(9.9)	"1001"	LibreOffice
+DEC2BIN(-512)	"1000000000"	LibreOffice
+DEC2BIN(512)	{"error": "#NUM!"}	LibreOffice
+DEC2BIN(3,0)	{"error": "#NUM!"}	LibreOffice
+DEC2BIN(-3,11)	{"error": "#NUM!"}	LibreOffice
+DEC2HEX(100,4)	"0064"	LibreOffice
+DEC2HEX(-54)	"FFFFFFFFCA"	LibreOffice
+DEC2HEX(28)	"1C"	LibreOffice
+DEC2HEX(549755813887)	"7FFFFFFFFF"	LibreOffice
+DEC2HEX(549755813888)	{"error": "#NUM!"}	LibreOffice
+DEC2HEX(64,1)	{"error": "#NUM!"}	LibreOffice
+DEC2OCT(58,3)	"072"	LibreOffice
+DEC2OCT(-100)	"7777777634"	LibreOffice
+DEC2OCT(536870911)	"3777777777"	LibreOffice
+DEC2OCT(-536870913)	{"error": "#NUM!"}	LibreOffice
+DEC2OCT(0)	"0"	LibreOffice
+HEX2BIN("F",8)	"00001111"	LibreOffice
+HEX2BIN("B7")	"10110111"	LibreOffice
+HEX2BIN("FFFFFFFE00")	"1000000000"	LibreOffice
+HEX2BIN("FFFFFFFDFF")	{"error": "#NUM!"}	LibreOffice
+HEX2BIN("200")	{"error": "#NUM!"}	LibreOffice
+HEX2DEC("A5")	165	LibreOffice
+HEX2DEC("FFFFFFFF5B")	-165	LibreOffice
+HEX2DEC("3DA408B9")	1034160313	LibreOffice
+HEX2DEC("fffffffffe")	-2	LibreOffice
+HEX2DEC("G")	{"error": "#NUM!"}	LibreOffice
+HEX2DEC("12345678901")	{"error": "#NUM!"}	LibreOffice
+HEX2OCT("F",3)	"017"	LibreOffice
+HEX2OCT("3B4E")	"35516"	LibreOffice
+HEX2OCT("FFFFFFFF00")	"7777777400"	LibreOffice
+HEX2OCT("FFDFFFFFFF")	{"error": "#NUM!"}	LibreOffice
+OCT2BIN("3",3)	"011"	LibreOffice
+OCT2BIN("7777777000")	"1000000000"	LibreOffice
+OCT2BIN("1000")	{"error": "#NUM!"}	LibreOffice
+OCT2BIN("8")	{"error": "#NUM!"}	LibreOffice
+OCT2DEC("54")	44	LibreOffice
+OCT2DEC("7777777533")	-165	LibreOffice
+OCT2DEC("4000000000")	-536870912	LibreOffice
+OCT2DEC("19")	{"error": "#NUM!"}	LibreOffice
+OCT2HEX("100",4)	"0040"	LibreOffice
+OCT2HEX("7777777533")	"FFFFFFFF5B"	LibreOffice
+OCT2HEX("7777777777")	"FFFFFFFFFF"	LibreOffice
+OCT2HEX("1",11)	{"error": "#NUM!"}	LibreOffice
+BASE(7,2)	"111"	LibreOffice
+BASE(100,16)	"64"	LibreOffice
+BASE(15,2,10)	"0000001111"	LibreOffice
+BASE(5.9,2)	"101"	LibreOffice
+BASE(-1,2)	{"error": "#NUM!"}	LibreOffice
+BASE(5,37)	{"error": "#NUM!"}	LibreOffice
+BASE(5,2.9)	"101"	LibreOffice
+BASE(35,36)	"Z"	LibreOffice
+DECIMAL("FF",16)	255	LibreOffice
+DECIMAL("111",2)	7	LibreOffice
+DECIMAL("zap",36)	45745	LibreOffice
+DECIMAL("12",2)	{"error": "#NUM!"}	LibreOffice
+DECIMAL("",2)	0	LibreOffice
+DECIMAL("ff",16.9)	255	LibreOffice
+DECIMAL("1",1)	{"error": "#NUM!"}	LibreOffice
+BASE(9007199254740992,2)	{"error": "#NUM!"}	Excel docs
+BASE(5,2,256)	{"error": "#NUM!"}	Excel docs
+BITAND(1,5)	1	LibreOffice
+BITAND(13,25)	9	LibreOffice
+BITAND(3.9,3)	3	LibreOffice
+BITAND(-1,1)	{"error": "#NUM!"}	LibreOffice
+BITAND(281474976710656,1)	{"error": "#NUM!"}	LibreOffice
+BITAND(281474976710655,255)	255	LibreOffice
+BITOR(23,10)	31	LibreOffice
+BITOR(0,0)	0	LibreOffice
+BITOR(-1,0)	{"error": "#NUM!"}	LibreOffice
+BITOR(281474976710655,1)	281474976710655	LibreOffice
+BITXOR(5,3)	6	LibreOffice
+BITXOR(5,5)	0	LibreOffice
+BITXOR(1,281474976710656)	{"error": "#NUM!"}	LibreOffice
+BITXOR(12.5,10)	6	LibreOffice
+BITLSHIFT(4,2)	16	LibreOffice
+BITLSHIFT(5,-2)	1	LibreOffice
+BITLSHIFT(1,2.9)	4	LibreOffice
+BITLSHIFT(8,-2.5)	1	LibreOffice
+BITLSHIFT(281474976710655,53)	2.5353012004564498e+30	LibreOffice
+BITLSHIFT(-1,2)	{"error": "#NUM!"}	LibreOffice
+BITRSHIFT(13,2)	3	LibreOffice
+BITRSHIFT(13,-2)	52	LibreOffice
+BITRSHIFT(16,1.5)	8	LibreOffice
+BITRSHIFT(281474976710656,1)	{"error": "#NUM!"}	LibreOffice
+BITRSHIFT(1,54)	{"error": "#NUM!"}	Excel docs
+BITLSHIFT(1,60)	{"error": "#NUM!"}	Excel docs
+DELTA(5,4)	0	LibreOffice
+DELTA(5,5)	1	LibreOffice
+DELTA(0.5,0)	0	LibreOffice
+DELTA(0)	1	LibreOffice
+DELTA(-1,-1)	1	LibreOffice
+GESTEP(5,4)	1	LibreOffice
+GESTEP(5,5)	1	LibreOffice
+GESTEP(-4,-5)	1	LibreOffice
+GESTEP(-1)	0	LibreOffice
+GESTEP(0)	1	LibreOffice
+COMPLEX(3,4)	"3+4i"	LibreOffice
+COMPLEX(3,4,"j")	"3+4j"	LibreOffice
+COMPLEX(0,1)	"i"	LibreOffice
+COMPLEX(0,-1,"j")	"-j"	LibreOffice
+COMPLEX(0,0)	"0"	LibreOffice
+COMPLEX(1.5,0)	"1.5"	LibreOffice
+COMPLEX(3,4,"")	"3+4i"	LibreOffice
+COMPLEX(100000000000000000000,-2.5)	"1e+20-2.5i"	LibreOffice
+COMPLEX(0.00001,1)	"1e-05+i"	LibreOffice
+IMREAL("6-9i")	6	LibreOffice
+IMREAL("-i")	0	LibreOffice
+IMREAL(5)	5	LibreOffice
+IMREAL("1e2+3i")	100	LibreOffice
+IMREAL("1.+.5i")	1	LibreOffice
+IMREAL("1+2I")	{"error": "#NUM!"}	LibreOffice
+IMREAL(" 1+2i")	{"error": "#NUM!"}	LibreOffice
+IMREAL("")	{"error": "#NUM!"}	LibreOffice
+IMAGINARY("3+4i")	4	LibreOffice
+IMAGINARY("0-j")	-1	LibreOffice
+IMAGINARY(4)	0	LibreOffice
+IMAGINARY("-2.5j")	-2.5	LibreOffice
+IMAGINARY("3+4k")	{"error": "#NUM!"}	LibreOffice
+IMABS("5+12i")	13	LibreOffice
+IMABS("-3")	3	LibreOffice
+IMABS("i")	1	LibreOffice
+IMABS("x")	{"error": "#NUM!"}	LibreOffice
+IMARGUMENT("3+4i")	0.9272952180016122	LibreOffice
+IMARGUMENT("-1")	3.141592653589793	LibreOffice
+IMARGUMENT("-i")	-1.5707963267948966	LibreOffice
+IMARGUMENT("0")	{"error": "#NUM!"}	LibreOffice
+IMCONJUGATE("3+4i")	"3-4i"	LibreOffice
+IMCONJUGATE("-j")	"j"	LibreOffice
+IMCONJUGATE("3")	"3"	LibreOffice
+IMCONJUGATE("2i")	"-2i"	LibreOffice
+IMSUM("3+4i","5-3i")	"8+i"	LibreOffice
+IMSUM("0","-0")	"0"	LibreOffice
+IMSUM("1+j",2,"j")	"3+2j"	LibreOffice
+IMSUM("1",2,3)	"6"	LibreOffice
+IMSUM("1+i","q")	{"error": "#NUM!"}	LibreOffice
+IMPRODUCT("3+4i","5-3i")	"27+11i"	LibreOffice
+IMPRODUCT("1+2i",30)	"30+60i"	LibreOffice
+IMPRODUCT("i","i")	"-1"	LibreOffice
+IMPRODUCT("1+2j","j")	"-2+j"	LibreOffice
+IMPRODUCT("2")	"2"	LibreOffice
+IMSUB("13+4i","5+3i")	"8+i"	LibreOffice
+IMSUB(3,"1+j")	"2-j"	LibreOffice
+IMSUB("i","i")	"0"	LibreOffice
+IMSUB("1","0.99999")	"9.99999999995449e-06"	LibreOffice
+IMDIV("-238+240i","10+24i")	"5+12i"	LibreOffice
+IMDIV("1","i")	"-i"	LibreOffice
+IMDIV("1","0")	{"error": "#NUM!"}	LibreOffice
+IMDIV("2j","1+j")	"1+j"	LibreOffice
+IMPOWER("2+3i",3)	"-46+9.00000000000001i"	LibreOffice
+IMPOWER("i",2)	"-1+1.22464679914735e-16i"	LibreOffice
+IMPOWER("4",0.5)	"2"	LibreOffice
+IMPOWER("-4",0.5)	"1.22464679914735e-16+2i"	LibreOffice
+IMPOWER("0",0)	{"error": "#NUM!"}	LibreOffice
+IMPOWER("0",2)	"0"	LibreOffice
+IMPOWER("2+3i",-1.5)	"0.0140886601975169-0.145382710751927i"	LibreOffice
+IMSQRT("1+i")	"1.09868411346781+0.455089860562227i"	LibreOffice
+IMSQRT("-4")	"2i"	LibreOffice
+IMSQRT("4")	"2"	LibreOffice
+IMSQRT("-3+4j")	"1+2j"	LibreOffice
+IMSQRT("0")	"0"	LibreOffice
+IMEXP("1+i")	"1.46869393991589+2.28735528717884i"	LibreOffice
+IMEXP("0")	"1"	LibreOffice
+IMEXP("2.5-j")	"6.58222957819277-10.2512151905294j"	LibreOffice
+IMEXP("i")	"0.54030230586814+0.841470984807897i"	LibreOffice
+IMLN("3+4i")	"1.6094379124341+0.927295218001612i"	LibreOffice
+IMLN("-1")	"3.14159265358979i"	LibreOffice
+IMLN("0")	{"error": "#NUM!"}	LibreOffice
+IMLN("1")	"0"	LibreOffice
+IMLN("-2-2j")	"1.03972077083992-2.35619449019234j"	LibreOffice
+IMLOG10("3+4i")	"0.698970004336019+0.402719196273373i"	LibreOffice
+IMLOG10("100")	"2"	LibreOffice
+IMLOG10("-i")	"-0.682188176920921i"	LibreOffice
+IMLOG10("0")	{"error": "#NUM!"}	LibreOffice
+IMLOG2("3+4i")	"2.32192809488736+1.33780421245098i"	LibreOffice
+IMLOG2("8")	"3"	LibreOffice
+IMLOG2("-1+j")	"0.5+3.3992701063704j"	LibreOffice
+IMLOG2("0")	{"error": "#NUM!"}	LibreOffice
+IMSIN("4+3i")	"-7.61923172032141-6.548120040911i"	LibreOffice
+IMSIN("1")	"0.841470984807897"	LibreOffice
+IMSIN("i")	"1.1752011936438i"	LibreOffice
+IMSIN("1e19+i")	"-1.43053321878018-0.440589002759235i"	LibreOffice
+IMSIN("1e20")	{"error": "#NUM!"}	LibreOffice
+IMCOS("1+i")	"0.833730025131149-0.988897705762865i"	LibreOffice
+IMCOS("0")	"1"	LibreOffice
+IMCOS("-2.5j")	"6.13228947966369"	LibreOffice
+IMCOS("1e20")	{"error": "#NUM!"}	LibreOffice
+IMTAN("4+3i")	"0.00490825806749606+1.00070953606723i"	LibreOffice
+IMTAN("1")	"1.5574077246549"	LibreOffice
+IMTAN("6e18+i")	"0.253083037924011+0.927903543267361i"	LibreOffice
+IMTAN("1e19+i")	{"error": "#NUM!"}	LibreOffice
+IMTAN("-2j")	"-0.964027580075817j"	LibreOffice
+IMSEC("4+3i")	"-0.065294027857947-0.0752249603027732i"	LibreOffice
+IMSEC("1+i")	"0.498337030555187+0.591083841721045i"	LibreOffice
+IMSEC("0")	"1"	LibreOffice
+IMSEC("1e20")	{"error": "#NUM!"}	LibreOffice
+IMCSC("4+3i")	"-0.0754898329158637+0.0648774713706355i"	LibreOffice
+IMCSC("0")	{"error": "#NUM!"}	LibreOffice
+IMCSC("1-2j")	"0.228375065599687+0.141363021612408j"	LibreOffice
+IMCSC("2")	"1.09975017029462"	LibreOffice
+IMCOT("4+3i")	"0.00490118239430447-0.999266927805902i"	LibreOffice
+IMCOT("0")	{"error": "#NUM!"}	LibreOffice
+IMCOT("1")	"0.642092615934331"	LibreOffice
+IMCOT("-1+i")	"-0.217621561854403-0.868014142895925i"	LibreOffice
+IMSINH("4+3i")	"-27.0168132580039+3.85373803791938i"	LibreOffice
+IMSINH("1")	"1.1752011936438"	LibreOffice
+IMSINH("i")	"0.841470984807897i"	LibreOffice
+IMSINH("1+1e20i")	{"error": "#NUM!"}	LibreOffice
+IMCOSH("4+3i")	"-27.0349456030742+3.85115333481178i"	LibreOffice
+IMCOSH("0")	"1"	LibreOffice
+IMCOSH("2j")	"-0.416146836547142"	LibreOffice
+IMCOSH("1+1e20i")	{"error": "#NUM!"}	LibreOffice
+IMSECH("4+3i")	"-0.0362534969158689-0.00516434460775318i"	LibreOffice
+IMSECH("0")	"1"	LibreOffice
+IMSECH("1-j")	"0.498337030555187+0.591083841721045j"	LibreOffice
+IMSECH("1e20i")	{"error": "#NUM!"}	LibreOffice
+IMCSCH("4+3i")	"-0.036275889628626-0.0051744731840194i"	LibreOffice
+IMCSCH("1+i")	"0.303931001628426-0.621518017170428i"	LibreOffice
+IMCSCH("0")	{"error": "#NUM!"}	LibreOffice
+IMCSCH("-2")	"-0.275720564771783"	LibreOffice
+COMPLEX(3,4,"I")	{"error": "#VALUE!"}	Excel docs
+IMSUM("1+i","2+j")	{"error": "#VALUE!"}	Excel docs
+IMPRODUCT("1+2j","i")	{"error": "#VALUE!"}	Excel docs
+BESSELJ(1.9,2)	{"approx": 0.3299257276923874, "tol": 1e-09}	LibreOffice
+BESSELJ(1.9,2.9)	{"approx": 0.3299257276923874, "tol": 1e-09}	LibreOffice
+BESSELJ(-1.9,1)	{"approx": -0.5811570727134342, "tol": 1e-09}	LibreOffice
+BESSELJ(0,0)	{"approx": 1.0, "tol": 1e-09}	LibreOffice
+BESSELJ(0,3)	{"approx": 0.0, "tol": 1e-09}	LibreOffice
+BESSELJ(10,5)	{"approx": -0.23406152818679357, "tol": 1e-09}	LibreOffice
+BESSELJ(100,1)	{"approx": -0.07714535201411203, "tol": 1e-09}	LibreOffice
+BESSELJ(1,-1)	{"error": "#NUM!"}	LibreOffice
+BESSELJ(30,40)	{"approx": 0.0003612023608896586, "tol": 1e-09}	LibreOffice
+BESSELI(1.5,1)	{"approx": 0.9816664285779076, "tol": 1e-09}	LibreOffice
+BESSELI(-1.5,1)	{"approx": -0.9816664285779076, "tol": 1e-09}	LibreOffice
+BESSELI(0,0)	{"approx": 1.0, "tol": 1e-09}	LibreOffice
+BESSELI(10,3)	{"approx": 1758.3807166108534, "tol": 1e-09}	LibreOffice
+BESSELI(0.01,2)	{"approx": 1.2500104166992188e-05, "tol": 1e-09}	LibreOffice
+BESSELI(1,-1)	{"error": "#NUM!"}	LibreOffice
+BESSELI(50,0)	{"approx": 2.932553783849337e+20, "tol": 1e-09}	LibreOffice
+BESSELK(1.5,1)	{"approx": 0.27738780360270177, "tol": 1e-09}	LibreOffice
+BESSELK(0.5,0)	{"approx": 0.9244190721001453, "tol": 1e-09}	LibreOffice
+BESSELK(3,0)	{"approx": 0.03473950439930018, "tol": 1e-09}	LibreOffice
+BESSELK(5,4)	{"approx": 0.015259065780927417, "tol": 1e-09}	LibreOffice
+BESSELK(0.1,3)	{"approx": 7990.012432782981, "tol": 1e-09}	LibreOffice
+BESSELK(0,1)	{"error": "#NUM!"}	LibreOffice
+BESSELK(1,-1)	{"error": "#NUM!"}	LibreOffice
+BESSELK(2,2)	{"approx": 0.25375976, "tol": 1e-09}	LibreOffice
+BESSELY(2.5,1)	{"approx": 0.14591813796678593, "tol": 1e-09}	LibreOffice
+BESSELY(0.5,0)	{"approx": -0.4445187335067066, "tol": 1e-09}	LibreOffice
+BESSELY(10,3)	{"approx": -0.2513626571838375, "tol": 1e-09}	LibreOffice
+BESSELY(1,5)	{"approx": -260.4058666258123, "tol": 1e-09}	LibreOffice
+BESSELY(-1,1)	{"error": "#NUM!"}	LibreOffice
+BESSELY(1,-1)	{"error": "#NUM!"}	LibreOffice
+BESSELY(100,2)	{"approx": 0.07683686712502787, "tol": 1e-09}	LibreOffice
+CONVERT(1,"lbm","kg")	{"approx": 0.45359230974881065, "tol": 1e-05}	LibreOffice
+CONVERT(68,"F","C")	{"approx": 20.0, "tol": 1e-05}	LibreOffice
+CONVERT(2.5,"ft","sec")	{"error": "#N/A"}	LibreOffice
+CONVERT(1,"g","m")	{"error": "#N/A"}	LibreOffice
+CONVERT(1,"xyz","m")	{"error": "#N/A"}	LibreOffice
+CONVERT(1,"kmi","m")	{"error": "#N/A"}	LibreOffice
+CONVERT(1,"mibit","bit")	{"error": "#N/A"}	LibreOffice
+CONVERT(10,"ozm","g")	{"approx": 283.49515207973195, "tol": 1e-05}	LibreOffice
+CONVERT(1,"stone","lbm")	{"approx": 14.000005808559816, "tol": 1e-05}	LibreOffice
+CONVERT(1,"LTON","ton")	{"approx": 1.1199996840862367, "tol": 1e-05}	LibreOffice
+CONVERT(1,"sg","kg")	{"approx": 14.593842418928725, "tol": 1e-05}	LibreOffice
+CONVERT(1,"u","g")	{"approx": 1.6605401039531317e-24, "tol": 1e-05}	LibreOffice
+CONVERT(5.8,"m","in")	{"approx": 228.3464566929134, "tol": 1e-05}	LibreOffice
+CONVERT(1,"mi","km")	{"approx": 1.609344, "tol": 1e-05}	LibreOffice
+CONVERT(1,"Nmi","ft")	{"approx": 6076.115485564304, "tol": 1e-05}	LibreOffice
+CONVERT(72,"Pica","in")	{"approx": 1.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"pica","Pica")	{"approx": 11.999999999997199, "tol": 1e-05}	LibreOffice
+CONVERT(1,"survey_mi","mi")	{"approx": 1.000002000004, "tol": 1e-05}	LibreOffice
+CONVERT(1,"dam","m")	{"approx": 10.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"yr","day")	{"approx": 365.25, "tol": 1e-05}	LibreOffice
+CONVERT(90,"mn","hr")	{"approx": 1.5, "tol": 1e-05}	LibreOffice
+CONVERT(1,"ms","s")	{"approx": 0.001, "tol": 1e-05}	LibreOffice
+CONVERT(1,"atm","Pa")	{"approx": 101324.99658300001, "tol": 1e-05}	LibreOffice
+CONVERT(1,"atm","mmHg")	{"approx": 760.0000000000003, "tol": 1e-05}	LibreOffice
+CONVERT(1,"psi","kPa")	{"approx": 6.894759086775369, "tol": 1e-05}	LibreOffice
+CONVERT(1,"lbf","N")	{"approx": 4.448222000000003, "tol": 1e-05}	LibreOffice
+CONVERT(1,"N","dyn")	{"approx": 100000.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"pond","N")	{"approx": 0.009806652048217348, "tol": 1e-05}	LibreOffice
+CONVERT(7.9,"cal","J")	{"approx": 33.075679284500424, "tol": 1e-05}	LibreOffice
+CONVERT(1,"BTU","J")	{"approx": 1055.0581378674885, "tol": 1e-05}	LibreOffice
+CONVERT(1,"kWh","J")	{"approx": 3600000.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"eV","J")	{"approx": 1.6021900014692083e-19, "tol": 1e-05}	LibreOffice
+CONVERT(1,"HPh","J")	{"approx": 2684519.717051622, "tol": 1e-05}	LibreOffice
+CONVERT(1,"flb","J")	{"approx": 0.04214000032364231, "tol": 1e-05}	LibreOffice
+CONVERT(1,"c","cal")	{"approx": 0.9993303152875601, "tol": 1e-05}	LibreOffice
+CONVERT(1,"HP","W")	{"approx": 745.6999214032282, "tol": 1e-05}	LibreOffice
+CONVERT(1,"PS","W")	{"approx": 735.4985429773864, "tol": 1e-05}	LibreOffice
+CONVERT(1,"T","ga")	{"approx": 10000.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"mT","ga")	{"approx": 10.0, "tol": 1e-05}	LibreOffice
+CONVERT(100,"C","F")	{"approx": 212.0, "tol": 1e-05}	LibreOffice
+CONVERT(0,"K","C")	{"approx": -273.15, "tol": 1e-05}	LibreOffice
+CONVERT(32,"F","K")	{"approx": 273.15, "tol": 1e-05}	LibreOffice
+CONVERT(100,"C","Reau")	{"approx": 80.0, "tol": 1e-05}	LibreOffice
+CONVERT(491.67,"Rank","C")	{"approx": 0.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"mK","K")	{"approx": 0.001, "tol": 1e-05}	LibreOffice
+CONVERT(-500,"C","K")	{"approx": -226.85000000000002, "tol": 1e-05}	LibreOffice
+CONVERT(1,"gal","l")	{"approx": 3.7854117839999994, "tol": 1e-05}	LibreOffice
+CONVERT(1,"uk_gal","l")	{"approx": 4.54609, "tol": 1e-05}	LibreOffice
+CONVERT(1,"cup","tsp")	{"approx": 48.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"m3","l")	{"approx": 1000.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"ft3","in3")	{"approx": 1728.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"m^3","ft3")	{"approx": 35.31466672148859, "tol": 1e-05}	LibreOffice
+CONVERT(1,"barrel","gal")	{"approx": 42.00000000000001, "tol": 1e-05}	LibreOffice
+CONVERT(1,"ml","tspm")	{"approx": 0.2, "tol": 1e-05}	LibreOffice
+CONVERT(1,"cm3","ml")	{"approx": 1.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"m2","ft2")	{"approx": 10.763910416709722, "tol": 1e-05}	LibreOffice
+CONVERT(1,"mm2","m2")	{"approx": 1e-06, "tol": 1e-05}	LibreOffice
+CONVERT(1,"ha","ar")	{"approx": 100.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"uk_acre","m2")	{"approx": 4046.8564224, "tol": 1e-05}	LibreOffice
+CONVERT(1,"us_acre","m2")	{"approx": 4046.872609874252, "tol": 1e-05}	LibreOffice
+CONVERT(1,"Morgen","ha")	{"approx": 0.25, "tol": 1e-05}	LibreOffice
+CONVERT(1,"m^2","ft2")	{"approx": 10.763910416709722, "tol": 1e-05}	LibreOffice
+CONVERT(1,"byte","bit")	{"approx": 8.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"Gibyte","bit")	{"approx": 8589934592.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"kibyte","kbyte")	{"approx": 1.024, "tol": 1e-05}	LibreOffice
+CONVERT(3,"Yibyte","bit")	{"approx": 2.90142196707511e+25, "tol": 1e-05}	LibreOffice
+CONVERT(1,"cbyte","bit")	{"approx": 0.08, "tol": 1e-05}	LibreOffice
+CONVERT(1,"kn","m/s")	{"approx": 0.5144444444444444, "tol": 1e-05}	LibreOffice
+CONVERT(100,"km/h","mph")	{"approx": 62.13711922373341, "tol": 1e-05}	LibreOffice
+CONVERT(1,"m/s","m/hr")	{"approx": 3600.0, "tol": 1e-05}	LibreOffice
+CONVERT(1,"Torr","Pa")	{"approx": 133.32199207587408, "tol": 1e-05}	LibreOffice
+CONVERT(1,"p","Pa")	1	Excel docs
+CONVERT(1,"Picapt","in")	{"approx": 0.013888888888888888, "tol": 1e-12}	Excel docs
+HEXREP(1)	"000000000000f03f"	Gnumeric 1.12
+HEXREP(-2.5)	"00000000000004c0"	Gnumeric 1.12
+HEXREP(0)	"0000000000000000"	Gnumeric 1.12
+HEXREP(0.1)	"9a9999999999b93f"	Gnumeric 1.12
+IMREAL(IMTANH("1+i"))	{"approx": 1.0839233273386946, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMTANH("1+i"))	{"approx": 0.27175258531951174, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMTANH("0"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMTANH("0"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMTANH("2-3j"))	{"approx": 0.9653858790221331, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMTANH("2-3j"))	{"approx": 0.009884375038322492, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMTANH("0.5"))	{"approx": 0.46211715726000974, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMTANH("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMTANH("x")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMCOTH("1+i"))	{"approx": 0.868014142895925, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMCOTH("1+i"))	{"approx": -0.2176215618544027, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMCOTH("2-3j"))	{"approx": 1.0357466377649955, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMCOTH("2-3j"))	{"approx": -0.0106047834703371, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMCOTH("0.5"))	{"approx": 2.163953413738653, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMCOTH("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMCOTH("-i"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMCOTH("-i"))	{"approx": 0.6420926159343309, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMNEG("3+4i"))	{"approx": -3.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMNEG("3+4i"))	{"approx": -4.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMNEG("0"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMNEG("0"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMNEG("-j"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMNEG("-j"))	{"approx": 1.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMNEG("2"))	{"approx": -2.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMNEG("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMNEG("i5")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMINV("2"))	{"approx": 0.5, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMINV("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMINV("1+i"))	{"approx": 0.5, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMINV("1+i"))	{"approx": -0.5, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMINV("-2j"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMINV("-2j"))	{"approx": 0.5, "tol": 1e-13}	Gnumeric 1.12
+IMINV("0")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMARCSIN("1+i"))	{"approx": 0.6662394324925152, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSIN("1+i"))	{"approx": 1.0612750619050357, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSIN("0.5"))	{"approx": 0.5235987755982989, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSIN("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSIN("2"))	{"approx": 1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSIN("2"))	{"approx": -1.3169578969248166, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSIN("-2"))	{"approx": -1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSIN("-2"))	{"approx": 1.3169578969248166, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSIN("3-4j"))	{"approx": 0.6339838656391766, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSIN("3-4j"))	{"approx": -2.305509031243477, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSIN("0.1+0.1i"))	{"approx": 0.09966370285979514, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSIN("0.1+0.1i"))	{"approx": 0.10033029811220502, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOS("1+i"))	{"approx": 0.9045568943023814, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOS("1+i"))	{"approx": -1.0612750619050357, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOS("0.5"))	{"approx": 1.0471975511965979, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOS("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOS("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOS("2"))	{"approx": 1.3169578969248166, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOS("-2"))	{"approx": 3.141592653589793, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOS("-2"))	{"approx": -1.3169578969248166, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOS("-3+4j"))	{"approx": 2.204780192434073, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOS("-3+4j"))	{"approx": -2.305509031243477, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTAN("1+i"))	{"approx": 1.0172219678978514, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTAN("1+i"))	{"approx": 0.4023594781085251, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTAN("0.5"))	{"approx": 0.4636476090008061, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTAN("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTAN("2i"))	{"approx": 1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTAN("2i"))	{"approx": 0.5493061443340549, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTAN("-2i"))	{"approx": -1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTAN("-2i"))	{"approx": -0.5493061443340549, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTAN("0.5i"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTAN("0.5i"))	{"approx": 0.5493061443340549, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTAN("0.01+0.01i"))	{"approx": 0.010000666586655238, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTAN("0.01+0.01i"))	{"approx": 0.009999333253344764, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSEC("1+i"))	{"approx": 1.118517879643706, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSEC("1+i"))	{"approx": 0.5306375309525178, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSEC("2"))	{"approx": 1.0471975511965979, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSEC("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSEC("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSEC("0.5"))	{"approx": 1.3169578969248166, "tol": 1e-13}	Gnumeric 1.12
+IMARCSEC("0")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMARCCSC("1+i"))	{"approx": 0.4522784471511906, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCSC("1+i"))	{"approx": -0.5306375309525178, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCSC("2"))	{"approx": 0.5235987755982989, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCSC("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCSC("-0.5j"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCSC("-0.5j"))	{"approx": 1.4436354751788103, "tol": 1e-13}	Gnumeric 1.12
+IMARCCSC("0")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMARCCOT("1+i"))	{"approx": 0.5535743588970451, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOT("1+i"))	{"approx": -0.40235947810852507, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOT("0"))	{"approx": 1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOT("0"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOT("2"))	{"approx": 0.4636476090008061, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOT("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOT("-3j"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOT("-3j"))	{"approx": 0.3465735902799726, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSINH("1+i"))	{"approx": 1.0612750619050357, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSINH("1+i"))	{"approx": 0.6662394324925152, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSINH("0.5"))	{"approx": 0.48121182505960347, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSINH("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSINH("2i"))	{"approx": 1.3169578969248166, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSINH("2i"))	{"approx": 1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSINH("-3+j"))	{"approx": -1.8641615441578825, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSINH("-3+j"))	{"approx": 0.30760364953071123, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOSH("1+i"))	{"approx": 1.0612750619050357, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOSH("1+i"))	{"approx": 0.9045568943023814, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOSH("1"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOSH("1"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOSH("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOSH("0.5"))	{"approx": 1.0471975511965979, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOSH("2"))	{"approx": 1.3169578969248166, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOSH("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOSH("-2j"))	{"approx": 1.4436354751788103, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOSH("-2j"))	{"approx": -1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTANH("1+i"))	{"approx": 0.4023594781085251, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTANH("1+i"))	{"approx": 1.0172219678978514, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTANH("0.5"))	{"approx": 0.5493061443340548, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTANH("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTANH("2"))	{"approx": 0.5493061443340549, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTANH("2"))	{"approx": -1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCTANH("-2"))	{"approx": -0.5493061443340549, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTANH("-2"))	{"approx": 1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMARCTANH("1")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMARCTANH("0.5j"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCTANH("0.5j"))	{"approx": 0.4636476090008061, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSECH("1+i"))	{"approx": 0.5306375309525178, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSECH("1+i"))	{"approx": -1.118517879643706, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSECH("0.5"))	{"approx": 1.3169578969248166, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSECH("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCSECH("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCSECH("2"))	{"approx": 1.0471975511965979, "tol": 1e-13}	Gnumeric 1.12
+IMARCSECH("0")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMARCCSCH("1+i"))	{"approx": 0.5306375309525178, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCSCH("1+i"))	{"approx": -0.4522784471511906, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCSCH("2"))	{"approx": 0.48121182505960347, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCSCH("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCSCH("0.5j"))	{"approx": -1.3169578969248166, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCSCH("0.5j"))	{"approx": -1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMARCCSCH("0")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMARCCOTH("1+i"))	{"approx": 0.402359478108525, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOTH("1+i"))	{"approx": -0.5535743588970451, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOTH("2"))	{"approx": 0.5493061443340548, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOTH("2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOTH("0.5"))	{"approx": 0.5493061443340549, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOTH("0.5"))	{"approx": -1.5707963267948966, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMARCCOTH("3j"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMARCCOTH("3j"))	{"approx": -0.3217505543966422, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMFACT("0.5+i"))	{"approx": 0.5753151880634517, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMFACT("0.5+i"))	{"approx": 0.0882106775440939, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMFACT("4"))	{"approx": 24.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMFACT("4"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMFACT("-0.5+2i"))	{"approx": 0.08985517670643162, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMFACT("-0.5+2i"))	{"approx": -0.060493760292887555, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMFACT("i"))	{"approx": 0.49801566811835596, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMFACT("i"))	{"approx": -0.1549498283018106, "tol": 1e-13}	Gnumeric 1.12
+IMFACT("-1")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMGAMMA("1+i"))	{"approx": 0.49801566811835607, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMGAMMA("1+i"))	{"approx": -0.15494982830181062, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMGAMMA("5"))	{"approx": 24.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMGAMMA("5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMGAMMA("-1.5+0.5i"))	{"approx": 0.9379166627878849, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMGAMMA("-1.5+0.5i"))	{"approx": 0.3492056681478047, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMGAMMA("0.5"))	{"approx": 1.772453850905516, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMGAMMA("0.5"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMGAMMA("0")	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMGAMMA("3-4j"))	{"approx": 0.0052255384713691955, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMGAMMA("3-4j"))	{"approx": 0.17254707929430013, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("1+i","2"))	{"approx": 0.9459499409975437, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("1+i","2"))	{"approx": -0.2433966422573516, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("2","3"))	{"approx": 0.8008517265285442, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("2","3"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("2","3",FALSE))	{"approx": 0.19914827347145575, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("2","3",FALSE))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("2","3",TRUE,FALSE))	{"approx": 0.8008517265285442, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("2","3",TRUE,FALSE))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("1+i","2",FALSE,FALSE))	{"approx": 0.0646320441729587, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("1+i","2",FALSE,FALSE))	{"approx": 0.11284029404942611, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("-1","2"))	{"approx": 1.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("-1","2"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("0.5","-1"))	{"approx": 0.0, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("0.5","-1"))	{"approx": 1.6504257587975428, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("1+i","40",FALSE))	{"approx": -5.230149528251621e-18, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("1+i","40",FALSE))	{"approx": -6.24144095760944e-18, "tol": 1e-13}	Gnumeric 1.12
+IMIGAMMA("0","2",TRUE,FALSE)	{"error": "#NUM!"}	Gnumeric 1.12
+IMREAL(IMIGAMMA("2+i","10",FALSE))	{"approx": -0.00022935637022269972, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("2+i","10",FALSE))	{"approx": 0.000634081895893023, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("i","5+5i",FALSE))	{"approx": -0.00016879833040217562, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("i","5+5i",FALSE))	{"approx": -0.0007933469441129229, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("-2.5","3+4i",FALSE,FALSE))	{"approx": 9.637012829821767e-05, "tol": 1e-13}	Gnumeric 1.12
+IMAGINARY(IMIGAMMA("-2.5","3+4i",FALSE,FALSE))	{"approx": -7.072565277516096e-05, "tol": 1e-13}	Gnumeric 1.12
+IMREAL(IMIGAMMA("0.5","30+i",FALSE))	{"approx": 4.994315590065452e-15, "tol": 1e-13}	mpmath (Gnumeric 1.12 has the same cancellation: 1 - P)
+IMAGINARY(IMIGAMMA("0.5","30+i",FALSE))	{"approx": -8.061578686975159e-15, "tol": 1e-13}	mpmath (Gnumeric 1.12 has the same cancellation: 1 - P)
+IMREAL(IMIGAMMA("0.5","20+i",FALSE))	{"approx": 1.3200280447953534e-10, "tol": 1e-13}	mpmath (Gnumeric 1.12 has the same cancellation: 1 - P)
+IMAGINARY(IMIGAMMA("0.5","20+i",FALSE))	{"approx": -2.1679192612415704e-10, "tol": 1e-13}	mpmath (Gnumeric 1.12 has the same cancellation: 1 - P)
+IMREAL(IMIGAMMA("1+i","40",TRUE,FALSE))	{"approx": 0.49801566811835607, "tol": 1e-13}	mpmath (Gnumeric 1.12 gives 1, the regularized value)
+IMAGINARY(IMIGAMMA("1+i","40",TRUE,FALSE))	{"approx": -0.15494982830181067, "tol": 1e-13}	mpmath (Gnumeric 1.12 gives 1, the regularized value)
+IMREAL(IMIGAMMA("0","1+i",FALSE,FALSE))	{"approx": 0.00028162445198141834, "tol": 1e-13}	mpmath (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("0","1+i",FALSE,FALSE))	{"approx": -0.17932453503935894, "tol": 1e-13}	mpmath (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("0","-1",FALSE,FALSE))	{"approx": -1.8951178163559368, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("0","-1",FALSE,FALSE))	{"approx": -3.141592653589793, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("0","-2.5",FALSE,FALSE))	{"approx": -7.0737658945786, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("0","-2.5",FALSE,FALSE))	{"approx": -3.141592653589793, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("-1","-1",FALSE,FALSE))	{"approx": -0.8231640121031085, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("-1","-1",FALSE,FALSE))	{"approx": 3.141592653589793, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("-2","-0.5",FALSE,FALSE))	{"approx": 4.719053859668798, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("-2","-0.5",FALSE,FALSE))	{"approx": -1.5707963267948966, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("0.5","-2",FALSE,FALSE))	{"approx": 1.772453850905516, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("0.5","-2",FALSE,FALSE))	{"approx": -6.6876855256219745, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("2.5","-3",TRUE,FALSE))	{"approx": 0.0, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("2.5","-3",TRUE,FALSE))	{"approx": 63.15338421040687, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("0","-1+2i",FALSE,FALSE))	{"approx": -1.0421677081649356, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("0","-1+2i",FALSE,FALSE))	{"approx": 0.559908772348081, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("1.5","-4",TRUE,TRUE))	{"approx": 0.0, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("1.5","-4",TRUE,TRUE))	{"approx": -104.6500277041347, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("1+i","-3-4i",FALSE,TRUE))	{"approx": 265.7715639188388, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("1+i","-3-4i",FALSE,TRUE))	{"approx": -129.6121453555461, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMREAL(IMIGAMMA("-1.5+2i","-5",TRUE,FALSE))	{"approx": -0.004137817482752218, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+IMAGINARY(IMIGAMMA("-1.5+2i","-5",TRUE,FALSE))	{"approx": -0.004784288776890572, "tol": 1e-13}	mpmath 1.3 gammainc (Gnumeric 1.12 gives #NUM!)
+CONVERT(1,"ly","m")	{"approx": 9460730472580800.0, "tol": 1e-06}	Gnumeric 1.12
+CONVERT(1,"ly","km")	{"approx": 9460730472580.8, "tol": 1e-06}	Gnumeric 1.12
+CONVERT(1,"pc","ly")	{"approx": 3.2615637967310738, "tol": 1e-06}	Gnumeric 1.12
+CONVERT(1,"MTON","GRT")	{"approx": 0.4, "tol": 1e-06}	Gnumeric 1.12
+CONVERT(1,"admkn","kn")	{"approx": 1.0006393088552916, "tol": 1e-06}	Gnumeric 1.12

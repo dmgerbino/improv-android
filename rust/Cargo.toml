@@ -1,0 +1,106 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core_model",
+    "crates/engine",
+    "crates/nl_formula",
+    "crates/storage_mentat",
+    "crates/store",
+    "crates/storage_csv",
+    "crates/client",
+    "improv_android_ffi",
+]
+# pg_improv is its own workspace (pgrx needs pg_config + libclang); see its Cargo.toml.
+# duckdb_improv too (its loadable-extension duckdb must not unify with
+# storage_sql's bundled one); see its Cargo.toml. gui_cosmic too (libcosmic's
+# wgpu 28 and winit fork must not meet eframe's wgpu 30 and winit 0.30).
+exclude = ["crates/pg_improv", "crates/duckdb_improv", "crates/gui_cosmic"]
+
+[workspace.package]
+version = "0.14.0"
+edition = "2021"
+rust-version = "1.97"
+license = "Apache-2.0 OR MIT"
+authors = ["Greg Burd <greg@burd.me>"]
+repository = "https://github.com/gburd/improv"
+
+[workspace.dependencies]
+# Core deps shared across crates. Pinned; bump deliberately.
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# A formula 256 levels deep: its recursion grows the stack where a thread's is
+# nearly used (stacker), and its JSON reads past serde_json's 128-level limit
+# (serde_stacker). MIT OR Apache-2.0.
+stacker = "0.1.25"
+serde_stacker = "0.1.14"
+# Property-based testing (Hypothesis engine; imported as `hegel`).
+hegeltest = "0.52.0"
+chrono = { version = "0.4", features = ["serde"] }
+# Verus's standard library (specs/proofs; erased under plain rustc). Pinned
+# exactly: it must match the Verus release CI verifies with
+# (0.2026.11.02.8bf68ee; see scripts/verify.sh). MIT.
+vstd = { version = "=0.0.0-2026-11-01-0251" }
+# Differential dataflow is the mandated computation engine (see AGENT_STEERING.md).
+# Exact pins: every DD minor breaks the API, so a bump is a port of the engine
+# (crates/engine/src/dataflow.rs, session.rs, reduce/order.rs), checked bit
+# for bit by its tests and timed by the scale probes. DD 0.26.0 + timely 0.32.0
+# (MSRV 1.88/1.86) build on rustc 1.97; see AGENT_ENGINE_STEERING.md §2.
+differential-dataflow = "=0.26.0"
+timely = "=0.32.0"
+# Storage substrate: the embedded SQLite Mentat fork, from crates.io (Mentat
+# 1.12+ publishes it as `mentatdb`; the library is still `mentat`). Bump
+# procedure + benchmark: AGENTS.md "CI / storage-backend pin".
+mentat = { package = "mentatdb", version = "=1.20.0" }
+# TUI (Phase 2).
+ratatui = "0.30"
+crossterm = "0.29"
+# Server (Phase 3).
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tower = "0.5"
+# Desktop GUI (Phase 5). egui/eframe — see AGENT_GUI_STEERING §9.1.
+# Pinned exactly: each egui minor breaks API (H4 moved 0.29 -> 0.37). eframe
+# keeps the glow (OpenGL) renderer it defaulted to before 0.32, so the
+# headless screenshot runs on Mesa's software GL, plus what 0.29's defaults
+# had: AccessKit, the clipboard and links. Not wgpu or system fonts (the
+# NeXT look ships its own).
+eframe = { version = "=0.37.0", default-features = false, features = [
+  "accesskit",
+  "clipboard",
+  "default_fonts",
+  "glow",
+  "links",
+  "wayland",
+  "x11",
+] }
+# Its emoji fonts hold the glyphs Arimo lacks (the error marker ⚠).
+egui = { version = "=0.37.0", features = ["monochrome_emoji_fonts"] }
+egui_extras = "=0.37.0"
+# egui 0.37's accessibility tree types, for the web GUI's DOM bridge
+# (crates/gui_web/src/a11y.rs). The same version egui resolves to, so the
+# types are egui's own. MIT OR Apache-2.0.
+accesskit = "=0.25.2"
+# Command-line parsing for the four binaries, and the man pages and shell
+# completions generated from the same definitions (G1-G3).
+clap = { version = "4.6.7", features = ["derive", "env"] }
+clap_mangen = "0.3.3"
+clap_complete = "4.6.11"
+# Access policies (crates/policy): the Cedar language, evaluator and
+# validator. Pinned exactly: a policy that validates must keep validating,
+# and decide the same, until a deliberate bump. No extension types
+# (decimal, ipaddr, datetime): the schema uses none. Apache-2.0.
+cedar-policy = { version = "=4.14.1", default-features = false }
+# TLS, to Postgres (storage_pg) and in improv-server: rustls on the ring
+# provider, which needs no cmake or NASM (aws-lc-rs, rustls' default, does).
+# TLS 1.2 stays on: Postgres' ssl_min_protocol_version defaults to it.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Throwaway CAs and certificates for the TLS tests (dev-dependency only).
+rcgen = "0.14"
+# improv_client's remote model service (feature `remote`): blocking HTTP/1.1
+# on rustls (ring, given explicitly: `rustls-no-provider`) with the operating
+# system's roots (`platform-verifier`). No default features, so neither
+# native-tls nor webpki-roots (a compiled-in CA bundle) comes with it; no
+# gzip, cookies or JSON helpers. Already in the tree through DuckDB's build.
+ureq = { version = "3.5.1", default-features = false, features = ["platform-verifier", "rustls-no-provider"] }

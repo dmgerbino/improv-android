@@ -1,0 +1,9 @@
+# actionlint config (`actionlint` finds it here). Forgejo runner labels:
+# `docker` (a self-hosted runner) and Codeberg's hosted `codeberg-*` ones.
+# Forgejo artifact storage speaks the v3 upload-artifact protocol, not v4.
+self-hosted-runner:
+  labels: [docker, codeberg-tiny, codeberg-small, codeberg-medium]
+paths:
+  .forgejo/workflows/*.yml:
+    ignore:
+      - "the runner of \"actions/upload-artifact@v3\" action is too old"

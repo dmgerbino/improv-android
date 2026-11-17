@@ -1,0 +1,49 @@
+//! P7: analysis reductions (regression and forecasting, normality tests,
+//! matrices, signal processing). Ids 1850–1999.
+//!
+//! A matrix is a measure over two categories, `MDETERM(A OVER R, C)`: rows
+//! along R, columns along C, in item order. A matrix result is a list
+//! flattened row by row; `INTO R2, C2` lays it out as the block.
+
+use super::{alias, f, over, Arg, Category, FnDef, Kind, Over, Ret};
+use crate::value::ValueType;
+
+use Arg::{Boolean as B, DateLike as DL, Number as N};
+use Category::{Math as M, Statistical as St};
+use Kind::{Aggregate as Ag, Array as Ar, PerItem as P};
+
+const NUM: Ret = Ret::Fixed(ValueType::Number);
+
+#[rustfmt::skip]
+pub(super) static ANALYSIS: &[FnDef] = &[
+    over(f(1850, "MDETERM", Ag, M, &[N], 1, false, NUM, "MDETERM(A OVER R, C): the determinant of the square matrix A (rows along R, columns along C); 0 if singular"), Over::At(&[0])),
+    over(f(1851, "LOGMDETERM", Ag, M, &[N], 1, false, NUM, "LOGMDETERM(A OVER R, C): ln |det A| (no overflow for large matrices); #NUM! if singular"), Over::At(&[0])),
+    over(f(1852, "MINVERSE", Ar, M, &[N], 1, false, NUM, "MINVERSE(A OVER R, C INTO R2, C2): the inverse of the square matrix A, row by row; #NUM! if singular"), Over::At(&[0])),
+    over(f(1853, "MPSEUDOINVERSE", Ar, M, &[N, N], 1, false, NUM, "MPSEUDOINVERSE(A OVER R, C, [threshold] INTO C2, R2): the Moore–Penrose pseudo-inverse (C × R, row by row); singular values up to threshold (default 256 ε) times the largest count as zero"), Over::At(&[0])),
+    over(f(1854, "CHOLESKY", Ar, M, &[N], 1, false, NUM, "CHOLESKY(A OVER R, C INTO R2, C2): the lower-triangular L with L·Lᵀ = A for a symmetric positive-definite A (asymmetric pairs averaged), row by row; #NUM! where A is not positive definite"), Over::At(&[0])),
+    over(f(1855, "EIGEN", Ar, M, &[N], 1, false, NUM, "EIGEN(A OVER R, C INTO R2, C2): for a symmetric A (asymmetric pairs averaged), its eigenvalues largest magnitude first, then the matrix of their unit eigenvectors as columns: (n + 1) × n values, row by row"), Over::At(&[0])),
+    over(f(1856, "SSMEDIAN", Ag, St, &[N, N], 1, false, NUM, "the median of grouped data (Gnumeric): each value the midpoint of an interval of width interval (default 1), interpolated within the median's interval"), Over::At(&[0])),
+    over(f(1857, "INTERPOLATION", Ag, St, &[N, N, N, N, N], 3, false, NUM, "INTERPOLATION(xs, ys OVER T, target, [method], [next]): ys interpolated at target (Gnumeric): method 0 linear, 2 staircase, 4 natural cubic spline; 1, 3, 5 the same averaged over [target, next]"), Over::At(&[0, 1])),
+    over(f(1858, "HPFILTER", P, St, &[N, N], 1, false, NUM, "each item's trend under the Hodrick–Prescott filter with smoothing λ (default 1600); the cycle is y − trend; needs 6 values"), Over::At(&[0])),
+    over(f(1859, "ADTEST", Ag, St, &[N], 1, false, NUM, "the p-value of the Anderson–Darling test of normality (Gnumeric; 8 values or more)"), Over::At(&[0])),
+    over(f(1860, "CVMTEST", Ag, St, &[N], 1, false, NUM, "the p-value of the Cramér–von Mises test of normality (Gnumeric; 8 values or more)"), Over::At(&[0])),
+    over(f(1861, "LKSTEST", Ag, St, &[N], 1, false, NUM, "the p-value of the Lilliefors (Kolmogorov–Smirnov) test of normality (Gnumeric; 5 values or more)"), Over::At(&[0])),
+    over(f(1862, "SFTEST", Ag, St, &[N], 1, false, NUM, "the p-value of the Shapiro–Francia test of normality (Gnumeric; 5 to 5000 values)"), Over::At(&[0])),
+    over(f(1863, "ADTEST.STAT", Ag, St, &[N], 1, false, NUM, "the Anderson–Darling statistic A² (adjusted for n), Gnumeric's ADTEST second value"), Over::At(&[0])),
+    over(f(1864, "CVMTEST.STAT", Ag, St, &[N], 1, false, NUM, "the Cramér–von Mises statistic W², Gnumeric's CVMTEST second value"), Over::At(&[0])),
+    over(f(1865, "LKSTEST.STAT", Ag, St, &[N], 1, false, NUM, "the Lilliefors statistic D, Gnumeric's LKSTEST second value"), Over::At(&[0])),
+    over(f(1866, "SFTEST.STAT", Ag, St, &[N], 1, false, NUM, "the Shapiro–Francia statistic W', Gnumeric's SFTEST second value"), Over::At(&[0])),
+    over(f(1867, "LOGREG", Ar, St, &[N, N, B, B], 2, false, NUM, "LOGREG(known_ys, known_xs OVER T, [affine], [stats] INTO K): the least-squares fit y = m·ln x + b (Gnumeric): m, b (affine = FALSE: b = 0); with stats LINEST's 5×2 block for ln x, row by row"), Over::At(&[0, 1])),
+    over(f(1868, "LOGFIT", Ar, St, &[N, N], 2, false, NUM, "LOGFIT(known_ys, known_xs OVER T INTO K): the fit y = a + b·ln(sign·(x − c)) by Gnumeric's trial-and-error search: sign, a, b, c and the sum of squared residuals; #NUM! if the points are not logarithmic enough"), Over::At(&[0, 1])),
+    over(f(1869, "FOURIER", Ar, M, &[N, B], 1, false, Ret::Fixed(ValueType::Text), "FOURIER(y OVER T, [inverse] INTO K): Gnumeric's discrete Fourier transform (scaled by 1/n, zero-padded to a power of two), each value as complex text \"a+bi\""), Over::At(&[0])),
+    over(f(1870, "PERIODOGRAM", Ar, St, &[N, N], 1, false, NUM, "PERIODOGRAM(y OVER T, [filter] INTO K): the magnitudes of the first half of the Fourier transform (Gnumeric), after a window: 0 none, 1 Bartlett, 2 Hann, 3 Welch"), Over::At(&[0])),
+    over(f(1871, "CRONBACH", Ag, St, &[N, N], 2, true, NUM, "CRONBACH(x1, x2, … OVER T): Cronbach's α of the items x1, x2, … (one row per respondent; population variances, as Gnumeric)"), Over::Every(0, 1)),
+    alias(over(f(1872, "FORECAST.ETS", Ag, St, &[DL, N, DL, N, N, N], 3, false, NUM, "FORECAST.ETS(target_date, values, timeline OVER T, [seasonality], [data_completion], [aggregation]): the additive Holt–Winters (triple exponential smoothing) forecast at target_date, LibreOffice's algorithm; seasonality 1 detects the season, 0 none; a target_date before the timeline's end is #NUM!"), Over::At(&[1, 2])), &["FORECAST.ETS.ADD"]),
+    over(f(1873, "FORECAST.ETS.MULT", Ag, St, &[DL, N, DL, N, N, N], 3, false, NUM, "FORECAST.ETS.MULT(target_date, values, timeline OVER T, …): FORECAST.ETS with multiplicative seasons (LibreOffice)"), Over::At(&[1, 2])),
+    alias(over(f(1874, "FORECAST.ETS.CONFINT", Ag, St, &[DL, N, DL, N, N, N, N], 3, false, NUM, "FORECAST.ETS.CONFINT(target_date, values, timeline OVER T, [confidence_level], [seasonality], …): the half-width of the prediction interval (default confidence_level 0.95); only for seasonality 0 (LibreOffice simulates seasonal intervals randomly): otherwise #N/A"), Over::At(&[1, 2])), &["FORECAST.ETS.PI.ADD"]),
+    over(f(1875, "FORECAST.ETS.PI.MULT", Ag, St, &[DL, N, DL, N, N, N, N], 3, false, NUM, "FORECAST.ETS.PI.MULT(target_date, values, timeline OVER T, …): FORECAST.ETS.CONFINT for the multiplicative model (the same for seasonality 0, the only one supported)"), Over::At(&[1, 2])),
+    alias(over(f(1876, "FORECAST.ETS.STAT", Ag, St, &[N, DL, N, N, N, N], 3, false, NUM, "FORECAST.ETS.STAT(values, timeline OVER T, statistic_type, …): a statistic of FORECAST.ETS's fit: 1 α, 2 β (trend), 3 γ (season), 4 MASE, 5 SMAPE, 6 MAE, 7 RMSE, 8 step, 9 seasonality"), Over::At(&[0, 1])), &["FORECAST.ETS.STAT.ADD"]),
+    over(f(1877, "FORECAST.ETS.STAT.MULT", Ag, St, &[N, DL, N, N, N, N], 3, false, NUM, "FORECAST.ETS.STAT.MULT(values, timeline OVER T, statistic_type, …): FORECAST.ETS.STAT of the multiplicative model"), Over::At(&[0, 1])),
+    over(f(1878, "FORECAST.ETS.SEASONALITY", Ag, St, &[N, DL, N, N], 2, false, NUM, "FORECAST.ETS.SEASONALITY(values, timeline OVER T, [data_completion], [aggregation]): the season length FORECAST.ETS detects (1: none)"), Over::At(&[0, 1])),
+    over(f(1879, "LEVERAGE", Ar, St, &[N], 1, false, NUM, "LEVERAGE(A OVER R, C INTO K): the regression leverages, the diagonal of A·(AᵀA)⁻¹·Aᵀ, one per row of A (Gnumeric); #NUM! if A's columns are dependent"), Over::At(&[0])),
+];

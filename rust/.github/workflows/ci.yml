@@ -1,0 +1,676 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # Format only the Improv workspace crates: `cargo fmt --all` would also
+      # walk the vendored Mentat path dependency (and, transitively, whatever
+      # IT path-depends on) if it happens to be checked out alongside this
+      # repo, which is not part of our gate.
+      - run: >
+          cargo fmt
+          -p improv_core_model
+          -p improv_storage_mentat
+          -p improv_storage_sql
+          -p improv_storage_duckdb
+          -p improv_storage_csv
+          -p improv_engine
+          -p improv_verified
+          -p improv_extfn
+          -p improv_pg_model
+          -p improv_duckdb_model
+          -p improv_nl_formula
+          -p improv_cli
+          -p improv_tui
+          -p improv_server
+          -p improv_gui
+          -p improv_client
+          -p improv_policy
+          -p improv_service
+          -p improv_gui_web
+          -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: improv
+      # libduckdb-sys unpacks its bundled sources once per target dir, into
+      # target/duckdb-sources/<key>/, and fails ("Directory not empty")
+      # when the cache restored a partial copy without its COMPLETE marker.
+      - name: Drop cached DuckDB sources
+        shell: bash
+        run: find improv -path '*/target/duckdb-sources' -prune -type d -exec rm -r {} + 2>/dev/null || true
+      # Lint only the Improv workspace crates; the vendored Mentat dep emits its
+      # own (upstream) warnings which must not fail our -D warnings gate.
+      - name: Clippy (workspace crates)
+        working-directory: improv
+        run: >
+          cargo clippy
+          -p improv_core_model
+          -p improv_storage_mentat
+          -p improv_storage_sql
+          -p improv_storage_duckdb
+          -p improv_storage_csv
+          -p improv_engine
+          -p improv_verified
+          -p improv_extfn
+          -p improv_pg_model
+          -p improv_duckdb_model
+          -p improv_nl_formula
+          -p improv_cli
+          -p improv_tui
+          -p improv_server
+          -p improv_gui
+          -p improv_client
+          -p improv_policy
+          -p improv_service
+          -p improv_gui_web
+          --all-targets --all-features -- -D warnings
+      # The browser build: improv_client must keep building for wasm32, and
+      # the web GUI must build and lint there.
+      - name: improv_client and the web GUI build for wasm32
+        working-directory: improv
+        run: |
+          cargo check --locked --target wasm32-unknown-unknown -p improv_client
+          cargo clippy --locked --target wasm32-unknown-unknown -p improv_gui_web -- -D warnings
+      # The fuzz crate is its own workspace (cargo-fuzz), so the workspace
+      # build never compiles it: check its targets build against the API.
+      - name: Fuzz targets build
+        working-directory: improv/fuzz
+        run: cargo check --locked --bins
+
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: crate-ci/typos@4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85 # v1.52.0
+
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      # cargo-deny reads manifests; this reads the vendored sources' SPDX
+      # headers: no GPL or AGPL file, no unlisted or modified LGPL one
+      # (CONTRIBUTING.md, "Licences of dependencies"). crates/gui_cosmic's
+      # tree is scanned by ci/gui_cosmic.sh. First, so a failing advisory
+      # cannot hide it.
+      - name: Licence scan of the vendored crates
+        run: >
+          python3 improv/crates/gui_cosmic/release/license-scan.py
+          vendor improv "$RUNNER_TEMP/vendor"
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: improv/Cargo.toml
+          command: check advisories licenses bans sources
+
+  build-test:
+    name: Build & Test (${{ matrix.os }} / ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
+    needs: [fmt, clippy]
+    # A cold cache compiles the bundled DuckDB C++ (several minutes on a
+    # 3-4 core runner, longest on Windows/MSVC) before any test runs.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        features: ["", "--all-features"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      # The all-features build and its cache filled the Linux runner's disk
+      # ("No space left on device"): drop the preinstalled SDKs it never
+      # uses first, as the coverage job does.
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo find /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL -mindepth 1 -delete 2>/dev/null || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1, nextest
+        with:
+          tool: nextest
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: improv
+          key: ${{ matrix.os }}-${{ matrix.features }}
+      # libduckdb-sys unpacks its bundled sources once per target dir, into
+      # target/duckdb-sources/<key>/, and fails ("Directory not empty")
+      # when the cache restored a partial copy without its COMPLETE marker.
+      - name: Drop cached DuckDB sources
+        shell: bash
+        run: find improv -path '*/target/duckdb-sources' -prune -type d -exec rm -r {} + 2>/dev/null || true
+      - name: Build
+        working-directory: improv
+        run: cargo build --workspace ${{ matrix.features }}
+      - name: Test
+        working-directory: improv
+        run: cargo nextest run --workspace ${{ matrix.features }}
+      - name: Doctests
+        working-directory: improv
+        run: cargo test --workspace --doc ${{ matrix.features }}
+      # The CLI under Windows' 1 MiB main-thread stack, on Linux too, so a
+      # stack overflow there fails the fast Linux job, not only Windows.
+      - name: CLI under a 1 MiB main stack
+        if: runner.os == 'Linux' && matrix.features == ''
+        working-directory: improv
+        env:
+          IMPROV_TEST_STACK_KB: "1024"
+        run: cargo nextest run -p improv_cli
+
+  # Coverage gate: every crate >= 90% functions AND >= 90% branches (inline
+  # test modules excluded; see CONTRIBUTING.md "Coverage"). Branch coverage
+  # needs nightly; bubblewrap + python3 so the sandboxed extfn paths run, and
+  # a Postgres service so storage_sql/pg.rs runs live, with ssl=on (a CA and
+  # certificate made here) so the TLS tests (IMPROV_TEST_PG_TLS) run too.
+  coverage:
+    name: Coverage (>= 90% fn and branch per crate)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: improv
+          POSTGRES_PASSWORD: improv
+          POSTGRES_DB: improv_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U improv" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      IMPROV_TEST_PG: "host=127.0.0.1 user=improv password=improv dbname=improv_test"
+      IMPROV_TEST_PG_TLS: "host=localhost user=improv password=improv dbname=improv_test sslrootcert=/tmp/pg-tls/ca.pem"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      # An instrumented build of the whole workspace and its cache filled
+      # the runner's disk ("No space left on device"): drop the preinstalled
+      # SDKs this job never uses first (about 30 GB).
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo find /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL -mindepth 1 -delete 2>/dev/null || true
+          df -h /
+      - name: Install bubblewrap and python3
+        # ubuntu-24.04 restricts unprivileged user namespaces (AppArmor), which
+        # bwrap needs; lift it so the sandboxed extfn paths run, not fail.
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap python3
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # TLS for the service: a throwaway CA and a certificate for localhost,
+      # 127.0.0.1 and pg.improv.test (the name the tests reach it by), then
+      # ssl=on and a reload. The service was started before this step, so
+      # the files are copied in rather than mounted.
+      - name: Postgres with ssl=on
+        env:
+          PG: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          d=/tmp/pg-tls && mkdir -p "$d" && cd "$d"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
+            -subj "/CN=Improv CI CA" -keyout ca.key -out ca.pem
+          openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=localhost" \
+            -keyout server.key -out server.csr
+          printf 'subjectAltName=DNS:pg.improv.test,DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' >ext.cnf
+          openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 2 \
+            -extfile ext.cnf -out server.pem
+          docker cp server.pem "$PG":/var/lib/postgresql/server.crt
+          docker cp server.key "$PG":/var/lib/postgresql/server.key
+          docker exec "$PG" sh -c 'chown postgres /var/lib/postgresql/server.* && chmod 600 /var/lib/postgresql/server.key'
+          docker exec -u postgres "$PG" psql -U improv -d improv_test -v ON_ERROR_STOP=1 \
+            -c "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.crt'" \
+            -c "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key'" \
+            -c "ALTER SYSTEM SET ssl = on" -c "SELECT pg_reload_conf()"
+          sleep 1
+          docker exec -u postgres "$PG" psql -U improv -d improv_test -Atc "SHOW ssl" | grep -qx on
+          PGPASSWORD=improv psql "host=localhost user=improv dbname=improv_test sslmode=verify-full sslrootcert=$d/ca.pem" \
+            -Atc "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()" | grep -qx t
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      # Pinned: the install-action's default (0.6.x) cannot read current
+      # nightly's profiles; its report silently drops files and functions.
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1, cargo-llvm-cov
+        with:
+          tool: cargo-llvm-cov@0.9.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: improv
+          key: coverage
+      # libduckdb-sys unpacks its bundled sources once per target dir, into
+      # target/duckdb-sources/<key>/, and fails ("Directory not empty")
+      # when the cache restored a partial copy without its COMPLETE marker.
+      - name: Drop cached DuckDB sources
+        shell: bash
+        run: find improv -path '*/target/duckdb-sources' -prune -type d -exec rm -r {} + 2>/dev/null || true
+      - name: Coverage gate
+        working-directory: improv
+        run: scripts/coverage.sh --html 90
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-html
+          path: improv/target/coverage-html/
+          if-no-files-found: ignore
+
+  # pg_improv: the Postgres extension (its own Cargo workspace; pgrx needs
+  # pg_config + libclang). Runs the #[pg_test] suite on PG 17 with the sync
+  # worker preloaded, then the end-to-end logical-decoding script.
+  pg_improv:
+    name: pg_improv (pgrx, PG ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+    container:
+      image: rust:1.97-trixie
+      # The host's preinstalled SDKs, mounted so the job can delete them:
+      # a cold build plus upgrade.sh's eight old releases filled the
+      # runner's disk ("No space left on device") on PG 18.
+      volumes:
+        - /usr/local/lib/android:/host/android
+        - /usr/share/dotnet:/host/dotnet
+        - /opt/ghc:/host/ghc
+        - /opt/hostedtoolcache:/host/toolcache
+    steps:
+      - name: Free disk space
+        run: |
+          for d in /host/android /host/dotnet /host/ghc /host/toolcache/CodeQL; do
+            [ -d "$d" ] && find "$d" -mindepth 1 -delete 2>/dev/null || true
+          done
+          df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+          # tests/upgrade.sh builds each earlier release from its tag.
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: improv/crates/pg_improv
+          key: pg_improv-${{ matrix.pg }}
+      # tests/upgrade.sh's builds of the released versions (.so, .control and
+      # .sql per version and major). A tag never changes: a new release's
+      # update script changes the key, and the restore key brings the rest.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: pgi-old
+          key: pgi-old-${{ matrix.pg }}-${{ hashFiles('improv/crates/pg_improv/sql/*.sql') }}
+          restore-keys: pgi-old-${{ matrix.pg }}-
+      # One script for GitHub, Forgejo and a local run: fmt, clippy, pg_test,
+      # pgspot, tests/txn.sh, tests/logical.sh, tests/upgrade.sh (from every
+      # release); on 17 also the PGXN dist build.
+      - name: pg_improv on PG ${{ matrix.pg }}
+        run: PGI_OLD_CACHE="$GITHUB_WORKSPACE/pgi-old" improv/ci/pg_improv.sh ${{ matrix.pg }}
+
+  # The DuckDB extension (crates/duckdb_improv: its own Cargo workspace).
+  # One release binary must load into BOTH the DuckDB v1.5.6 floor and the
+  # v2.0.0 the community registry builds against (README "Pins").
+  # ci/duckdb_improv.sh: fmt, clippy, the SQLLogicTest file under Python
+  # duckdb 1.5.6 and 2.0.0, smoke.sh under the v1.5.6 and v2.0.0 CLIs, the
+  # concurrency test, and improv(...) against `improv eval`.
+  test-duckdb:
+    name: DuckDB extension (v1.5.6 + v2.0)
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+          submodules: recursive   # crates/duckdb_improv/extension-ci-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            improv/crates/duckdb_improv
+            improv
+          key: duckdb
+      # libduckdb-sys unpacks its bundled sources once per target dir, into
+      # target/duckdb-sources/<key>/, and fails ("Directory not empty")
+      # when the cache restored a partial copy without its COMPLETE marker.
+      - name: Drop cached DuckDB sources
+        shell: bash
+        run: find improv -path '*/target/duckdb-sources' -prune -type d -exec rm -r {} + 2>/dev/null || true
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-venv unzip
+      - name: duckdb_improv
+        run: improv/ci/duckdb_improv.sh "$GITHUB_WORKSPACE/duckdb-cli"
+
+  # The COSMIC GUI (crates/gui_cosmic: its own Cargo workspace, so
+  # libcosmic's iced, wgpu and winit fork stay out of the root lockfile).
+  # ci/gui_cosmic.sh: fmt, clippy, tests, rustdoc, cargo-deny with the
+  # crate's deny.toml, and (Linux) the release vendoring that replaces
+  # libcosmic's GPL localize.rs, with its licence scan (pop-os/libcosmic#1500);
+  # Windows builds and tests it too (no AccessKit there at the libcosmic
+  # pin, see docs/src/cosmic-gui.md).
+  gui-cosmic:
+    name: COSMIC GUI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [fmt, clippy]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: improv/crates/gui_cosmic
+          key: gui-cosmic-${{ matrix.os }}
+      - name: Install libxkbcommon and libwayland
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev
+      # Pinned: the install-action's default cargo-deny is too old for the
+      # advisory database (CVSS 4.0 entries fail to parse) and takes
+      # --config elsewhere. 0.20.2 is what the root's Cargo Deny job runs.
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1, cargo-deny
+        if: runner.os == 'Linux'
+        with:
+          tool: cargo-deny@0.20.2
+      - name: gui_cosmic
+        shell: bash
+        env:
+          # cargo-deny's and the licence scan's verdicts do not depend on
+          # the host: run them once.
+          GUI_COSMIC_DENY: ${{ runner.os == 'Linux' && '1' || '0' }}
+        run: improv/ci/gui_cosmic.sh
+
+  # The COSMIC GUI rendered headless (Xvfb, wgpu on Mesa's llvmpipe; the
+  # window captures itself) must match its golden. Same container as
+  # gui-shot, so Mesa and ImageMagick match the box that made the golden.
+  # Refresh: scripts/cosmic-shot-check.sh --update.
+  cosmic-shot:
+    name: COSMIC GUI screenshot vs golden
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    timeout-minutes: 45
+    container:
+      image: rust:1.97-trixie
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - name: Install Xvfb, ImageMagick, Mesa, xkbcommon, wayland
+        run: >
+          apt-get update && apt-get install -y --no-install-recommends
+          xvfb imagemagick libgl1 libegl1 libgl1-mesa-dri mesa-vulkan-drivers
+          libxkbcommon-dev libxkbcommon-x11-0 libwayland-dev
+          libxcursor1 libxi6 libxrandr2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            improv/crates/gui_cosmic
+            improv
+          key: cosmic-shot
+      # libduckdb-sys unpacks its bundled sources once per target dir, into
+      # target/duckdb-sources/<key>/, and fails ("Directory not empty")
+      # when the cache restored a partial copy without its COMPLETE marker.
+      - name: Drop cached DuckDB sources
+        shell: bash
+        run: find improv -path '*/target/duckdb-sources' -prune -type d -exec rm -r {} + 2>/dev/null || true
+      - name: Screenshot regression
+        working-directory: improv
+        run: scripts/cosmic-shot-check.sh
+      - name: Upload capture and diff
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cosmic-shot
+          path: improv/target/cosmic-shot/
+          if-no-files-found: ignore
+
+  # Review plan D5: the GUI rendered headless (Xvfb + llvmpipe) must match the
+  # committed golden. Debian 13 like the box that made the golden, so Mesa and
+  # ImageMagick match. Refresh: CONTRIBUTING.md "GUI screenshot golden".
+  gui-shot:
+    name: GUI screenshot vs golden
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    timeout-minutes: 30
+    container:
+      image: rust:1.97-trixie
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - name: Install Xvfb, ImageMagick, xdotool, GL/X11 runtime
+        run: >
+          apt-get update && apt-get install -y --no-install-recommends
+          xvfb x11-apps imagemagick xdotool
+          libgl1 libegl1 libgl1-mesa-dri libxkbcommon-x11-0
+          libxcursor1 libxi6 libxrandr2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: improv
+          key: gui-shot
+      # libduckdb-sys unpacks its bundled sources once per target dir, into
+      # target/duckdb-sources/<key>/, and fails ("Directory not empty")
+      # when the cache restored a partial copy without its COMPLETE marker.
+      - name: Drop cached DuckDB sources
+        shell: bash
+        run: find improv -path '*/target/duckdb-sources' -prune -type d -exec rm -r {} + 2>/dev/null || true
+      - name: Screenshot regression
+        working-directory: improv
+        run: scripts/gui-shot-check.sh
+      - name: Upload capture and diff
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gui-shot
+          path: improv/target/gui-shot/
+          if-no-files-found: ignore
+
+  # The web GUI (crates/gui_web) in headless Chromium: two browser sessions
+  # on one improv-server; an edit in one reaches the other within a second,
+  # a server restart is caught up, pivot by drag, a located formula error,
+  # undo, a page item, and the accessibility tree a screen reader reads
+  # (crates/gui_web/e2e/drive.py).
+  web-e2e:
+    name: Web GUI in Chromium
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    # Release builds of the server, the CLI and the wasm GUI, cold: past
+    # 30 minutes on a 4-core runner (the first run was cancelled at 30).
+    timeout-minutes: 60
+    container:
+      image: rust:1.97-trixie
+      # An init as PID 1 reaps exited processes. GitHub starts the job
+      # container with `tail -f /dev/null` as PID 1, which reaps nothing, so
+      # e2e.sh's stop() (kill, then wait while `kill -0` succeeds) spun
+      # forever on the killed server's zombie, after every check had passed.
+      options: --init
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - name: Install Chromium and the DevTools client
+        run: >
+          apt-get update && apt-get install -y --no-install-recommends
+          chromium python3-websocket curl fonts-dejavu-core procps
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: improv
+          key: web-e2e
+      # libduckdb-sys unpacks its bundled sources once per target dir, into
+      # target/duckdb-sources/<key>/, and fails ("Directory not empty")
+      # when the cache restored a partial copy without its COMPLETE marker.
+      - name: Drop cached DuckDB sources
+        shell: bash
+        run: find improv -path '*/target/duckdb-sources' -prune -type d -exec rm -r {} + 2>/dev/null || true
+      - name: The wasm target and wasm-bindgen at Cargo.lock's version
+        working-directory: improv
+        run: |
+          rustup target add wasm32-unknown-unknown
+          v=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/[^0-9.]/, ""); print }' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$v" --locked
+      # The golden was taken with nixpkgs' Chromium 156; Debian's draws it
+      # identically (0 pixels differ, checked in this container image).
+      - name: Two browser sessions
+        working-directory: improv
+        env:
+          CHROMIUM: chromium
+        run: scripts/web-e2e.sh
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-e2e
+          path: improv/target/web-e2e/
+          if-no-files-found: ignore
+
+  # The Verus proofs of crates/verified (scripts/verify.sh). The release and
+  # its Rust toolchain are pinned together; vstd in Cargo.toml must match.
+  verify:
+    name: Verus proofs
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    env:
+      VERUS_RELEASE: 0.2026.11.02.8bf68ee
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+      - name: Install Verus
+        run: |
+          zip="verus-${VERUS_RELEASE}-x86-linux.zip"
+          curl -fsSL -o "$zip" "https://github.com/verus-lang/verus/releases/download/release/${VERUS_RELEASE}/${zip}"
+          unzip -q "$zip"
+          echo "VERUS_DIR=$PWD/verus-x86-linux" >> "$GITHUB_ENV"
+      - name: Verify
+        working-directory: improv
+        run: scripts/verify.sh
+
+  msrv:
+    name: MSRV (1.97)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+      - name: Build (MSRV)
+        working-directory: improv
+        run: cargo build --workspace
+
+  docs:
+    name: Doc build
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - uses: dtolnay/rust-toolchain@stable
+      - name: rustdoc
+        working-directory: improv
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: cargo doc --workspace --no-deps
+      - name: Install mdBook
+        run: |
+          # Pinned as a set: mdbook-linkcheck has no mdbook 0.5 release, and
+          # mdbook-mermaid >= 0.17 targets mdbook 0.5 (the preprocessor
+          # protocol changed), so all three stay on the 0.4 line.
+          cargo install mdbook --version =0.4.52 --locked
+          cargo install mdbook-linkcheck --version =0.7.7 --locked
+          cargo install mdbook-mermaid --version =0.16.2 --locked
+      - name: Build book
+        working-directory: improv
+        run: mdbook build docs
+      # groff exits 0 on a warning, so any output fails the step. The
+      # generated pages' drift test (cargo test -p improv_cli) runs groff
+      # too, but skips without it; this is the check that always runs.
+      - name: Man pages (groff -ww)
+        working-directory: improv
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y groff
+          status=0
+          for f in docs/man/*.[157]; do
+            # ascii has the fewest glyphs (ps has no Greek either): a page
+            # clean there is clean on every device.
+            if ! out="$(groff -man -ww -z -Tascii "$f" 2>&1)" || [ -n "$out" ]; then
+              echo "::error file=$f::groff: $out"
+              status=1
+            fi
+          done
+          exit "$status"

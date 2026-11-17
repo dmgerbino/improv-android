@@ -1,0 +1,49 @@
+[package]
+name = "improv_gui"
+version.workspace = true
+edition.workspace = true
+license = "(MIT OR Apache-2.0) AND OFL-1.1"
+
+[[bin]]
+name = "improv-gui"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+improv_core_model = { path = "../core_model" }
+improv_store = { path = "../store" }
+improv_storage_csv = { path = "../storage_csv" }
+improv_engine = { path = "../engine" }
+improv_nl_formula = { path = "../nl_formula" }
+improv_client = { path = "../client", features = ["remote"] }
+serde_json.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+thiserror.workspace = true
+# Print's Date and Time markers, in local time.
+chrono.workspace = true
+
+# Print on Windows: the system print dialog and GDI.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_Xps",
+  "Win32_UI_Controls_Dialogs",
+] }
+
+# `cargo llvm-cov` on nightly sets `--cfg coverage_nightly`; test modules are
+# `coverage(off)` so the report measures library code only.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
+[dev-dependencies]
+postgres = "0.19"
+# The served app's tests drive it over an authority in process, under
+# stored Cedar policies.
+improv_service = { path = "../service" }
+improv_policy = { path = "../policy" }
+# The crash-safety tests check the store file with SQLite's integrity_check.
+mentat.workspace = true
+improv_storage_mentat = { path = "../storage_mentat" }

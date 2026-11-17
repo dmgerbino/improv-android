@@ -1,0 +1,37 @@
+[package]
+name = "improv_tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "improv-tui"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+improv_core_model = { path = "../core_model" }
+improv_store = { path = "../store" }
+improv_storage_csv = { path = "../storage_csv" }
+improv_engine = { path = "../engine" }
+improv_nl_formula = { path = "../nl_formula" }
+improv_client = { path = "../client", features = ["remote"] }
+thiserror.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+[dev-dependencies]
+# The served app's tests drive it over an authority in process, under
+# stored Cedar policies.
+improv_service = { path = "../service" }
+improv_policy = { path = "../policy" }
+# A Postgres model's notifications: the test's SQL connection.
+postgres = "0.19"
+# The crash-safety tests check the store file with SQLite's integrity_check.
+mentat.workspace = true
+improv_storage_mentat = { path = "../storage_mentat" }
+
+# `cargo llvm-cov` on nightly sets `--cfg coverage_nightly`; it gates the
+# `coverage(off)` exclusions on the real-terminal shell in main.rs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

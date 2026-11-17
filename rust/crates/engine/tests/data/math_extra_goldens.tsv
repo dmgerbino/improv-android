@@ -1,0 +1,304 @@
+formula	expected	source
+ASC("ＡＢＣ　１２３ガパヴカ")	"ABC　123ｶﾞﾊﾟｳﾞｶ"	LibreOffice
+ASC("ｶﾀｶﾅ abc")	"ｶﾀｶﾅ abc"	LibreOffice
+ASC("「テスト」、。")	"｢ﾃｽﾄ｣､｡"	LibreOffice
+ASC("")	""	LibreOffice
+JIS("ABC 123 ｶﾞﾊﾟｳﾞｶ~")	"ＡＢＣ １２３ ガパウ゛カ～"	LibreOffice
+JIS("ﾃｽﾄ!")	"テスト！"	LibreOffice
+JIS("全角")	"全角"	LibreOffice
+JIS("a\b")	"ａ￥ｂ"	LibreOffice
+DBCS("abc 1")	"ａｂｃ １"	LibreOffice
+BAHTTEXT(1234.5)	"หนึ่งพันสองร้อยสามสิบสี่บาทห้าสิบสตางค์"	LibreOffice
+BAHTTEXT(21)	"ยี่สิบเอ็ดบาทถ้วน"	LibreOffice
+BAHTTEXT(1000001)	"หนึ่งล้านหนึ่งบาทถ้วน"	LibreOffice
+BAHTTEXT(-0.25)	"ลบยี่สิบห้าสตางค์"	LibreOffice
+BAHTTEXT(0)	"ศูนย์บาทถ้วน"	LibreOffice
+BAHTTEXT(100000000)	"หนึ่งร้อยล้านบาทถ้วน"	LibreOffice
+BAHTTEXT(0.011)	"หนึ่งสตางค์"	LibreOffice
+BAHTTEXT(111.11)	"หนึ่งร้อยสิบเอ็ดบาทสิบเอ็ดสตางค์"	LibreOffice
+ROT13("Hello, World!")	"Uryyb, Jbeyq!"	LibreOffice
+ROT13("")	""	LibreOffice
+ROT13("Zebra-123")	"Mroen-123"	LibreOffice
+ROT13("Ärger")	"Äetre"	LibreOffice
+ROT13("NOPQRSTUVWXYZ")	"ABCDEFGHIJKLM"	LibreOffice
+ENCODEURL("a b&c/é")	"a%20b%26c%2F%C3%A9"	LibreOffice
+ENCODEURL("")	{"error": "#VALUE!"}	LibreOffice
+ENCODEURL("x=1;y=2?")	"x%3D1%3By%3D2%3F"	LibreOffice
+ENCODEURL("€100")	"%E2%82%AC100"	LibreOffice
+ENCODEURL("http://contoso.sharepoint.com/teams/Finance/Documents/April Reports/Profit and Loss Statement.xlsx")	"http%3A%2F%2Fcontoso.sharepoint.com%2Fteams%2FFinance%2FDocuments%2FApril%20Reports%2FProfit%20and%20Loss%20Statement.xlsx"	Excel docs
+ENCODEURL("a.b~c")	"a.b~c"	RFC 3986
+ROMAN(499)	"CDXCIX"	LibreOffice
+ROMAN(499,0)	"CDXCIX"	LibreOffice
+ROMAN(499,1)	"LDVLIV"	LibreOffice
+ROMAN(499,2)	"XDIX"	LibreOffice
+ROMAN(499,3)	"VDIV"	LibreOffice
+ROMAN(499,4)	"ID"	LibreOffice
+ROMAN(1999,4)	"MIM"	LibreOffice
+ROMAN(3999)	"MMMCMXCIX"	LibreOffice
+ROMAN(0)	""	LibreOffice
+ROMAN(4000)	{"error": "#VALUE!"}	LibreOffice
+ROMAN(-1)	{"error": "#VALUE!"}	LibreOffice
+ROMAN(10,5)	{"error": "#VALUE!"}	LibreOffice
+ROMAN(12.9)	"XII"	LibreOffice
+ROMAN(499,TRUE)	"CDXCIX"	Excel docs
+ROMAN(499,FALSE)	"ID"	Excel docs
+ARABIC("mcmxii")	1912	LibreOffice
+ARABIC("MMMCMXCIX")	3999	LibreOffice
+ARABIC("IIII")	4	LibreOffice
+ARABIC("")	0	LibreOffice
+ARABIC("IM")	999	LibreOffice
+ARABIC("ABC")	{"error": "#VALUE!"}	LibreOffice
+ARABIC("MMMM")	{"error": "#VALUE!"}	LibreOffice
+ARABIC("VX")	{"error": "#VALUE!"}	LibreOffice
+ARABIC("-MMXI")	-2011	Excel docs
+ARABIC(" X ")	10	Excel docs
+EASTERSUNDAY(2024)	{"date": "2024-03-31T00:00:00Z"}	LibreOffice
+EASTERSUNDAY(2025)	{"date": "2025-04-20T00:00:00Z"}	LibreOffice
+EASTERSUNDAY(24)	{"date": "2024-03-31T00:00:00Z"}	LibreOffice
+EASTERSUNDAY(95)	{"date": "1995-04-16T00:00:00Z"}	LibreOffice
+EASTERSUNDAY(1583)	{"date": "1583-04-10T00:00:00Z"}	LibreOffice
+EASTERSUNDAY(9956)	{"date": "9956-04-22T00:00:00Z"}	LibreOffice
+EASTERSUNDAY(2038.7)	{"date": "2038-04-25T00:00:00Z"}	LibreOffice
+EASTERSUNDAY(1582)	{"error": "#NUM!"}	LibreOffice
+EASTERSUNDAY(9957)	{"error": "#NUM!"}	LibreOffice
+EASTERSUNDAY(-1)	{"error": "#NUM!"}	LibreOffice
+LAMBERTW(1)	0.5671432904097838	Gnumeric 1.12
+LAMBERTW(0)	0	Gnumeric 1.12
+LAMBERTW(-0.2)	-0.25917110181907377	Gnumeric 1.12
+LAMBERTW(-0.35)	-0.7166388164560739	Gnumeric 1.12
+LAMBERTW(10)	1.7455280027406992	Gnumeric 1.12
+LAMBERTW(POWER(10,100))	224.8431064451185	Gnumeric 1.12
+LAMBERTW(-0.2,-1)	-2.5426413577735265	Gnumeric 1.12
+LAMBERTW(-0.01,-1)	-6.472775124394005	Gnumeric 1.12
+LAMBERTW(-0.5)	{"error": "#NUM!"}	Gnumeric 1.12
+LAMBERTW(1,-1)	{"error": "#NUM!"}	Gnumeric 1.12
+LAMBERTW(0,-1)	{"error": "#NUM!"}	Gnumeric 1.12
+LAMBERTW(1,1)	{"error": "#NUM!"}	Gnumeric 1.12
+REDUCEPI(10,1)	0.5752220392306203	Gnumeric 1.12
+REDUCEPI(10,1,TRUE)	2	Gnumeric 1.12
+REDUCEPI(10,-1)	-2.566370614359173	Gnumeric 1.12
+REDUCEPI(10,-1,TRUE)	0	Gnumeric 1.12
+REDUCEPI(-10,2)	0.21017612416682802	Gnumeric 1.12
+REDUCEPI(-10,2,TRUE)	3	Gnumeric 1.12
+REDUCEPI(POWER(10,22),0)	-1.020177392559087	Gnumeric 1.12
+REDUCEPI(POWER(10,22),7,TRUE)	214	Gnumeric 1.12
+REDUCEPI(1,0)	1	Gnumeric 1.12
+REDUCEPI(123456789,3)	-0.14072368402007415	Gnumeric 1.12
+REDUCEPI(POWER(2,1000),5)	0.0364675505730393	Gnumeric 1.12
+REDUCEPI(10,8)	{"error": "#VALUE!"}	Gnumeric 1.12
+REDUCEPI(10,-2)	{"error": "#VALUE!"}	Gnumeric 1.12
+AGM(1,2)	1.4567910310469068	Gnumeric 1.12
+AGM(24,6)	13.458171481725616	Gnumeric 1.12
+AGM(0,5)	0	Gnumeric 1.12
+AGM(3,3)	3	Gnumeric 1.12
+AGM(POWER(10,-300),1)	0.002269406194157821	Gnumeric 1.12
+AGM(-1,2)	{"error": "#NUM!"}	Gnumeric 1.12
+GD(0)	0	Gnumeric 1.12
+GD(1)	0.8657694832396586	Gnumeric 1.12
+GD(-2.5)	-1.4069935689361537	Gnumeric 1.12
+GD(20)	1.5707963226725894	Gnumeric 1.12
+GD(POWER(10,-10))	1e-10	Gnumeric 1.12
+ILOG(1000)	3	Gnumeric 1.12
+ILOG(999)	2	Gnumeric 1.12
+ILOG(POWER(10,22),10)	22	Gnumeric 1.12
+ILOG(0.001,10)	-3	Gnumeric 1.12
+ILOG(1024,2)	10	Gnumeric 1.12
+ILOG(1023,2)	9	Gnumeric 1.12
+ILOG(80,3)	3	Gnumeric 1.12
+ILOG(81,3)	4	Gnumeric 1.12
+ILOG(POWER(10,300),7)	354	Gnumeric 1.12
+ILOG(0.3,2)	-2	Gnumeric 1.12
+ILOG(0,10)	{"error": "#NUM!"}	Gnumeric 1.12
+ILOG(10,1)	{"error": "#NUM!"}	Gnumeric 1.12
+ILOG(10,0)	{"error": "#NUM!"}	Gnumeric 1.12
+ILOG(10,1.5)	{"error": "#NUM!"}	Gnumeric 1.12
+FIB(1)	1	Gnumeric 1.12
+FIB(2)	1	Gnumeric 1.12
+FIB(12)	144	Gnumeric 1.12
+FIB(46)	1836311903	Gnumeric 1.12
+FIB(78)	8944394323791488	Gnumeric 1.12
+FIB(2.9)	1	Gnumeric 1.12
+FIB(0)	{"error": "#NUM!"}	Gnumeric 1.12
+FIB(-3)	{"error": "#NUM!"}	Gnumeric 1.12
+FIB(1477)	{"error": "#NUM!"}	Gnumeric 1.12
+ISPRIME(2)	true	Gnumeric 1.12
+ISPRIME(1)	false	Gnumeric 1.12
+ISPRIME(0)	false	Gnumeric 1.12
+ISPRIME(-7)	false	Gnumeric 1.12
+ISPRIME(97)	true	Gnumeric 1.12
+ISPRIME(91)	false	Gnumeric 1.12
+ISPRIME(1000000007)	true	Gnumeric 1.12
+ISPRIME(561)	false	Gnumeric 1.12
+ISPRIME(7.9)	true	Gnumeric 1.12
+ISPRIME(4503599627370449)	true	Gnumeric 1.12
+ITHPRIME(1)	2	Gnumeric 1.12
+ITHPRIME(2)	3	Gnumeric 1.12
+ITHPRIME(10)	29	Gnumeric 1.12
+ITHPRIME(1000)	7919	Gnumeric 1.12
+ITHPRIME(10000000)	179424673	Gnumeric 1.12
+ITHPRIME(0)	{"error": "#NUM!"}	Gnumeric 1.12
+ITHPRIME(2.5)	3	Gnumeric 1.12
+PFACTOR(2)	2	Gnumeric 1.12
+PFACTOR(91)	7	Gnumeric 1.12
+PFACTOR(97)	97	Gnumeric 1.12
+PFACTOR(1)	{"error": "#VALUE!"}	Gnumeric 1.12
+PFACTOR(1000000007)	1000000007	Gnumeric 1.12
+PFACTOR(4503599627370449)	4503599627370449	Gnumeric 1.12
+PFACTOR(4503599627370495)	3	Gnumeric 1.12
+NT_D(1)	1	Gnumeric 1.12
+NT_D(12)	6	Gnumeric 1.12
+NT_D(720720)	240	Gnumeric 1.12
+NT_D(0)	{"error": "#NUM!"}	Gnumeric 1.12
+NT_D(4503599627370495)	128	Gnumeric 1.12
+NT_SIGMA(1)	1	Gnumeric 1.12
+NT_SIGMA(12)	28	Gnumeric 1.12
+NT_SIGMA(97)	98	Gnumeric 1.12
+NT_SIGMA(0)	{"error": "#NUM!"}	Gnumeric 1.12
+NT_SIGMA(1000000)	2480437	Gnumeric 1.12
+NT_PHI(1)	1	Gnumeric 1.12
+NT_PHI(9)	6	Gnumeric 1.12
+NT_PHI(97)	96	Gnumeric 1.12
+NT_PHI(1000000)	400000	Gnumeric 1.12
+NT_PHI(0)	{"error": "#NUM!"}	Gnumeric 1.12
+NT_MU(1)	1	Gnumeric 1.12
+NT_MU(6)	1	Gnumeric 1.12
+NT_MU(30)	-1	Gnumeric 1.12
+NT_MU(12)	0	Gnumeric 1.12
+NT_MU(97)	-1	Gnumeric 1.12
+NT_MU(0)	{"error": "#NUM!"}	Gnumeric 1.12
+NT_OMEGA(1)	0	Gnumeric 1.12
+NT_OMEGA(12)	2	Gnumeric 1.12
+NT_OMEGA(30030)	6	Gnumeric 1.12
+NT_OMEGA(1024)	1	Gnumeric 1.12
+NT_OMEGA(0)	{"error": "#NUM!"}	Gnumeric 1.12
+NT_PI(-5)	0	Gnumeric 1.12
+NT_PI(1)	0	Gnumeric 1.12
+NT_PI(2)	1	Gnumeric 1.12
+NT_PI(100)	25	Gnumeric 1.12
+NT_PI(1000000)	78498	Gnumeric 1.12
+NT_PI(179424673)	10000000	Gnumeric 1.12
+NT_RADICAL(1)	1	Gnumeric 1.12
+NT_RADICAL(12)	6	Gnumeric 1.12
+NT_RADICAL(1024)	2	Gnumeric 1.12
+NT_RADICAL(30030)	30030	Gnumeric 1.12
+NT_RADICAL(0)	{"error": "#NUM!"}	Gnumeric 1.12
+NT_RADICAL(4503599627370495)	4503599627370495	Gnumeric 1.12
+FLT.MAX()	1.7976931348623157e+308	Gnumeric 1.12
+FLT.MIN()	2.2250738585072014e-308	Gnumeric 1.12
+FLT.RADIX()	2	Gnumeric 1.12
+FLT.NEXTAFTER(1,2)	1.0000000000000002	Gnumeric 1.12
+FLT.NEXTAFTER(1,0)	0.9999999999999999	Gnumeric 1.12
+FLT.NEXTAFTER(0,"+")	5e-324	Gnumeric 1.12
+FLT.NEXTAFTER(-1,"-")	-1.0000000000000002	Gnumeric 1.12
+FLT.NEXTAFTER(3,3)	3	Gnumeric 1.12
+FLT.NEXTAFTER(1,"x")	{"error": "#VALUE!"}	Gnumeric 1.12
+ASCENSIONTHURSDAY(2024)	{"date": "2024-05-09T00:00:00Z"}	Gnumeric 1.12
+ASCENSIONTHURSDAY(2025)	{"date": "2025-05-29T00:00:00Z"}	Gnumeric 1.12
+ASCENSIONTHURSDAY(1999)	{"date": "1999-05-13T00:00:00Z"}	Gnumeric 1.12
+ASHWEDNESDAY(2024)	{"date": "2024-02-14T00:00:00Z"}	Gnumeric 1.12
+ASHWEDNESDAY(2025)	{"date": "2025-03-05T00:00:00Z"}	Gnumeric 1.12
+ASHWEDNESDAY(1900)	{"date": "1900-02-28T00:00:00Z"}	Gnumeric 1.12
+GOODFRIDAY(2024)	{"date": "2024-03-29T00:00:00Z"}	Gnumeric 1.12
+GOODFRIDAY(2025)	{"date": "2025-04-18T00:00:00Z"}	Gnumeric 1.12
+GOODFRIDAY(2000)	{"date": "2000-04-21T00:00:00Z"}	Gnumeric 1.12
+PENTECOSTSUNDAY(2024)	{"date": "2024-05-19T00:00:00Z"}	Gnumeric 1.12
+PENTECOSTSUNDAY(2025)	{"date": "2025-06-08T00:00:00Z"}	Gnumeric 1.12
+PENTECOSTSUNDAY(10)	{"date": "2010-05-23T00:00:00Z"}	Gnumeric 1.12
+ASHWEDNESDAY(9957)	{"error": "#NUM!"}	Gnumeric 1.12
+GOODFRIDAY(-1)	{"error": "#NUM!"}	Gnumeric 1.12
+DATE2JULIAN(DATE(2001,3,30))	2451999	Gnumeric 1.12
+DATE2JULIAN(DATE(1970,1,1))	2440588	Gnumeric 1.12
+DATE2JULIAN(DATE(2000,1,1))	2451545	Gnumeric 1.12
+DATE2JULIAN(DATE(1900,3,1))	2415080	Gnumeric 1.12
+DATE2JULIAN(DATE(2024,12,31))	2460676	Gnumeric 1.12
+HDATE_JULIAN(2001,3,30)	2451999	Gnumeric 1.12
+HDATE_JULIAN(2024,2,30)	2460371	Gnumeric 1.12
+HDATE_JULIAN(2024,13,1)	2460677	Gnumeric 1.12
+HDATE_JULIAN(2024,0,15)	2460294	Gnumeric 1.12
+HDATE_JULIAN(1582,10,15)	2299161	Gnumeric 1.12
+HDATE_JULIAN(2024.9,1.5,1.9)	2460311	Gnumeric 1.12
+HDATE(2024,1,1)	"20 Tebet 5784"	Gnumeric 1.12
+HDATE(2024,3,24)	"14 Adar II 5784"	Gnumeric 1.12
+HDATE(2024,10,3)	"1 Tishri 5785"	Gnumeric 1.12
+HDATE(2023,9,16)	"1 Tishri 5784"	Gnumeric 1.12
+HDATE(2000,2,29)	"23 Adar I 5760"	Gnumeric 1.12
+HDATE(1,1,1)	"18 Tebet 3761"	Gnumeric 1.12
+HDATE(2024,2,30)	"21 Adar I 5784"	Gnumeric 1.12
+HDATE(2024,13,1)	{"error": "#VALUE!"}	Gnumeric 1.12
+HDATE(2024,0,1)	{"error": "#VALUE!"}	Gnumeric 1.12
+HDATE(0,1,1)	{"error": "#VALUE!"}	Gnumeric 1.12
+HDATE(2024,1,32)	{"error": "#VALUE!"}	Gnumeric 1.12
+HDATE_HEB(2024,1,1)	"כ׳ בְּטֵבֵת התשפ״ד"	Gnumeric 1.12
+HDATE_HEB(2024,10,17)	"ט״ו בְּתִּשְׁרֵי התשפ״ה"	Gnumeric 1.12
+HDATE_HEB(2024,3,24)	"י״ד בְּאַדׇר ב׳ התשפ״ד"	Gnumeric 1.12
+HDATE_HEB(2025,3,1)	"א׳ בְּאַדׇר התשפ״ה"	Gnumeric 1.12
+HDATE_HEB(2240,9,1)	"י״ד בְּאֱלוּל ו׳"	Gnumeric 1.12
+HDATE_HEB(2024,13,1)	{"error": "#VALUE!"}	Gnumeric 1.12
+DATE2HDATE(DATE(2024,1,1))	"20 Tebet 5784"	Gnumeric 1.12
+DATE2HDATE(DATE(2024,4,23))	"15 Nisan 5784"	Gnumeric 1.12
+DATE2HDATE(DATE(1948,5,14))	"5 Iyar 5708"	Gnumeric 1.12
+DATE2HDATE(45000)	"22 Adar 5783"	Gnumeric 1.12
+DATE2HDATE(DATE(2024,9,3))	"30 Ab 5784"	Gnumeric 1.12
+DATE2HDATE_HEB(DATE(2024,3,24))	"י״ד בְּאַדׇר ב׳ התשפ״ד"	Gnumeric 1.12
+DATE2HDATE_HEB(DATE(2024,6,12))	"ו׳ בְּסִיוׇן התשפ״ד"	Gnumeric 1.12
+DATE2HDATE_HEB(DATE(2023,12,8))	"כ״ה בְּכִּסְלֵו התשפ״ד"	Gnumeric 1.12
+DATE2HDATE_HEB(DATE(2025,4,13))	"ט״ו בְּנִיסׇן התשפ״ה"	Gnumeric 1.12
+HDATE_DAY(2024,1,1)	20	Gnumeric 1.12
+HDATE_DAY(2024,3,24)	14	Gnumeric 1.12
+HDATE_DAY(2023,9,16)	1	Gnumeric 1.12
+HDATE_DAY(2024,2,30)	21	Gnumeric 1.12
+HDATE_DAY(2024,13,1)	{"error": "#VALUE!"}	Gnumeric 1.12
+HDATE_MONTH(2024,1,1)	3	Gnumeric 1.12
+HDATE_MONTH(2024,3,15)	13	Gnumeric 1.12
+HDATE_MONTH(2024,3,1)	12	Gnumeric 1.12
+HDATE_MONTH(2025,3,1)	5	Gnumeric 1.12
+HDATE_MONTH(2024,9,1)	10	Gnumeric 1.12
+HDATE_MONTH(2024,10,3)	0	Gnumeric 1.12
+HDATE_MONTH(2024,0,1)	{"error": "#VALUE!"}	Gnumeric 1.12
+HDATE_YEAR(2024,1,1)	5784	Gnumeric 1.12
+HDATE_YEAR(2024,10,3)	5785	Gnumeric 1.12
+HDATE_YEAR(2024,10,2)	5784	Gnumeric 1.12
+HDATE_YEAR(1,1,1)	3761	Gnumeric 1.12
+HDATE_YEAR(4000,12,31)	7761	Gnumeric 1.12
+HDATE_YEAR(-5,1,1)	{"error": "#VALUE!"}	Gnumeric 1.12
+PROBBLOCK(10,12)	0.11973918844482516	Gnumeric 1.12
+PROBBLOCK(10,12.7)	0.11973918844482516	Gnumeric 1.12
+PROBBLOCK(150,140)	0.10863616861352016	Gnumeric 1.12
+PROBBLOCK(50,200)	1.5219070610627318e-57	Gnumeric 1.12
+PROBBLOCK(500,200)	0.6013188220206098	Gnumeric 1.12
+PROBBLOCK(0,5)	0	Gnumeric 1.12
+PROBBLOCK(-1,5)	{"error": "#VALUE!"}	Gnumeric 1.12
+PROBBLOCK(5,0.5)	{"error": "#VALUE!"}	Gnumeric 1.12
+OFFTRAF(8,12)	8.598753503809851	Gnumeric 1.12
+OFFTRAF(100,140)	100.00276670129179	Gnumeric 1.12
+OFFTRAF(10,12)	{"error": "#VALUE!"}	Gnumeric 1.12
+OFFTRAF(-1,12)	{"error": "#VALUE!"}	Gnumeric 1.12
+DIMCIRC(10,0.01)	18	Gnumeric 1.12
+DIMCIRC(100,0.02)	113	Gnumeric 1.12
+DIMCIRC(0,0.5)	1	Gnumeric 1.12
+DIMCIRC(10,0)	{"error": "#VALUE!"}	Gnumeric 1.12
+DIMCIRC(10,1.5)	{"error": "#VALUE!"}	Gnumeric 1.12
+OFFCAP(12,0.1)	9.474039599657551	Gnumeric 1.12
+OFFCAP(150,0.01)	131.57558839441248	Gnumeric 1.12
+OFFCAP(1,0.5)	1	Gnumeric 1.12
+OFFCAP(12,1)	{"error": "#VALUE!"}	Gnumeric 1.12
+OFFCAP(0.5,0.1)	{"error": "#VALUE!"}	Gnumeric 1.12
+ILOG(0.2,4)	-2	exact
+ILOG(0.0625,4)	-2	exact
+FIB(47)	2971215073	exact
+FIB(79)	1.447233402467622e+16	exact
+FIB(100)	3.542248481792619e+20	exact
+FIB(1476)	1.3069892237633993e+308	exact
+PARTITIONS(0)	1	exact
+PARTITIONS(5)	7	exact
+PARTITIONS(100)	190569292	exact
+PARTITIONS(1000)	2.4061467864032624e+31	exact
+PARTITIONS(4000)	1.0241500647765513e+66	exact
+PARTITIONS(10.5)	42	exact
+PARTITIONS(-1)	{"error": "#NUM!"}	Gnumeric source
+PARTITIONS(4001)	{"error": "#NUM!"}	Improv limit
+ITHPRIME(10000001)	{"error": "#NUM!"}	Improv limit
+NT_PI(179424674)	{"error": "#NUM!"}	Improv limit
+ISPRIME(4503599627370497)	{"error": "#NUM!"}	Improv limit
+HDATE_YEAR(9999,12,31)	13760	exact
+HDATE_YEAR(4400,12,31)	8161	exact

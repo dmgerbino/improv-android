@@ -1,0 +1,25 @@
+[package]
+name = "improv_core_model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "improv_core_model"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["unbounded_depth"] }
+serde_stacker.workspace = true
+stacker.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+
+# `cargo llvm-cov` on nightly sets `--cfg coverage_nightly`; test modules are
+# `coverage(off)` so the report measures library code only.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

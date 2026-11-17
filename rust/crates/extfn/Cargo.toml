@@ -1,0 +1,38 @@
+[package]
+name = "improv_extfn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+improv_core_model = { path = "../core_model" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+# In-process WebAssembly interpreter (no JIT; MSRV 1.86 per its Cargo.toml, under
+# our 1.97 floor). MIT/Apache-2.0.
+wasmi = "2.0"
+
+[features]
+# `wat:` module bodies are assembled with the `wat` crate. On by default; turn
+# off for a smaller dep tree if only `.wasm`/base64 modules are used.
+default = ["wat"]
+wat = ["dep:wat"]
+
+[dependencies.wat]
+version = "1"
+optional = true
+
+# `setrlimit` for the subprocess-runner OS sandbox (Linux/macOS only; already a
+# transitive dep of the workspace via several other crates). MIT/Apache-2.0.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# `cargo llvm-cov` on nightly sets `--cfg coverage_nightly`; test modules are
+# `coverage(off)` so the report measures library code only.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

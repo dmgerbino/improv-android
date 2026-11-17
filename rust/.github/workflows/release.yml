@@ -1,0 +1,519 @@
+name: Release
+
+# A v* tag builds, qualifies and publishes a release. A workflow_dispatch run
+# (`gh workflow run release.yml -R gburd/improv --ref <branch>`) is the dry
+# run: every build and install test, with the version from Cargo.toml, and
+# nothing published (the GitHub Release, the ghcr push, PGXN, the registry
+# PR and the announcement are tag-only).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  qualify:
+    name: Qualify (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            test: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            test: true
+          # Intel macOS runners are gone (macos-13 retired): cross-compile on
+          # the arm64 runner; its tests run only for the native target above.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            test: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            test: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: improv
+          key: release-${{ matrix.target }}
+      # libduckdb-sys unpacks its bundled sources once per target dir, into
+      # target/duckdb-sources/<key>/, and fails ("Directory not empty")
+      # when the cache restored a partial copy without its COMPLETE marker.
+      - name: Drop cached DuckDB sources
+        shell: bash
+        run: find improv -path '*/target/duckdb-sources' -prune -type d -exec rm -r {} + 2>/dev/null || true
+      - name: Test (release)
+        if: matrix.test
+        working-directory: improv
+        run: cargo test --workspace --release --target ${{ matrix.target }}
+      # Linux: build in manylinux_2_28 (EL8), so the binaries need at most
+      # glibc 2.28 and GLIBCXX_3.4.25 (ci/manylinux.sh). Its target dir,
+      # target/manylinux, is nested in improv/target, so rust-cache keeps it
+      # with the host's (the crate registry is the host's, mounted).
+      - name: Build binaries (release)
+        working-directory: improv
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          build=(cargo build --release --target "$TARGET"
+            -p improv_cli -p improv_tui -p improv_server -p improv_gui)
+          case "$TARGET" in
+            *linux*)
+              ci/manylinux.sh "${build[@]}"
+              out=target/manylinux/$TARGET/release
+              ci/glibc-floor.sh 2.28 3.4.25 "$out"/improv{,-tui,-server,-gui} ;;
+            *) "${build[@]}"; out=target/$TARGET/release ;;
+          esac
+          echo "OUT=$out" >> "$GITHUB_ENV"
+      - name: Package
+        working-directory: improv
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ext=""
+          case "$TARGET" in *windows*) ext=".exe" ;; esac
+          tag=$REF_NAME
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            tag="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
+          staging="improv-${tag}-${TARGET}"
+          # man/man{1,5,7} as MANPATH wants them; completions/{bash,zsh,fish}.
+          mkdir -p "$staging"/man/man{1,5,7} "$staging"/completions/{bash,zsh,fish}
+          for bin in improv improv-tui improv-server improv-gui; do
+            cp "$OUT/${bin}${ext}" "$staging/"
+          done
+          for s in 1 5 7; do cp docs/man/*."$s" "$staging/man/man$s/"; done
+          cp docs/completions/*.bash "$staging/completions/bash/"
+          cp docs/completions/_* "$staging/completions/zsh/"
+          cp docs/completions/*.fish "$staging/completions/fish/"
+          cp README.md LICENSE-APACHE LICENSE-MIT CHANGELOG.md "$staging/"
+          mkdir -p dist
+          if [ -n "$ext" ]; then
+            7z a "dist/${staging}.zip" "$staging"
+          else
+            tar czf "dist/${staging}.tar.gz" "$staging"
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: improv/dist/*
+          if-no-files-found: error
+
+  # The extension, per Postgres major, as
+  # pg_improv-<ver>-pg<N>-x86_64-linux.tar.gz: the .so, control file,
+  # install script and update scripts under usr/ in Debian's PGDG layout.
+  # Built in manylinux_2_28 (EL8) against yum.postgresql.org's
+  # postgresql<N>-devel (ci/pg_improv-dist.sh), so the .so needs at most
+  # glibc 2.28; the packages job loads it into Debian's and EL's servers.
+  extension:
+    name: Extension (PG ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [15, 16, 17, 18]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+      - name: Package
+        working-directory: improv
+        env:
+          PG: ${{ matrix.pg }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            test "$(sed -n 's/^version = "\(.*\)"/\1/p' crates/pg_improv/Cargo.toml | head -1)" = "${REF_NAME#v}"
+          fi
+          ci/manylinux.sh ci/pg_improv-dist.sh "$PG" dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-pg${{ matrix.pg }}
+          path: improv/dist/*
+          if-no-files-found: error
+
+  # The DuckDB extension for linux_amd64, attached to the Release:
+  # improv-<ver>-duckdb-linux_amd64.tar.gz (improv.duckdb_extension, README).
+  # Stable C API: it loads into DuckDB v1.5.6 and v2.0, and is smoke tested
+  # in both before it is packaged. Built in manylinux_2_28 (EL8), as DuckDB
+  # builds its own linux_amd64 extensions, so it needs at most glibc 2.28.
+  # The registry builds every other platform (and signs them) from the
+  # descriptor; see duckdb-registry-pr.
+  build-duckdb-ext:
+    name: DuckDB extension (linux_amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: improv
+          submodules: recursive
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-venv unzip
+      - name: DuckDB CLIs
+        run: improv/ci/duckdb-clis.sh "$GITHUB_WORKSPACE/duckdb-cli"
+      - name: Build, test, smoke in v1.5.6 and v2.0, package
+        working-directory: improv
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/duckdb_improv/Cargo.toml | head -1)
+          if [ "$GITHUB_REF_TYPE" = tag ]; then test "${REF_NAME#v}" = "$ver"; fi
+          ci/manylinux.sh make configure release test_release
+          ext="$PWD/build/release/extension/improv/improv.duckdb_extension"
+          ci/glibc-floor.sh 2.28 3.4.25 "$ext"
+          for v in v1.5.6 v2.0.0; do
+            EXT="$ext" DUCKDB="$GITHUB_WORKSPACE/duckdb-cli/$v/duckdb" bash crates/duckdb_improv/test/smoke.sh
+          done
+          staging="improv-${ver}-duckdb-linux_amd64"
+          mkdir -p "$staging" dist
+          cp "$ext" crates/duckdb_improv/README.md LICENSE-APACHE LICENSE-MIT "$staging/"
+          tar czf "dist/${staging}.tar.gz" "$staging"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-duckdb
+          path: improv/dist/*
+          if-no-files-found: error
+
+  # .deb and .rpm (ci/packages.sh, nfpm): improv (the four binaries, man
+  # pages, completions) from the Linux tarball, and pg_improv per PG major
+  # under PGDG's names and paths. ci/install-test.sh installs each in clean
+  # containers of every supported distribution (Debian 12/13, Ubuntu
+  # 22.04/24.04, Rocky 8/9, AlmaLinux 10, Fedora; pg_improv under PGDG's
+  # server on Debian and EL) and runs it before it is attached.
+  packages:
+    name: Linux packages (.deb, .rpm)
+    needs: [qualify, extension]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: nfpm
+        run: |
+          set -euo pipefail
+          v=2.48.0 sum=6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750
+          curl -sSfL -o nfpm.tgz "https://github.com/goreleaser/nfpm/releases/download/v$v/nfpm_${v}_Linux_x86_64.tar.gz"
+          echo "$sum  nfpm.tgz" | sha256sum -c
+          mkdir -p "$RUNNER_TEMP/bin" && tar xzf nfpm.tgz -C "$RUNNER_TEMP/bin" nfpm
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Build and install-test
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) t=x86_64-unknown-linux-gnu
+          mkdir -p stage pkg
+          tar xzf "dist/improv-v$ver-$t.tar.gz" -C stage
+          ci/glibc-floor.sh 2.28 3.4.25 "stage/improv-v$ver-$t"/improv{,-tui,-server,-gui}
+          ci/packages.sh bin "$ver" "stage/improv-v$ver-$t" pkg
+          for pg in 15 16 17 18; do
+            ci/packages.sh pg "$ver" "$pg" "dist/pg_improv-$ver-pg$pg-x86_64-linux.tar.gz" pkg
+          done
+          ci/install-test.sh "$ver" pkg
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-packages
+          path: pkg/*
+          if-no-files-found: error
+
+  # A dry run checks the SBOMs and SHA256SUMS too, unsigned (keyless
+  # signing needs a tag's OIDC identity): a release once failed here after
+  # every build had passed, because the dry run skipped this step.
+  attest-dry-run:
+    name: SBOMs and SHA256SUMS (dry run, unsigned)
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    needs: [qualify, extension, build-duckdb-ext, packages]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@stable
+      - name: SBOMs, SHA256SUMS
+        env:
+          ATTEST_SIGN: none
+        run: |
+          cargo install cargo-cyclonedx --version =0.5.9 --locked
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          ci/release-attest.sh "v$ver" dist
+
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [qualify, extension, build-duckdb-ext, packages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # cosign keyless: the job's OIDC token gets a short-lived Fulcio
+      # certificate naming this workflow and tag. No signing secret exists.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+      - name: SBOMs, SHA256SUMS, signature
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          ATTEST_SIGN: keyless
+        run: |
+          cargo install cargo-cyclonedx --version =0.5.9 --locked
+          ci/release-attest.sh "$REF_NAME" dist
+      # After the sums: the formula pins the macOS tarballs by their SHA-256
+      # (it is not in SHA256SUMS itself; it is generated from it).
+      - name: Homebrew formula
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: ci/homebrew-formula.sh "$REF_NAME" dist/SHA256SUMS > dist/improv.rb
+      - name: Release notes from CHANGELOG
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # The `## [X.Y.Z] - date` section for this tag, up to the next one.
+          awk -v h="## [${REF_NAME#v}]" \
+            'index($0, h) == 1 { f = 1; next } f && /^## \[/ { exit } f' \
+            CHANGELOG.md > release-notes.md
+          test -s release-notes.md || {
+            echo "CHANGELOG.md has no '## [${REF_NAME#v}]' section" >&2
+            exit 1
+          }
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          body_path: release-notes.md
+          files: dist/*
+          fail_on_unmatched_files: true
+
+  # The container image (Containerfile): improv-server and the improv CLI on
+  # Debian trixie-slim, pushed to ghcr.io/gburd/improv as :X.Y.Z and :latest
+  # (amd64). podman is on the runner; the push uses the job's GITHUB_TOKEN.
+  # Before the push, the image must refuse to start without a token, refuse
+  # a token over plain HTTP (naming --tls-cert/--tls-key and
+  # IMPROV_ALLOW_PLAIN=1), answer /health with IMPROV_ALLOW_PLAIN=1, and
+  # with a mounted certificate answer HTTPS and not plain HTTP.
+  container:
+    name: Container image (ghcr.io/gburd/improv)
+    needs: [qualify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build, check, push (the push on a tag only)
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_REF_TYPE" = tag ]; then test "${REF_NAME#v}" = "$ver"; fi
+          img=ghcr.io/gburd/improv
+          podman build --label "org.opencontainers.image.version=$ver" \
+            --label org.opencontainers.image.source=https://github.com/gburd/improv \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.licenses=MIT OR Apache-2.0" \
+            -t "$img:$ver" -t "$img:latest" -f Containerfile .
+          test "$(podman run --rm --entrypoint improv "$img:$ver" --version)" = "improv $ver"
+          if podman run --rm "$img:$ver" 2>err.txt; then
+            echo "the image started without a token" >&2; exit 1
+          fi
+          grep -q "refusing to serve 0.0.0.0:3000 without auth" err.txt
+          # A token over plain HTTP: refused, naming both ways out.
+          if podman run --rm -e IMPROV_API_TOKEN=ci "$img:$ver" 2>err.txt; then
+            echo "the image served a token over plain HTTP" >&2; exit 1
+          fi
+          grep -q "refusing to serve 0.0.0.0:3000 over plain HTTP" err.txt
+          grep -q -- "--tls-cert and --tls-key" err.txt
+          grep -q "IMPROV_ALLOW_PLAIN=1" err.txt
+          # Plain HTTP, opted in (a host-side proxy would keep it off the network).
+          podman run -d --rm --name t -p 127.0.0.1:3000:3000 -e IMPROV_API_TOKEN=ci \
+            -e IMPROV_ALLOW_PLAIN=1 "$img:$ver" >/dev/null
+          for _ in $(seq 50); do curl -sf 127.0.0.1:3000/health >/dev/null && break; sleep 0.2; done
+          curl -sf 127.0.0.1:3000/health >/dev/null
+          test "$(curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:3000/v1/measures)" = 401
+          podman stop -t 5 t >/dev/null
+          # TLS: a throwaway CA and a certificate for 127.0.0.1, mounted.
+          tls=$(mktemp -d)
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+            -subj "/CN=improv CI CA" -keyout "$tls/ca.key" -out "$tls/ca.pem" 2>/dev/null
+          openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=127.0.0.1" \
+            -keyout "$tls/key.pem" -out "$tls/csr.pem" 2>/dev/null
+          printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\n' >"$tls/ext.cnf"
+          openssl x509 -req -in "$tls/csr.pem" -CA "$tls/ca.pem" -CAkey "$tls/ca.key" \
+            -CAcreateserial -days 1 -extfile "$tls/ext.cnf" -out "$tls/cert.pem" 2>/dev/null
+          chmod 755 "$tls" && chmod 644 "$tls"/*.pem   # uid 10001 reads them
+          podman run -d --rm --name t -p 127.0.0.1:3443:3000 -e IMPROV_API_TOKEN=ci -v "$tls:/tls:ro" \
+            "$img:$ver" /data/improv.db --tls-cert /tls/cert.pem --tls-key /tls/key.pem >/dev/null
+          for _ in $(seq 50); do
+            curl -sf --cacert "$tls/ca.pem" https://127.0.0.1:3443/health >/dev/null && break; sleep 0.2
+          done
+          curl -sf --cacert "$tls/ca.pem" https://127.0.0.1:3443/health >/dev/null
+          test "$(curl -s --cacert "$tls/ca.pem" -o /dev/null -w '%{http_code}' \
+            https://127.0.0.1:3443/v1/measures)" = 401
+          if curl -s --max-time 5 http://127.0.0.1:3443/health >/dev/null; then
+            echo "the TLS listener answered plain HTTP" >&2; exit 1
+          fi
+          podman stop -t 5 t >/dev/null
+          [ "$GITHUB_REF_TYPE" = tag ] || { echo "not a tag: built and checked, not pushed"; exit 0; }
+          echo "$GHCR_TOKEN" | podman login ghcr.io -u "$ACTOR" --password-stdin
+          podman push "$img:$ver"
+          podman push "$img:latest"
+
+  # PGXN: every release is published (pgxn.yml builds ci/pgxn-dist.sh's
+  # zip, uploads it, and waits until api.pgxn.org lists the version). It
+  # fails, rather than skipping, when the PGXN secrets are missing.
+  pgxn:
+    name: PGXN
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: release
+    uses: ./.github/workflows/pgxn.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
+
+  # DuckDB Community Extensions: point extensions/improv/description.yml at
+  # this tag and open the PR upstream (a DuckDB maintainer merges it). The
+  # first registration is a manual PR, so until the registry has the
+  # descriptor (a 404) this skips with a notice. After that it FAILS without
+  # the COMMUNITY_EXT_PAT secret (a token that can push to the fork
+  # gburd/community-extensions and open PRs from it), so a release cannot
+  # skip the registry silently.
+  duckdb-registry-pr:
+    name: PR to duckdb/community-extensions
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Is improv in the registry yet?
+        id: registered
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/duckdb/community-extensions/contents/extensions/improv/description.yml)
+          case "$code" in
+            200) echo "yes=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "::notice::extensions/improv/description.yml is not in duckdb/community-extensions yet; the first registration is a manual PR (crates/duckdb_improv/README.md, \"Registry\"). Skipping."
+                 echo "yes=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::GitHub API answered $code for the registry descriptor"; exit 1 ;;
+          esac
+      - name: Require COMMUNITY_EXT_PAT
+        if: steps.registered.outputs.yes == 'true'
+        env:
+          COMMUNITY_EXT_PAT: ${{ secrets.COMMUNITY_EXT_PAT }}
+        run: |
+          if [ -z "$COMMUNITY_EXT_PAT" ]; then
+            echo "::error::COMMUNITY_EXT_PAT is not set on this repository, so this release cannot reach the DuckDB registry. Set it (gh secret set COMMUNITY_EXT_PAT -R gburd/improv) and re-run this job."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.registered.outputs.yes == 'true'
+        with:
+          persist-credentials: false
+          path: improv
+      - name: Check out the fork of community-extensions
+        if: steps.registered.outputs.yes == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: gburd/community-extensions
+          token: ${{ secrets.COMMUNITY_EXT_PAT }}
+          path: community-extensions
+      - name: Point the descriptor at this tag
+        if: steps.registered.outputs.yes == 'true'
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p community-extensions/extensions/improv
+          sed -e "s/^  version:.*/  version: ${REF_NAME#v}/" \
+              -e "s/^  ref:.*/  ref: ${SHA}/" \
+              improv/crates/duckdb_improv/community-extensions/description.yml \
+              > community-extensions/extensions/improv/description.yml
+          grep -q "^  ref: ${SHA}$" community-extensions/extensions/improv/description.yml
+      - name: Open or update the upstream PR
+        if: steps.registered.outputs.yes == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.COMMUNITY_EXT_PAT }}
+          path: community-extensions
+          push-to-fork: gburd/community-extensions
+          branch: improv-${{ github.ref_name }}
+          commit-message: "improv ${{ github.ref_name }}"
+          title: "Update improv to ${{ github.ref_name }}"
+          body: |
+            Descriptor bump for improv ${{ github.ref_name }} (commit ${{ github.sha }}).
+            Stable C API (v1.5.6 floor): qualified with the registry's own build
+            (extension-ci-tools v2.0-cyanoptera, DuckDB v2.0.0) and
+            smoke tested in DuckDB v1.5.6 and v2.0 by gburd/improv's
+            duckdb.yml and release.yml.
+
+  # postgresql.org news (which feeds pgsql-announce): feature and major
+  # releases only. ci/announce.sh skips a patch release unless its CHANGELOG
+  # section has a "### Security" heading (or ANNOUNCE=1), and with the
+  # PGORG_* secrets unset it prints the draft to paste in by hand. Either
+  # way the article waits for postgresql.org's two moderators.
+  announce:
+    name: Announce (postgresql.org news)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [release, pgxn]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Announce
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          PGORG_USER: ${{ secrets.PGORG_USER }}
+          PGORG_PASSWORD: ${{ secrets.PGORG_PASSWORD }}
+          PGORG_ORG_ID: ${{ secrets.PGORG_ORG_ID }}
+          PGORG_EMAIL_ID: ${{ secrets.PGORG_EMAIL_ID }}
+          PGORG_TAGS: ${{ secrets.PGORG_TAGS }}
+        run: bash ci/announce.sh "${REF_NAME#v}"

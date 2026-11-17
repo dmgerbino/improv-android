@@ -1,0 +1,951 @@
+# Per-user access control with Cedar policies (2026-11-02)
+
+**Goal.** Every front end (the egui GUI, a COSMIC GUI, the web GUI, the
+TUI and the CLI) connects securely to a database that hosts Improv models,
+through pg_improv or through `improv-server`, and views and edits them live.
+A per-user, per-role and per-group policy decides who sees and who changes
+what. Policies are written in [Cedar](https://www.cedarpolicy.com)
+(`cedar-policy`, Apache-2.0) and checked by one library, `improv_policy`,
+at every enforcement point.
+
+Base: `main` at `cff0143` (0.12.2). The 0.11 owner model is
+`crates/pg_improv/src/owner.rs`; the server's tokens and scopes are in
+`crates/server/src/main.rs`; the C3 review is
+[2026-10-25-security-review.md](2026-10-25-security-review.md).
+
+## Decisions in one list
+
+1. **One schema, one library.** The Cedar schema below lives in
+   `crates/policy` (`improv_policy::SCHEMA`). Postgres, the server and the
+   clients load the same crate. No enforcement point writes its own rules.
+2. **Opt-in per model.** A model with no stored policies behaves exactly as
+   in 0.12. Once a model has policies, they are enforced and the default is
+   deny.
+3. **Forbid wins. Errors deny.** Cedar already makes a forbid override a
+   permit. Cedar also skips a policy whose evaluation errors, which can
+   turn a broken forbid into an allow. Improv denies any request whose
+   evaluation reports an error.
+4. **Policies name things by id.** `Improv::Measure::"101"`, not
+   `"Revenue"`. A rename cannot move a measure out from under a forbid.
+   The CLI prints names beside ids, and its templates take names.
+5. **The owner is never restricted.** In Postgres, a superuser and any
+   role that may act as the model's owner (`improv.may_act_as`) bypass
+   Cedar. Cedar narrows what everyone else sees and does. Nobody can lock
+   the owner out.
+6. **Hidden means absent.** A hidden measure, item or cell is missing from
+   every response: no placeholder, no count, no different error.
+7. **The authority computes.** A client under a read policy never computes
+   derived values from the inputs it can see. It reads them from the
+   authority (pg_improv's result tables, or the server's engine), and asks
+   the authority for what-ifs.
+8. **Aggregates are computed over all data.** Hiding an item hides its
+   cells, not its share of a total. A policy that must hide a total hides
+   the total's measure or cells. `improv policy lint` reports the totals
+   and derived measures that let a reader infer something hidden.
+9. **DuckDB models go through improv-server.** DuckDB has no users. A
+   DuckDB-hosted model store is a later stage; the server will own the
+   file and enforce the policies. The DuckDB extension stays single-user.
+10. **TLS by default off the host.** storage_pg gets rustls with
+    certificate verification and refuses cleartext to anything but a
+    socket or loopback unless `sslmode=disable` is explicit (as today).
+    The server terminates TLS itself or sits behind a proxy.
+
+Where this disagrees with the lead's proposal: decisions 4, 7 and 8 are
+additions; `ReadItem` is a ninth action (item names need their own rule,
+below); Role and Group get distinct meanings (below); the server keeps its
+token scopes as an outer cap; and the 0.13 scope is smaller than the whole
+goal (see [What 0.13 delivers](#what-013-delivers)).
+
+## The schema
+
+```cedar
+namespace Improv {
+  // Who. A User is one authenticated identity. A Role is asserted by the
+  // identity source (Postgres role membership; later, a JWT claim). A
+  // Group is defined with the model's policies, by its Admin.
+  entity Role in [Role];
+  entity Group in [Group];
+  entity User in [Group, Role];
+
+  // What. Ids are the model's numeric ids, as strings. A model's policies
+  // apply to that model only; its entity is always Model::"model".
+  entity Model;
+  entity Category in [Model];
+  entity Item in [Category];
+  entity Measure in [Model] { kind: String };   // "input" | "derived"
+  entity View in [Model] { measure: Measure };
+  // One cell: a measure and one item per category of the measure. Its
+  // parents are the measure and the items. It has no attributes.
+  entity Cell in [Measure, Item];
+
+  type Context = { channel: String };  // "local" | "postgres" | "server"
+
+  action Read, Write, Build;           // groups, for policies to name
+  action ViewModel in [Read] appliesTo {
+    principal: User, resource: Model, context: Context };
+  action ReadMeasure in [Read] appliesTo {
+    principal: User, resource: Measure, context: Context };
+  action ReadItem in [Read] appliesTo {
+    principal: User, resource: Item, context: Context };
+  action ReadCell in [Read] appliesTo {
+    principal: User, resource: Cell, context: Context };
+  action EditCell in [Write] appliesTo {
+    principal: User, resource: Cell, context: Context };
+  action DefineMeasure in [Build] appliesTo {
+    principal: User, resource: [Model, Measure], context: Context };
+  action EditStructure in [Build] appliesTo {
+    principal: User, resource: [Model, Category, Item], context: Context };
+  action ManageViews in [Build] appliesTo {
+    principal: User, resource: [Model, View], context: Context };
+  action Admin appliesTo {
+    principal: User, resource: Model, context: Context };
+}
+```
+
+**What each action allows.**
+
+| Action | Resource | Allows |
+|---|---|---|
+| ViewModel | Model | Opening the model: its existence, its categories' names, its views' names. |
+| ReadMeasure | Measure | The measure's name, type and dimensions; its formula when every measure the formula reads is readable too. |
+| ReadItem | Item | The item's name as a row or column header, and its place in its category. |
+| ReadCell | Cell | The cell's value. |
+| EditCell | Cell | Setting or clearing an input cell. |
+| DefineMeasure | Model (new) or Measure | Adding, redefining, formatting or dropping a measure. |
+| EditStructure | Model, Category or Item | Adding, renaming, reordering or removing categories and items. |
+| ManageViews | Model (new) or View | Saving, changing or dropping views. |
+| Admin | Model | Setting and clearing the model's policies and groups. |
+
+**The composite rules.** An enforcement point never asks Cedar one
+question for a cell. It applies these rules, so a policy author cannot
+forget a step:
+
+- A cell is **visible** when ReadMeasure allows its measure, ReadItem
+  allows every item of its coordinate, and ReadCell allows the cell.
+- A cell is **editable** when it is visible, its measure is an input, and
+  EditCell allows it. No blind writes.
+- A formula is **shown** when its measure is readable and every measure it
+  reads is readable. Otherwise the measure shows without its formula.
+- Every action needs ViewModel first.
+
+**Why ReadItem.** Without it, hiding an item's cells would still show its
+name as an empty row ("Project Falcon"). Item names are often the secret.
+
+**Why cells have no attributes.** A cell's decision can then depend only
+on which policy-named entities it is `in`: its measure, and those of its
+items that some policy names. Two cells whose items differ only in items
+no policy names get the same decision. That makes the per-cell cache
+below exact, and keeps per-cell cost to a few hash lookups. To keep it
+exact, a policy may not name a Cell (`set` refuses `Improv::Cell::"…"`),
+and the schema gives Cells no attributes.
+
+**Templates.** `improv policy template NAME` prints policy text to edit
+or store. Each takes a principal, `--group G` or `--user U`:
+
+| Template | Takes | Gives |
+|---|---|---|
+| `viewer` | | ViewModel, ReadMeasure, ReadItem, ReadCell on everything |
+| `editor` | `--measure M`… | `viewer`, plus EditCell on the cells of those input measures |
+| `analyst` | `--item I`… | `viewer`, minus ReadItem on those items: their rows and cells are absent, totals stay |
+| `hide-measures` | `--measure M`… | a forbid of ReadMeasure on those measures; add it to another template |
+| `admin` | | every action |
+
+**Groups and roles.** Roles come from whoever authenticated the user, and
+a model's Admin cannot change them. Groups are stored with the model's
+policies as Cedar entities JSON (`User in Group`, `Group in Group` edges
+only), so a model Admin groups users without a DBA. A stored document that
+names a Role, or gives a User a Role parent, is refused.
+
+## Where each check happens
+
+| Path | Enforcement point | What it checks |
+|---|---|---|
+| psql, or any client over storage_pg | pg_improv, in the backend | Reads of result tables (row-level security calling the policy), the filtered read functions, cell edits, `define`, structure changes, `set_policies`. |
+| HTTP clients (web GUI, scripts) | improv-server | Every route, before and after the store: requests are authorized, responses filtered. |
+| Desktop GUI, COSMIC GUI, TUI over a server or Postgres | the server or pg_improv | Nothing locally that matters for security. The client asks for capability hints to grey out what the user cannot do. |
+| CLI, TUI, GUI on a local Mentat file | none | The file is the boundary: whoever can read the file reads everything. Policies stored in a file are enforced when improv-server serves it. `improv policy check` evaluates them for testing. |
+| DuckDB extension (`improv(source, spec)`) | none | Stateless and single-user: it reads what the DuckDB connection reads. |
+
+Client hints are never security. Every authority re-checks.
+
+## Identity mapping
+
+| Path | Cedar User | Cedar Roles | Cedar Groups |
+|---|---|---|---|
+| Postgres | `current_user` (so `SET ROLE` acts as that role, as Postgres privileges do) | every role whose privileges `current_user` has (`pg_has_role(current_user, r, 'USAGE')`) | the model's stored groups |
+| improv-server, tokens | the token's name | none yet | the model's stored groups |
+| improv-server, later OIDC/JWT | the `sub` claim | a configured claim (`roles`) | the model's stored groups |
+| `improv policy check` | `--user` | `--role` (asserted by the tester) | the model's stored groups |
+
+The server's seam: an `Authenticator` returns an `Identity { user, roles,
+scope }`. The bearer-token one exists today. A JWT one validates a
+signature against a JWKS and maps claims; nothing past the `Identity`
+changes. A token's scope stays an outer cap: a read token never writes,
+whatever the policy says.
+
+When the server's store is Postgres, the server connects as one service
+role that may act as the model's owner, and enforces the policies itself
+for its callers. pg_improv sees only the service role. Per-request `SET
+ROLE` is not planned.
+
+## Threat model
+
+**Protected.** The confidentiality of measures, items and cells a policy
+hides from a principal, and the integrity of cells, formulas, structure,
+views and policies a policy does not let the principal change.
+
+**Against whom.** Authenticated users who are not the model's owner: an
+analyst, a contractor, a dashboard token. They may bypass every GUI and
+use psql, curl or their own code. Also a network attacker between a client
+and Postgres or the server (TLS).
+
+**Not protected, by design:**
+
+- Superusers, the model's owner, roles that may act as the owner, and the
+  server's operator. They see everything.
+- Anyone who can read a Mentat or DuckDB file, the server's token file, or
+  the server's process.
+- The source tables. A model bound to `sales` reads `sales` as its owner.
+  Cedar governs the model's view of it. A role that can `SELECT` from
+  `sales` reads it directly whatever the model's policy says. The DBA's
+  grants on source tables must match the intent.
+- Inference. A visible total and visible parts reveal a hidden part (total
+  minus the visible ones). A derived measure reveals the measure it is
+  computed from (`Bonus = Salary * 0.1`). `improv policy lint` lists these;
+  it does not prevent them.
+- Existence and timing. A ViewModel holder sees the model and its
+  category names. It also learns that the model changed, when, and how
+  often, even when nothing it can see changed: the model's version is
+  global (see [Versions](#versions-and-change-timing)). It never learns
+  what changed.
+- Older releases. 0.12 opens a file with policies and ignores them. For a
+  file this changes nothing (see above). For Postgres the policies are in
+  the database, so an old client cannot get past them.
+
+### Versions and change timing
+
+**Ruling: accepted and documented (option a), with two rules that keep
+option b open.** A model has one version, `improv.model_version` in
+Postgres and the store's high-water for a file. A principal that sees the
+version move with no visible change learns that something it cannot see
+changed, and when.
+
+- **Why not per-principal versions (b).** Postgres cannot hide change
+  timing from a role that may use the database. Any role may `LISTEN` on
+  any channel. `improv.model_version` is readable by every
+  `improv_user`. `pg_stat_user_tables` and `pg_current_wal_lsn()` show
+  any role when writes happen. Hiding the version on the server alone
+  would promise something the same model in Postgres does not keep.
+- **Rule 1: versions are opaque.** The server's API and the model
+  service carry a version as a string that clients compare for equality
+  only. They never order versions or subtract them. The server can later
+  switch to one version per principal (b) without changing the API.
+- **Rule 2: a cell edit never fails because the version moved.** When
+  the store refuses a batch of cell edits as a conflict, the authority
+  reloads, checks each cell again (it still exists, and the principal may
+  still edit it) and retries, up to three times. The last write to a cell
+  wins. So a hidden change never refuses a visible edit, which would leak
+  it. A structure edit (EditStructure, DefineMeasure, ManageViews) still
+  fails with a conflict. Those principals see the structure, so the leak
+  is small. Today's server returns 409 for a cell edit that races another
+  writer; stage 2 changes that.
+- **No empty events.** The change feed sends nothing to a subscriber when
+  the visible part of a change is empty. A client that polls still sees
+  the version move.
+
+**Denial of service.** A policy document is capped at 1 MiB and 10,000
+policies. Cedar's evaluation is linear in the policy set and has no
+loops.
+
+## TLS
+
+**Postgres (storage_pg).**
+
+- rustls, with the `ring` provider (already in the tree, no C toolchain).
+  `postgres` 0.19 takes a `MakeTlsConnect`; `tokio-postgres-rustls` if its
+  version lines up, else our own connector of about 80 lines.
+- `sslmode`: `disable`, `prefer` (the default), `require`, `verify-ca`,
+  `verify-full`. Improv parses `verify-ca` and `verify-full` itself, since
+  `postgres` 0.19 does not.
+- Improv verifies the certificate whenever it uses TLS. `require` behaves
+  as `verify-full`; this is stricter than libpq and the docs say so.
+  `sslrootcert=FILE` trusts that CA only. Without it, the operating
+  system's roots (`rustls-platform-verifier`).
+- Off the host (not a Unix socket, not loopback), `prefer` never falls
+  back to cleartext. Only an explicit `sslmode=disable` sends cleartext,
+  as today.
+- With TLS, SCRAM uses channel binding (`channel_binding=prefer`, which
+  `postgres` supports).
+
+**improv-server.**
+
+- Behind a proxy that terminates TLS, as `server.md` documents today
+  (Caddy, nginx). The server listens on loopback.
+- Or itself: `--tls-cert FILE --tls-key FILE` (rustls, `tokio-rustls`,
+  HTTP/1.1 over ALPN). With both set, the server refuses a plain listener
+  on a non-loopback address.
+- Tokens still never travel in cleartext off the host: with tokens set
+  and no TLS, the server binds loopback only unless `IMPROV_ALLOW_PLAIN=1`.
+
+## Live updates
+
+**Postgres.** pg_improv sends `NOTIFY improv_<model id>, '<tx>.<data>'`
+at the commit of a transaction that moved `improv.model_version.tx` (a
+structural change, a store's save) or applied the model's inputs or
+wrote its results (`improv.stale.data_gen`: the sync worker, trigger and
+commit modes, `recalc`). Both are numbers: the payload carries nothing
+else. The channel is the model's numeric id (`improv.model.id`), not
+its name: a model name is any text, and a channel is an identifier
+(unquoted, folded to lower case, at most 63 bytes), so names would need
+quoting rules every client gets right, could collide after folding, and
+would be cut at 63 bytes. A client looks the id up once
+(`SELECT id FROM improv.model WHERE name = …`, which every reader may
+read). The payload is a number and nothing else: any role may `LISTEN`
+on any channel. A client keeps one extra connection that listens, and on
+a notification re-reads what it shows through the filtered read path. The
+re-read applies the policy, so each client sees only what it may.
+
+**Server.** `GET /v1/changes` is Server-Sent Events. The first version
+sends `{"tx": N}` per change, and the client re-reads. The second sends
+the changed cells, filtered per subscriber: the server already has the
+engine's delta; it keeps one policy session per subscriber and drops cells
+that session may not see. A change to the policies or the structure sends
+`{"reload": true}`, and the client re-reads everything.
+
+**Mentat files.** Today's high-water polling (H9) stays. With the server
+in front, its feed replaces polling.
+
+## The model-service contract
+
+The `web` agent is building a model-service trait in `crates/client`
+(`improv_client`). Under a policy, it needs an implementation that is
+remote and filtered and never holds the full input set. What that implementation must guarantee:
+
+1. **It never computes derived values locally** when the user is
+   restricted. Every derived cell, total and what-if result comes from the
+   authority. Local evaluation is for an unrestricted local model only.
+2. **It holds only what the user may see.** Structure (categories, visible
+   items in order, visible measures, formulas when shown, views) and the
+   cells of the window on screen. No call returns the whole model.
+3. **Hidden is absent.** Item lists, measure lists, cell pages and totals
+   ("n cells", page counts) count visible things only. A hidden cell is
+   not a null, an error or a blank.
+4. **Reads are windowed.** `cells(measure, page items, row range, column
+   range)` returns visible cells in that window, computed by the
+   authority.
+5. **What-ifs go to the authority.** `what_if(edits, measures, window)`
+   returns the authority's results. The authority checks each edited cell
+   as for EditCell, without saving.
+6. **Edits are per cell.** `edit(cells)` succeeds whole or fails whole.
+   A refusal names the first failing cell. A denied cell and a cell that
+   does not exist for this user get the same text. A cell edit never
+   fails because the version moved (the authority retries; the last
+   write to a cell wins). A structure edit fails with a conflict when
+   the version moved.
+7. **Capabilities are hints.** `can(action, resource)` greys out menus
+   and cells. Every call can still fail with `Denied`, and the GUI must
+   handle that on every call.
+8. **Changes arrive by subscription.** `subscribe()` yields changed cells
+   (already filtered) or `Reload`. On `Reload` (the policy, the structure
+   or the user's groups changed) the client drops its caches. A change
+   with no visible part sends nothing. Versions are opaque strings,
+   compared for equality only.
+9. **Undo is inverse edits.** A filtered client cannot snapshot the whole
+   model, so undo sends the inverse edit through `edit`.
+10. **Errors do not leak.** Error text from the authority is shown as is;
+    the client never adds what it knows about hidden things.
+
+## Inference and aggregates
+
+- A total is a cell of a derived measure whose dimensions leave out the
+  category it sums over. It is computed by the authority over every item,
+  hidden ones included.
+- A policy on the total's measure (ReadMeasure) or its cells (ReadCell
+  `in Improv::Measure::"…"`) hides it. A policy on items does not.
+- "Sees aggregates but not some items" therefore means: ReadItem forbids
+  those items, so their rows and cells are absent; the totals stay visible
+  and correct. The analyst template does exactly that.
+- What that reveals: with one hidden item, the total minus the visible
+  items is the hidden value. With several hidden items, their sum. `improv
+  policy lint --user U` reports, for a principal, each readable derived
+  measure that reads a hidden measure or aggregates over a category with
+  hidden items.
+- Not offered: totals over visible items only (each user would see
+  different numbers, and the engine would run per user), and small-cell
+  suppression. Both are possible later as a per-measure option.
+
+**What each template shows for an aggregate.** An aggregate is a cell of
+a derived measure that sums (or averages, counts, ranks) over items. It is
+never recomputed over the visible items. It is shown with its value over
+all items, or it is absent. Clients display exactly this:
+
+| Template | Aggregate over items the principal cannot see | Derived cell that reads a hidden measure |
+|---|---|---|
+| `viewer` | none are hidden: shown | none are hidden: shown |
+| `editor` (edits named measures) | none are hidden: shown | none are hidden: shown |
+| `analyst` (hides named items) | **shown**, over all items, hidden ones included | none are hidden: shown |
+| `hide-measures` (hides named measures) | not affected by this template: shown | **shown**, without its formula |
+| `admin` | none are hidden: shown | none are hidden: shown |
+| any, plus a forbid on the aggregate's measure or cells | **absent** | **absent** |
+
+A cell whose own coordinate names a hidden item (`Total[Product=Secret]`)
+is absent under every template: the composite rule needs every item of
+the coordinate readable.
+
+## Performance (measured)
+
+Release builds, x86_64 Linux (werk), rustc 1.98; medians. The first three
+rows replace the targets this note set (20 µs, 200 ns, 1.2×), which the
+lead accepted as measured. `cargo test --release -p improv_policy --
+--ignored --nocapture perf` reproduces the `improv_policy` rows.
+
+| What | Measured |
+|---|---|
+| One raw `authorize` (100 policies, uncached, the canonical model) | 142 µs |
+| One question of a new, uncached session (100 policies) | 21 µs |
+| One cell check from a session's class cache | 334 ns |
+| Parsing and validating 100 policies | 4.5 ms |
+| A filtered read of a 1M-cell measure through a session (1,000 x 1,000 items, 100 policies, one row hidden; `perf_filtered_read`) | 326 ms (326 ns a cell; the bare pass: 2 ms) |
+| pg_improv, PG 17: `SELECT count(*), sum(value)` of a 1M-row result table as a restricted role (row-level security), against the owner (none); stage 3 as first built | 955 ms against 78 ms (12×) |
+| The same, with the per-statement qual (`docs/reviews/bench/rls_1m.sh`, the mixed case below) | 167 ms against 63 ms (2.7×); 126 ms (2.0×) once a recalc vouches for the rows; a uniform allow 88 ms (1.4×) |
+| pg_improv: `improv.cells` of that measure, restricted against the owner | 3.6 s against 3.3 s |
+
+**Where the time goes.** A raw `authorize` builds the whole request: the
+schema-checked request, the principal and resource entities, and every
+policy of the set. A session keeps only the policies that can apply to
+its principal and action, and caches decisions per class, so a cell check
+is a few hash lookups; at 1M cells that is the 326 ms. In Postgres, stage
+3 as first built called `improv.cell_visible` once per row: building the
+`text[]` of a row's item names cost about 150 ns, the function call and
+the session's statement check about 200 ns more, the coordinate and the
+cache lookup the rest. The owner's read has no qual.
+
+**The result tables' qual, per statement.** Postgres runs an uncorrelated
+scalar subquery in a policy qual once per execution (an InitPlan), so the
+qual of measure `w` of model `m` is
+
+```sql
+(SELECT improv.cell_rule(m, w)) <> 1 AND
+  ((SELECT improv.cell_rule(m, w)) = 0 OR improv.row_visible(m, w, "row", col))
+```
+
+`cell_rule` says 0 (every row: the owner's side, or no policies), 1 (no
+row: stored policies that cannot be used, `ViewModel` or `ReadMeasure`
+denied, a category of the measure with no item the role may read, or
+every combination of the items' decision classes denied, which it asks
+the session for up to 1,024 combinations) or 3 (check each row). Each is
+exactly what `cell_visible` says of every row. `row_visible` takes the
+dimension columns as `VARIADIC "any"` text, so no array is built. Its
+first call of a query finds the session and builds, per measure, each
+category's item names (as bytes, FNV-hashed) to their decision class, and
+a decision per combination of classes, kept in the call's `fn_extra`. A
+row then hashes its names and reads one byte: no allocation. A name the
+model lacks has no entry and hides its row, as before. Freshness is as
+before (the session's statement stamp; a change committed elsewhere
+applies from the next statement, REPEATABLE READ keeps its snapshot's
+view); a cursor keeps its first execution's decisions.
+
+Measured on PG 17 (release build, `shared_buffers = 1GB`,
+`max_parallel_workers_per_gather = 0`, werk; `rls_1m.sh`: medians of 7
+wall-clock runs, each its own connection, 1000 x 1000 items):
+
+| Case | Owner | Restricted, stage 3 as first built | Restricted, per-statement qual |
+|---|---:|---:|---:|
+| mixed: permit Read; forbid ReadItem on r0; 98 forbids for others naming r1..r98 | 61 ms | 1007 ms | 167 ms (2.7×) |
+| uniform: permit Read only | 62 ms | 939 ms | 158 ms (2.5×) |
+| cells: mixed, plus a ReadCell forbid on r1 x c1 (not separable per category) | 62 ms | 1015 ms | 174 ms (2.8×) |
+| denied: permit Read, forbid ReadMeasure on W (rule 1) | 63 ms | about 1000 ms | 56 ms (0 rows) |
+
+About 10 ms of each restricted number is the Cedar session a new
+connection builds at its first statement (11 ms with 100 policies, 6 ms
+with one); a warm session reads the mixed case in 142 ms. The rest is
+about 90 ns a row: the call, two hashes, a byte.
+
+**Why not hidden-item name lists (the first design).** The plan had a
+rule 2: a row is visible when each dimension's item is outside a
+per-category hide list (or inside an allow list), the lists InitPlan
+arrays. Two findings changed it:
+
+- **Stale rows would leak.** A result table is keyed by item names, and
+  its rows keep the names they were written with until their measure is
+  recomputed. An item renamed (by a `postgres://` store's save, the GUI,
+  or `UPDATE improv.item`) or deleted leaves rows whose name the model no
+  longer has. `cell_visible` hides them (no item, no cell). A hide list of
+  the model's current names would show them, and after a rename exactly
+  the wrong ones: forbid `Item::"57"` named `Secret`, rename 57 to
+  `Public`, and the list is `['Public']`, so the stale `Secret` rows, the
+  forbidden item's values, show. A uniform allow answered by rule 0 would
+  likewise show stale rows `cell_visible` hides. So rule 0 is only the
+  owner's side and models without policies, and a uniform allow is
+  checked per row. `the_qual_shows_what_cell_visible_shows` checks rows
+  with names the model lacks, a forbidden item renamed, an item deleted,
+  and both recomputed.
+- **A list costs per name per row.** `col <> ALL(<InitPlan array>)` is
+  not hashed (only a constant array is), so each row walks the list,
+  about 10 ns a name, and an InitPlan array under 127 bytes is detoasted
+  per row; a 64-name list costs about 700 ns a row, more than
+  `row_visible`. A list pays only for one or two names a category.
+
+**Rule 2, with proof the rows are fresh.** A uniform allow (rule 0) and
+one or two hidden names a category (rule 2: the qual compares the row's
+names with `(SELECT improv.cell_name(m, w, dim, slot))` InitPlans, `IS
+DISTINCT FROM` each, an empty slot NULL) are used only when the model's
+result rows are vouched for, so the leak above cannot happen:
+
+- `improv.stale (model_id, items, gen, clean_gen)`. A trigger on
+  `improv.item` (`ENABLE ALWAYS`, so a logical subscriber or a restore
+  with `session_replication_role = replica` fires it too) bumps `gen` for
+  an item UPDATE that changed a row, a DELETE and a TRUNCATE (every
+  model), and `items` for those and an INSERT. A trigger on each filtered
+  result table bumps `gen` for any INSERT or UPDATE of it, the
+  extension's own writes included (a recompute from a load that raced a
+  rename writes the old name).
+- Only a recompute of every derived measure clears it: `recalc`,
+  `set_sync_mode` to trigger or commit, and the sync worker's rebuild (a
+  load and a whole-table diff of every result table). After its writes,
+  in its transaction, it reads `gen`, checks in one query per table that
+  every row's dimension values are the names of the model's items (as of
+  a snapshot after that read), and then sets `clean_gen = gen` with a
+  compare-and-set (`UPDATE … SET clean_gen = $read WHERE gen = $read`) on
+  the row the triggers bump. A rename that commits after the check, or
+  is still in flight, moves `gen` (or waits on the row lock and then
+  fails the compare), so the model stays stale. Under REPEATABLE READ or
+  SERIALIZABLE the clear is skipped. Trigger mode's statement recomputes,
+  commit mode's pre-commit recompute and the worker's incremental applies
+  write result rows and never clear.
+- The default is stale: a model without a row, or with `clean_gen`
+  NULL, is checked per row; a model updated to 0.13.0, or made by a
+  store that writes `improv.model` directly, starts stale until its first
+  full recompute.
+- `cell_rule` reads the row in the statement's own snapshot (a read-only
+  SPI execution takes no snapshot of its own), and the backend's Cedar
+  session is keyed on `items` as well as the policy and model versions,
+  and is used for rule 2 only if `items` did not move while it was built.
+  A cached session never outlives a rename.
+
+Measured, PG 17, release, medians of 7 wall-clock runs each in its own
+connection, on a host that was otherwise idle (`rls_1m.sh`; "stale" is
+after an item renamed and back, "clean" after a `recalc`):
+
+| Case | Owner | Restricted, stale | Restricted, clean (rule) |
+|---|---:|---:|---:|
+| mixed (r0 hidden; 98 forbids for others, r1..r98 named) | 64 ms | 167 ms (2.6×) | 126 ms (2.0×, rule 2) |
+| uniform: permit Read only | 64 ms | 155 ms (2.5×) | 88 ms (1.4×, rule 0) |
+| hidden1: permit Read, forbid ReadItem on r0 | 64 ms | 158 ms (2.5×) | 115 ms (1.8×, rule 2) |
+| cells: mixed, plus a ReadCell forbid on r1 x c1 | 64 ms | 172 ms (2.7×) | 169 ms (rule 3: not per category) |
+| denied: forbid ReadMeasure on W | 64 ms | 65 ms (rule 1) | 65 ms (rule 1) |
+
+About 10 ms of each restricted number is the first statement's Cedar
+session in a new connection (warm, uniform clean reads in about 70 ms
+against the owner's 57 ms). Rule 2 costs about 15 ns per comparison a
+row: 2 slots a dimension, 4 for this table. The 1.5× target is met for a
+uniform allow; with hidden names rule 2 gives 1.8× (2.0× in the mixed
+case, whose 99 named items make the session's first build slower).
+
+**Not done, on purpose.** Result tables stay keyed by item names (the SQL
+users read). The session still checks each request against the schema
+(`Request::new` with a schema): that is in the session's first questions,
+not the per-row path, and skipping it would weaken fail-closed for no
+gain here. `unvalidated_policies_hide_every_row_for_every_rule` checks
+that stored policies naming an undeclared attribute deny every row
+through the qual, from every rule the valid ones gave (0, 1, 2 and 3).
+
+**Caching.** A session is one (policy version, model structure version,
+principal, channel). It caches decisions:
+
+- per measure for ReadMeasure and DefineMeasure;
+- per item class for ReadItem: an item a policy names is its own class,
+  every other item of a category shares one;
+- per (measure, item class per category) for ReadCell and EditCell.
+
+So a cell check is a few hash lookups, and the number of real Cedar
+evaluations is about the number of measures plus the number of
+policy-named items. The cache is exact (see "Why cells have no
+attributes"); a property test checks it against uncached evaluation. A
+new policy version or structure version starts a new session. The server
+keeps up to 1,024 sessions (least recently used); pg_improv keeps one per
+backend.
+
+Each evaluation passes Cedar only the entities it needs: the principal
+and its groups and roles, the resource and its ancestors, and every entity
+a policy names. Building one `Entities` for a 100k-item model per request
+would cost more than the evaluation.
+
+## Migration from 0.12's owner model
+
+- Nothing changes until a model's Admin stores policies. Existing models,
+  grants, RLS and token scopes behave as in 0.12.
+- The owner (and anyone who may act as the owner, and superusers) is
+  Admin by definition and is never filtered.
+- In Postgres, other roles today read results only when the owner grants
+  the result tables, and see every row. With policies, pg_improv adds a
+  row-level security policy to each result table, so a grant shows only
+  the rows the policy allows. Cell edits and structure changes by
+  non-owners go through pg_improv functions that check the policy, then
+  act as the owner (as `recalc` does). Cedar can let a non-owner do, to
+  this model, at most what the owner may do.
+- Clearing a model's policies (`improv policy clear`, an Admin action)
+  returns it to 0.12's behavior.
+- pg_improv's update script adds `improv.policy` (model, version, text,
+  groups, set by, set at) and `improv.policy_audit`; it changes no
+  existing row.
+- A Mentat file gains four `:policy/*` attributes, installed on open like
+  every other attribute. Older releases ignore them and their saves keep
+  them.
+
+## Test plan
+
+- **Unit (`improv_policy`):** the schema parses; each action's resource
+  types; default deny; forbid wins; an evaluation error denies; a Cell
+  literal is refused; a stored Role is refused; each template validates
+  and decides as documented; group nesting.
+- **Deterministic:** the canonical Time × Product model with a fixed
+  policy set for four principals (viewer, editor of Price, analyst
+  without WidgetB, admin); every cell's decision is a known table.
+- **Property (proptest):**
+  - the class cache equals uncached Cedar on every cell, for random
+    models, random permit/forbid sets over random literals and random
+    principals;
+  - adding a forbid never shows anything new; adding a permit never hides
+    anything;
+  - policy text round-trips through the store.
+- **CLI integration:** `policy validate`, `set`, `show`, `check`; a file
+  written with policies opens in v0.12.2's `improv`, which lists and
+  saves it, and the policies survive.
+- **Server (stage 2):** for every route, with a hidden measure, a hidden
+  item and a hidden cell, the response bodies contain none of their ids,
+  names or values; lists and counts leave them out; a hidden measure's
+  404 is byte-for-byte the 404 of a measure that does not exist; denied
+  writes are audited.
+- **pg_improv (stage 3):** `tests/policies.sh` (in `ci/pg_improv.sh`, on
+  PG 15 to 18): direct `SELECT` on a result table in every sync mode, the
+  filtered functions, the catalog, edits, `define` and `drop_measure` as
+  owner, analyst, editor, an Admin and a role with no policy; hidden
+  equals missing byte for byte; denied changes write nothing and are
+  logged; the owner is never locked out; a change in one session applies
+  from the next statement of another; `pg_dump` keeps the policies. Two
+  `#[pg_test]`s check the result tables follow set and clear, and that
+  policies that no longer validate fail closed. (NOTIFY is stage 6.)
+- **Fuzz:** the stored policy document loader (text and groups JSON).
+- **Performance:** the targets above, release build, recorded in the
+  stage's commit.
+
+## Stages
+
+Each stage lands green on its own (fmt, clippy, tests, docs, CHANGELOG).
+
+1. **The policy crate and the CLI** (this run). `crates/policy`: schema,
+   entities from a `Model`, `authorize`, sessions with the class cache,
+   templates, lint. Mentat `:policy/*` attributes. `improv policy
+   validate|set|show|check|template|lint`. mdBook page `policies.md`, man
+   pages, CHANGELOG.
+2. **improv-server enforcement.** Principal mapping, groups from the
+   model, every route authorized, responses filtered, the hidden-equals-
+   missing 404, `GET /v1/capabilities` for GUI hints, denied requests
+   audited, OpenAPI updated.
+3. **pg_improv enforcement** (done, pg_improv 0.13.0).
+   `improv.policy` and `improv.policy_audit`, `set_policies`, `policies`,
+   `explain_access`, filtered read functions, RLS on result tables, edit
+   and define for non-owners, the update script. As built (see
+   [Stage 3 as built](#stage-3-as-built)).
+4. **TLS** (done; 0.14). storage_pg rustls and sslmode; `--tls-cert`/
+   `--tls-key` in the server. As built (see
+   [Stage 4 as built](#stage-4-as-built)).
+5. **Filtered clients.** The model service's remote implementations: over
+   the server's API and over pg_improv's filtered functions. The GUI, TUI
+   and CLI use them for any restricted user; capability hints grey out
+   the GUI.
+6. **Live updates.** pg NOTIFY and LISTEN; the server's SSE feed, first
+   versions only, then filtered deltas.
+7. **DuckDB-hosted models** (done; 0.15). A DuckDB model store (catalog
+   tables in the DuckDB file, as `improv.*` in Postgres). improv-server
+   owns the file, since DuckDB allows one writing process per file; it
+   enforces the policies and serves the change feed. The DuckDB extension
+   stays single-user; its README says so. As built (see
+   [Stage 7 as built](#stage-7-as-built)).
+
+### Stage 3 as built
+
+- **Freshness.** A backend keeps one session per (model, role), keyed by
+  the policy version, `improv.model_version`, the newest item id, and the
+  role's principal (its memberships). It is re-checked when the
+  statement, the snapshot's completed-transaction count, or the command
+  id moves, so one query's rows share a check and a commit in another
+  session is seen by the next statement. REPEATABLE READ keeps its
+  snapshot's policies.
+- **The catalog.** With policies, the read policies of `improv.measure`,
+  `category`, `binding`, `category_binding`, `view`, `lambda` and
+  `sync_state` call `improv.unrestricted(model_id)`: a restricted role
+  reads the model through `improv.categories`, `items`, `measures` and
+  `cells` instead. Without policies they read as in 0.12.
+- **Result tables.** `set_policies` adds a policy `improv_access` (`FOR
+  SELECT`, the per-statement qual of "Performance (measured)":
+  `improv.cell_rule` once a statement, `improv.cell_name` lists or
+  `improv.row_visible` a row) and a trigger `improv_stale` to each
+  result table, as its owner, and turns row-level security on; clearing
+  drops the policy (the trigger stays, so writes stay tracked). A result table made later gets it when it is
+  created. The owner owns the tables, so its reads skip the qual.
+- **Roles.** `improv_reader` is the least-privilege role for a restricted
+  user: `USAGE` on schema `improv`, `EXECUTE` on the functions Cedar
+  filters (`categories`, `items`, `measures`, `cells`, `set_cells`,
+  `define`, `drop_measure`, `explain_access`, `policies`) and on what the
+  quals call (`cell_rule`, `row_visible`, `cell_visible`, `unrestricted`,
+  `may_act_as`), and `SELECT` on `improv.model` and `improv.models`.
+  `improv_admin` holds it `WITH ADMIN OPTION`; `improv_user` already has
+  all of it. It is not granted to PUBLIC: every function's errors would
+  then name models and owners to any role, and every function would need
+  an audit for PUBLIC callers. A role with only the owner's `SELECT` on a
+  result table (no `USAGE` on `improv`) reads it through the qual:
+  Postgres checks `EXECUTE` on a policy's functions (PUBLIC has it by
+  default), not `USAGE` on their schema. So a reader needs
+  `improv_reader` for the functions, and the owner's grant to query a
+  result table. What else a reader can call, checked by the error each
+  gives (`tests/policies.sh` section 11): `create_model`, `recalc`,
+  `bind_*`, `set_sync_mode`, `drop_model`, `enable_logical`,
+  `sync_publication` and `mint_items` need catalog tables it has no
+  grant on; `status` reads `improv.sync_state`; `what_if` needs to act
+  as the owner; `set_policies` needs Admin; `may_act_as` and
+  `unrestricted` answer only about the caller; `on_change` and the
+  language handlers cannot be called as functions. The functions it is
+  granted act through Cedar, as everyone else's calls do.
+- **Changes through Cedar.** `define` and `drop_measure` check
+  `DefineMeasure` (on the model for a new measure or a LAMBDA, on the
+  measure to redefine or drop it), parse the formula against what the
+  role may read, and refuse a LAMBDA redefinition unless the role may
+  redefine every measure that calls it; then they run as the owner.
+  `set_cells` (new) edits input cells that pass `EditCell`. Structure
+  changes (`bind_*`) and `recalc`, `what_if` stay the owner's.
+- **Audit.** `improv.policy_audit` rows for every `set_policies` and
+  every change made through Cedar, in the change's transaction. A
+  refusal rolls back its transaction, so it is one `LOG_SERVER_ONLY`
+  line, `pg_improv audit: {"audit":"deny",…}`, instead.
+- **Messages.** A role the policies do not let open the model gets
+  "its access policies do not let you open it": model names are public
+  (`improv.models`), so this hides nothing that is not already shown.
+
+### Stage 4 as built
+
+- **One transport.** `improv_storage_pg::tls::connect` opens every Improv
+  connection to Postgres: `PgModelStore::open` (so `improv_store` and every
+  front end: CLI, `improv policy`, TUI, both GUIs, the server) and
+  `improv_storage_sql::connect_postgres` (SQL data sources). rustls 0.23 on
+  ring, TLS 1.2 and 1.3; `tokio-postgres-rustls` 0.14 is the
+  `MakeTlsConnect` (its version lines up with `postgres` 0.19.14 /
+  `tokio-postgres` 0.7.18), and gives SCRAM channel binding
+  (`tls-server-end-point`). ALPN `postgresql`, as libpq 17 sends.
+- **Parameters.** Improv takes `sslmode`, `sslrootcert`, `sslcert` and
+  `sslkey` out of the keyword/value string or the URL query before the
+  driver parses the rest. `sslmode`: `disable`, `prefer` (default),
+  `require`, `verify-ca`, `verify-full`; `allow` is refused. `sslrootcert`:
+  a PEM file of CAs (only those are trusted), or unset/empty/`system` for
+  the operating system's roots. `sslcert`/`sslkey` (client certificates)
+  are refused by name: not built.
+- **The decision table** (`tls::transport`, unit-tested cell by cell):
+  a Unix socket is always cleartext (as libpq); loopback is cleartext for
+  `disable` and `prefer`, TLS for the others; anything else (any host or
+  `hostaddr` off loopback, the farthest of them decides) is TLS unless
+  `disable`. TLS always verifies: `require`, `prefer` and `verify-full`
+  check the chain and the name, `verify-ca` the chain only, and refuses
+  to run on the system roots (any site's certificate would pass). TLS needs
+  `host=` (the name checked); `hostaddr=` alone is refused.
+- **No fallback.** When TLS is chosen the driver runs with `sslmode=require`,
+  so a server answering the SSLRequest with `N` is refused before the
+  startup message; a fake server in the unit tests checks that nothing,
+  not even the user name, follows the refusal.
+- **System roots.** `rustls-platform-verifier` 0.7: the OS verifier on
+  macOS and Windows (revocation included), `rustls-native-certs` and webpki
+  on Linux and the BSDs. Not `webpki-roots`: a Mozilla bundle compiled into
+  the binary would ignore a site's own CAs in the system store, and the
+  platform verifier builds on every CI target (Linux, macOS, Windows;
+  FreeBSD and illumos use the same unix path).
+- **Errors.** `ConnectError::{Refused, Tls, Driver}`; a TLS failure is
+  described from rustls's `CertificateError` (an unknown CA, "is not valid
+  for "h" (it names a, b)", expired, not yet valid, revoked) or the
+  server's refusal of TLS; never the connection string.
+- **Tests.** Unit: the parser, the table, parameter stripping (keyword and
+  URL, quoting, percent-encoding), and certificate errors against an
+  in-process rustls server with `rcgen` CAs (wrong name, unknown CA, an
+  expired certificate, verify-ca, `prefer` off the host refused without a
+  byte sent). Live (`IMPROV_TEST_PG` + `IMPROV_TEST_PG_TLS`, a Postgres 17
+  with `ssl=on` made in CI's coverage job): verify-full and `require` with
+  `channel_binding=require`, verify-ca with a wrong name, a model store
+  over a URL with `sslrootcert`, a wrong name and an unknown CA refused,
+  `prefer` off the host (by name, at the server's address) on TLS, and
+  loopback `prefer` cleartext.
+- **improv-server.** `--tls-cert FILE --tls-key FILE` (clap requires both):
+  rustls on ring through `tokio-rustls` 0.26, HTTP/1.1 over ALPN, the
+  handshake under the header read timeout, a plain-HTTP client dropped;
+  axum 0.8 and the hyper accept loop are unchanged. `startup_check`: on a
+  non-loopback address, no tokens needs `IMPROV_ALLOW_OPEN=1` (as before),
+  and tokens without TLS need `IMPROV_ALLOW_PLAIN=1`. The container image
+  does not set it (the maintainer's ruling), so a container that publishes
+  the port needs it or a mounted certificate; `release.yml` checks the
+  refusal, the opt-in and HTTPS with a generated CA.
+- **Not done.** Client certificates; `sslnegotiation=direct` is passed to
+  the driver untouched (it works with `require`-class modes; `prefer`
+  with it is the driver's error); certificate reload without a restart.
+
+### Stage 7 as built
+
+- **The store.** `crates/storage_duckdb` (`improv_storage_duckdb`), a
+  crate of its own rather than a module of `storage_sql`: that crate is a
+  data source and sink (import, export, refresh) that links rusqlite and
+  postgres, and keeps the canonical model out by design. The new crate
+  needs only `core_model` and the bundled `duckdb` 1.20000.1 (DuckDB
+  2.0) `storage_sql` already links, so the workspace keeps one libduckdb.
+  `improv_store::Store::Duck` opens it behind `improv_store`'s `duckdb`
+  feature; the CLI and the server turn it on, so a build of a GUI alone
+  (gui_cosmic's own workspace, the Solnix GUI build) links no DuckDB.
+- **The target.** `duckdb:FILE?model=NAME`; `?model=` is required and no
+  other parameter is accepted. One file holds many models.
+- **The catalog** (`CATALOG_SQL`, version 1 in `improv.catalog`; a newer
+  one is refused): `model`, `model_version` (the conflict token and the
+  high-water), `category`, `item`, `measure` (`categories BIGINT[]` in the
+  measure's order, `format`), `cell` (`coord` JSON as in Postgres, the
+  value in one of `value_number`, `value_boolean`, `value_text`), `view`,
+  `lambda`, `meta`, `policy` (version, text, groups; a NULL text is
+  cleared). No bindings: every cell is a row of `improv.cell`. The cell
+  table has no primary key: DuckDB's ART index made rewriting 1M cells
+  take 24 s against 0.8 s; the store deletes a cell's row before it
+  appends one, inside the save's transaction.
+- **Saves.** One transaction that moves the model's `tx` first, so two
+  racing saves fail at the second write of that row (DuckDB's
+  write-write check) as a `Conflict`, never a lost update; a handle whose
+  loaded `tx` is stale is refused before it writes. `save_changes`
+  deletes and appends only the named cells; with `structure` it replaces
+  the model's catalog rows and drops the cells of dropped measures.
+  `save_model` rewrites the cells of every measure the handle loaded (the
+  closure after `load_partial`). `save_policies` moves the policy
+  version and `tx` on, so change streams reload.
+- **One writer.** DuckDB takes an exclusive lock on the file
+  (`fcntl` on Unix, a share mode on Windows) per instance. An `fcntl`
+  lock belongs to the process, so on Unix two instances in one process
+  would both open the file and both write it. The store keeps a
+  registry of open instances by canonical path; every handle of a
+  process is a connection to its file's one instance, closed with the
+  last handle. A second process gets DuckDB's lock error, reworded:
+  "FILE is open in another program (HOLDER). DuckDB lets one program at a
+  time open a file for writing: while improv-server serves this model,
+  change it through the server, or stop the server first". DuckDB names
+  the holder (program, PID, user) on Linux and macOS, and on Windows when
+  the Restart Manager finds it; elsewhere (FreeBSD, illumos) it is
+  "another program". The instance runs with external access and
+  extension autoloading off.
+- **Measured** (release, werk, 1M cells in one measure; the B12 probe,
+  `IMPROV_B12_STORE=duckdb:…`): `improv import-csv` 2.2 s (a 12 MB file), `improv set` of one cell 1.4 s (all of
+  it the load), a load 1.07 s, one cell's `save_changes` 14 ms (the
+  first 26 ms), a structural `save_changes` 20 ms, an unchanged
+  `save_model` 1.14 s.
+- **The server.** `improv-server duckdb:…` opens a store handle before it
+  listens (`hold_duckdb`) and keeps it until it exits, so it holds the
+  lock for its whole life; a file another program holds stops it with
+  status 2. Everything else is the code every store uses: the authority's
+  per-request high-water check reads `improv.model_version`, policies come
+  from `improv.policy` through `CedarPolicy`, and `/v1/changes` is
+  unchanged.
+- **Tests.** Unit tests per path (corrupt rows, a newer catalog, a
+  non-DuckDB file, Windows' lock message), a proptest that save → load
+  returns the model and an incremental save of the differing cells leaves
+  the second, a two-process lock test, `improv_store`'s shared exercise on
+  a `duckdb:` target, a CLI test (init, import, eval, policy set, a
+  missing file refused), the server's Cedar-filtered change stream over a
+  `duckdb:` model, and `crates/server/tests/duckdb.rs`: the binary over a
+  DuckDB file, a second writer and a second server refused by name, bob's
+  edit reaching ann's stream without WidgetB, ann's edits refused as
+  missing, and the file intact after a kill.
+- **Not done.** The desktop GUIs and the TUI are not tested on `duckdb:`
+  targets, and the COSMIC GUI cannot open them (its build leaves the
+  feature off); they reach a served model as remote clients (stage 5).
+  One server serves one model of a file, so the file's other models are
+  unreachable while it runs. A read-only open (DuckDB allows several
+  read-only processes, but not beside a writer) is not offered.
+
+### Stages 5 and 6 as built
+
+- **The remote model service.** `improv_client::remote` (feature
+  `remote`; the crate stays wasm-safe without it): requests in order on a
+  thread, the change stream on another (`?since=` resume, backoff 0.25 s
+  to 10 s, a 45 s silence is a dead link), a 401 on either is
+  `Event::LoggedOut`. ureq 3.5.1 (already in the lock through DuckDB's
+  build) on rustls/ring; the OS roots through
+  `rustls-platform-verifier` (no compiled-in bundle), or only the CA in
+  `?sslrootcert=FILE`. `http://` only to loopback, no opt-in; a URL with
+  credentials is refused; redirects are not followed (the token stays
+  with its host); `*_PROXY` is ignored for `http://`. Replies are capped
+  at 128 MiB. `Request::Capabilities` joins the wire.
+- **The desktop GUI** runs the web GUI's worksheet app for a server URL:
+  the file moved to `crates/gui/src/served.rs` and gui_web includes it by
+  `#[path]`, so both GUIs are one implementation of the contract. It
+  holds the visible structure and the cells of the windows on screen,
+  greys out from `/v1/capabilities` (menus, Model Browser buttons,
+  formula lines, cell editing), shows every refusal, and re-reads on a
+  `reload` event. A formula that reads a hidden measure shows the name
+  alone. Not there yet on a server model: the desktop-only panels
+  (graphs, printing, the Inspector, the CSV wizard). Undo is the
+  server's, per session.
+- **The TUI** has its own served grid (`crates/tui/src/served.rs`) on
+  `improv_client::layout`: one measure, pages, pivot, typed edits, undo
+  and redo on the server, a masked token prompt; it polls the service
+  every 100 ms, so changes redraw without a key.
+- **NOTIFY (pg_improv 0.15.0).** `improv_<model id>` (the id: a name is
+  not a safe identifier), payload `<tx>.<data_gen>`. `data_gen` is a new
+  column of `improv.stale` (the extension's own row per model, which the
+  worker's transaction already writes; no new lock order), moved by
+  `data_moved`: the worker's `record` for every batch applied or
+  rebuild, the trigger-mode statement, the commit-mode recompute, and
+  `trigger::recompute` when it wrote rows (`recalc`). `tx` moves by the
+  row trigger `version_moved` on `improv.model_version` (ENABLE ALWAYS).
+  Queued per transaction and sent by `Async_Notify` in the transaction
+  callback at `PRE_COMMIT`, once per model with its last pair; a
+  rolled-back savepoint takes its own back, and a prepared transaction
+  sends none (Postgres refuses `PREPARE` after a `NOTIFY`).
+- **LISTEN.** `improv_storage_pg::Listener` is a second connection;
+  `PgModelStore::listen` returns it only when the database has the
+  `version_moved` trigger, so a plain catalog or an older pg_improv is
+  polled as before. The GUI's listener thread wakes the frame and
+  replaces the two-second probe; the TUI's sets a wake flag its loop
+  turns into an event, so news shows without a key. A `tx` the client
+  did not save at is H9 (the Reload panel; the TUI's message). A moved
+  `data_gen` re-reads the model through the store's load, at most once a
+  second (later notifications coalesce into the next read), off the UI
+  thread, and when the read is at the client's own version and nothing
+  is unsaved, applies the input cells that differ through the engine and
+  takes the read's save token; its own save's echo diffs to nothing, so
+  echoes need no telling apart. With an edit unsaved it waits, and never
+  overwrites. Measured (release, PG 17, werk, medians of 7): the re-read
+  and diff of the sample model (100 bound cells) 8 ms; of a 100k-cell
+  bound model 218 ms (load 165 ms), under the 300 ms bar, so it re-reads
+  the whole model rather than the relations the worker touched. Both
+  fall back to polling when the listener's connection dies.
+- **Not done.** The COSMIC GUI's remote service; filtered deltas over
+  Postgres (a listener re-reads); per-principal versions (option b).
+
+### What 0.13 delivers
+
+Proposed: stages 1 to 4. That is Cedar policies stored with Mentat and
+Postgres models, enforced by pg_improv for every Postgres client and by
+improv-server for every HTTP client, and TLS on both paths. A restricted
+user can then use psql, curl or the web API safely.
+
+Later (0.14): stages 5 to 7. The desktop GUI, COSMIC GUI and TUI as
+restricted clients with live updates, and DuckDB-hosted models editable
+in real time through the server. Until then a restricted user's GUI over
+Postgres shows nothing past what RLS already allows (today: no items or
+cells of a model it may not act as the owner of).
+
+## Open questions for the maintainer
+
+1. Is `require` meaning `verify-full` acceptable? libpq's `require`
+   encrypts without checking the certificate.
+2. Should a model's Admin be able to grant Admin to others through a
+   policy (yes in this design), or only the owner?
+3. Do totals over visible items only (per-user aggregates) matter for
+   1.0, or is the lint enough?
+4. Should Mentat-file policies ever be enforced by the local GUI/TUI (as
+   a convenience, not security), or only by the server? This design says
+   only the server.
+5. Release split: stages 1 to 4 in 0.13, and 5 to 7 in 0.14?
+6. Answered: the maintainer confirmed `improv.set_cells` (its name and
+   its `what_if`-style edits), and accepted "its access policies do not
+   let you open it" for a model a role may not open (model names are
+   public through `improv.models`).

@@ -1,0 +1,37 @@
+# typos configuration. https://github.com/crate-ci/typos
+
+[files]
+extend-exclude = [
+    "IMPROV.txt",       # source design transcript, verbatim
+    "Cargo.lock",
+    "docs/man/*",
+    "*.roff",
+    "docs/mermaid.min.js",   # vendored mdbook-mermaid asset
+    "docs/mermaid-init.js",  # vendored mdbook-mermaid asset
+    "docs/src/img/*.svg",        # generated asciinema recordings (text split across spans)
+    "docs/book/**",          # generated mdbook output (gitignored)
+    "crates/core_model/src/locale/*.tsv",  # localized function names (not English)
+    "crates/duckdb_improv/extension-ci-tools",  # DuckDB's submodule, vendored
+]
+
+[default.extend-words]
+# Commit SHAs cited in review docs can contain letter runs typos misreads.
+ba = "ba"
+# Domain terms typos might flag.
+Improv = "Improv"
+Quantrix = "Quantrix"
+Datomic = "Datomic"
+Mentat = "Mentat"
+edn = "edn"
+EDN = "EDN"
+datom = "datom"
+datoms = "datoms"
+EAVT = "EAVT"
+Abomonation = "Abomonation"
+ratatui = "ratatui"
+# Spreadsheet function names (docs/reviews/2026-10-16-builtin-functions-plan.md).
+PERMUT = "PERMUT"
+AVERAGEIFS = "AVERAGEIFS"
+TTEST = "TTEST"
+ODF = "ODF"
+EXTENDIBLE = "EXTENDIBLE"

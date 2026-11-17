@@ -1,0 +1,40 @@
+#compdef improv-server
+
+autoload -U is-at-least
+
+_improv-server() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--static=[Also serve the files in DIR (a web front end'\''s build) at /, beside the API; off by default]:DIR:_files' \
+'--tls-cert=[Serve HTTPS with this certificate chain (PEM, the server'\''s certificate first); needs --tls-key]:FILE:_files' \
+'--tls-key=[The private key of --tls-cert (PEM\: PKCS#8, PKCS#1 or SEC1)]:FILE:_files' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+'::model -- The model\: a store file, postgres\://USER@HOST/DB?model=NAME, or duckdb\:FILE?model=NAME, which the server holds open while it runs:_default' \
+'::addr -- The address to listen on:_default' \
+&& ret=0
+}
+
+(( $+functions[_improv-server_commands] )) ||
+_improv-server_commands() {
+    local commands; commands=()
+    _describe -t commands 'improv-server commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_improv-server" ]; then
+    _improv-server "$@"
+else
+    compdef _improv-server improv-server
+fi

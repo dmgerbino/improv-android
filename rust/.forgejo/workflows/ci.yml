@@ -1,0 +1,217 @@
+# Forgejo / Codeberg CI — mirrors .github/workflows/ci.yml.
+# Forgejo Actions syntax is nearly identical to GitHub Actions.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  lint-build-test:
+    name: lint + build + test
+    runs-on: docker
+    container:
+      image: rust:1.97-bookworm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: improv
+      - name: Toolchain components
+        run: rustup component add rustfmt clippy
+      - name: Format
+        working-directory: improv
+        run: >
+          cargo fmt
+          -p improv_core_model
+          -p improv_storage_mentat
+          -p improv_storage_sql
+          -p improv_storage_duckdb
+          -p improv_storage_csv
+          -p improv_engine
+          -p improv_verified
+          -p improv_extfn
+          -p improv_pg_model
+          -p improv_duckdb_model
+          -p improv_nl_formula
+          -p improv_cli
+          -p improv_tui
+          -p improv_server
+          -p improv_gui
+          -p improv_client
+          -p improv_policy
+          -p improv_service
+          -p improv_gui_web
+          -- --check
+      - name: Clippy (workspace crates)
+        working-directory: improv
+        run: >
+          cargo clippy
+          -p improv_core_model
+          -p improv_storage_mentat
+          -p improv_storage_sql
+          -p improv_storage_duckdb
+          -p improv_storage_csv
+          -p improv_engine
+          -p improv_verified
+          -p improv_extfn
+          -p improv_pg_model
+          -p improv_duckdb_model
+          -p improv_nl_formula
+          -p improv_cli
+          -p improv_tui
+          -p improv_server
+          -p improv_gui
+          -p improv_client
+          -p improv_policy
+          -p improv_service
+          -p improv_gui_web
+          --all-targets --all-features -- -D warnings
+      - name: Build
+        working-directory: improv
+        run: cargo build --workspace --all-features
+      - name: Test
+        working-directory: improv
+        run: cargo test --workspace --all-features
+
+  # Mirrors the GitHub verify job: the Verus proofs of crates/verified.
+  verify:
+    name: Verus proofs
+    runs-on: docker
+    container:
+      image: rust:1.97-bookworm
+    env:
+      VERUS_RELEASE: 0.2026.11.02.8bf68ee
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: improv
+      - name: Install Verus
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends unzip
+          rustup toolchain install 1.99.1 --profile minimal
+          zip="verus-${VERUS_RELEASE}-x86-linux.zip"
+          curl -fsSL -o "$zip" "https://github.com/verus-lang/verus/releases/download/release/${VERUS_RELEASE}/${zip}"
+          unzip -q "$zip"
+      - name: Verify
+        working-directory: improv
+        run: VERUS_DIR="$PWD/../verus-x86-linux" scripts/verify.sh
+
+  # Review plan D5; mirrors the GitHub gui-shot job.
+  gui-shot:
+    name: GUI screenshot vs golden
+    runs-on: docker
+    container:
+      image: rust:1.97-trixie
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: improv
+      - name: Install Xvfb, ImageMagick, xdotool, GL/X11 runtime
+        run: >
+          apt-get update && apt-get install -y --no-install-recommends
+          xvfb x11-apps imagemagick xdotool
+          libgl1 libegl1 libgl1-mesa-dri libxkbcommon-x11-0
+          libxcursor1 libxi6 libxrandr2
+      - name: Screenshot regression
+        working-directory: improv
+        run: scripts/gui-shot-check.sh
+      - name: Upload capture and diff
+        if: always()
+        # Forgejo's fork: actions/upload-artifact v4+ refuses a non-GitHub host.
+        uses: forgejo/upload-artifact@cb8afe72b42edc798abfb8fcb556cf660d894245 # v5
+        with:
+          name: gui-shot
+          path: improv/target/gui-shot/
+
+  # Coverage gate (see .github/workflows/ci.yml for the rationale).
+  coverage:
+    runs-on: docker
+    container:
+      image: rust:1.97-trixie
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: improv
+      # A container has no user namespaces, so bwrap cannot run here: leave it
+      # out and let IMPROV_EXTFN_ALLOW_UNSANDBOXED=1 run the Python extfn paths
+      # under rlimits only (GitHub's job covers the bwrap path on the host).
+      - name: Install nightly + llvm-cov, python3, postgres
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends python3 postgresql
+          rustup toolchain install nightly --profile minimal -c llvm-tools-preview
+          cargo install cargo-llvm-cov --version =0.9.1 --locked
+          service postgresql start
+          runuser -u postgres -- psql -c "CREATE ROLE improv LOGIN PASSWORD 'improv'" -c "CREATE DATABASE improv_test OWNER improv"
+      - name: Coverage gate
+        working-directory: improv
+        env:
+          IMPROV_TEST_PG: "host=127.0.0.1 user=improv password=improv dbname=improv_test"
+          IMPROV_EXTFN_ALLOW_UNSANDBOXED: "1"
+        run: scripts/coverage.sh 90
+
+  # pg_improv (see .github/workflows/ci.yml for the rationale).
+  pg_improv:
+    runs-on: docker
+    container:
+      image: rust:1.97-trixie
+    timeout-minutes: 90
+    strategy:
+      matrix:
+        pg: [15, 16, 17, 18]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: improv
+          fetch-depth: 0
+      - name: pg_improv on PG ${{ matrix.pg }} (see .github/workflows/ci.yml)
+        run: improv/ci/pg_improv.sh ${{ matrix.pg }}
+
+  # The DuckDB extension (see .github/workflows/ci.yml for the rationale).
+  test-duckdb:
+    runs-on: docker
+    container:
+      image: rust:1.97-trixie
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: improv
+          submodules: recursive
+      - name: Build deps
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends python3-venv ninja-build cmake unzip
+      - name: Toolchain components
+        run: rustup component add rustfmt clippy
+      - name: duckdb_improv (see .github/workflows/ci.yml)
+        run: improv/ci/duckdb_improv.sh "$PWD/duckdb-cli"
+
+  deny:
+    name: cargo-deny
+    runs-on: docker
+    container:
+      image: rust:1.97-bookworm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: improv
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Licence scan of the vendored crates (see .github/workflows/ci.yml)
+        working-directory: improv
+        run: python3 crates/gui_cosmic/release/license-scan.py vendor . "$(mktemp -d)/vendor"
+      - name: Deny
+        working-directory: improv
+        run: cargo deny check advisories licenses bans sources

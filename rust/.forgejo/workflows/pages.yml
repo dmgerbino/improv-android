@@ -1,0 +1,51 @@
+# Codeberg Pages: build the mdBook guide and publish it to
+# https://gregburd.codeberg.page/improv/ with git-pages (Forge Wildcard
+# Authorization: the automatic token (github.token, Forgejo's alias of
+# forge.token) is enough for the matching
+# <owner>.codeberg.page/<repo>/ site, so no secret is needed).
+#
+# Runs on Codeberg's hosted runner (codeberg-small, a 5-minute job): the
+# mdBook tools are prebuilt binaries, so the guide builds in seconds. The
+# rustdoc API reference needs a full Rust build that does not fit there, so
+# /api/ redirects to the GitHub Pages copy, which .github/workflows/docs.yml
+# builds on every push.
+
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: codeberg-small
+    container:
+      image: debian:trixie-slim
+    steps:
+      - name: Tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl git unzip nodejs >/dev/null
+          cd /usr/local/bin
+          curl -sSfL https://github.com/rust-lang/mdBook/releases/download/v0.4.52/mdbook-v0.4.52-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          curl -sSfL https://github.com/badboy/mdbook-mermaid/releases/download/v0.16.2/mdbook-mermaid-v0.16.2-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          curl -sSfL -o /tmp/lc.zip https://github.com/Michael-F-Bryan/mdbook-linkcheck/releases/download/v0.7.7/mdbook-linkcheck.x86_64-unknown-linux-gnu.zip
+          unzip -qo /tmp/lc.zip mdbook-linkcheck && chmod +x mdbook-linkcheck
+          mdbook --version
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the guide
+        run: |
+          mdbook build docs
+          site=docs/book/html
+          test -f "$site/index.html"
+          mkdir -p "$site/api"
+          printf '<!doctype html><meta http-equiv="refresh" content="0; url=https://gburd.github.io/improv/api/"><title>Improv API docs</title><a href="https://gburd.github.io/improv/api/">Improv API docs (rustdoc)</a>\n' > "$site/api/index.html"
+          echo "SITE=$site" >> "$GITHUB_ENV"
+      - name: Publish to Codeberg Pages
+        if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+        uses: actions/git-pages@2b24bbb7ff943d3c8fe1df91326adec66daea6dd # v2.2.0
+        with:
+          site: https://gregburd.codeberg.page/improv/
+          token: ${{ github.token }}
+          source: ${{ env.SITE }}/

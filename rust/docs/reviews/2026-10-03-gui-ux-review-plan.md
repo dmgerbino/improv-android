@@ -1,0 +1,90 @@
+# GUI UX review and plan — 2026-10-03
+
+Source: running `improv-gui` under Xvfb (800×600 default and 1400×900) on a
+Time × Product × Scenario demo model, compared against
+`refs/improv-pivot-gesture.jpg`. Each item names the defect and the fix.
+Status is updated in place as items land.
+
+## Batch A — broken now (cheap)
+
+| # | Item | Status |
+| --- | --- | --- |
+| A1 | Tool-palette glyphs (`↶ ↷` etc.) render as tofu `□`: egui's default font lacks them. Bundle an icon font or use glyphs the default font has; add a test that every palette label is covered by the loaded fonts. | done |
+| A2 | Default 800×600 window: Inspector overlaps the matrix and gutter tiles draw over its text. Start at ~1280×800, set a minimum size, keep the canvas's space before side panels. | done: root cause was nested gutter panels resetting the canvas clip; each gutter now narrows its clip to the canvas, 1280×800 initial / 960×600 min |
+| A3 | Numeric cells are left-aligned; Improv right-aligns numbers so digits line up. | done |
+| A4 | Item headers (`Q1`, `Widget`) are beveled button chips; Improv draws them as plain text in a ruled band — only category tiles look draggable. | done |
+| A5 | CLI `set --at` rejects repeated `--at` / space-separated pairs (only one comma-joined arg works). | done |
+
+## Direction (maintainer, 2026-10-03)
+
+**The GUI must look identical to NeXTSTEP Lotus Improv**, with modern
+features added only where required (and styled to match). References:
+`refs/improv-next-workspace-1.0.png`, `refs/improv-next-worksheet-formulas.png`,
+`refs/improv-pivot-gesture.jpg`, `refs/improv-next-nested-headers.jpg`.
+Observed NeXTSTEP traits that Batches B–D must reproduce:
+
+- Workspace of separate windows: a floating vertical **application menu**
+  (Info, File, Edit, Format, Worksheet, View, Graph, Print, Services, Hide,
+  Quit; submenus marked `r`), a **model browser** window listing views, and
+  one or more **worksheet windows**.
+- Worksheet window: black title bar, centered white `View - Worksheet - File`
+  text, close box. Formula pane attached at the bottom of the same window:
+  ✓ column, numbered formulas, `Calc` button. No operator palette, no
+  "new measure" form.
+- Tiles are dark-gray with white text: rows tiles bottom-left beside the
+  horizontal scroller; column tiles stacked top-right; page tiles top-left
+  with an item field.
+- Grid: white cells, thin black rules, right-aligned numbers, nested group
+  cells spanning their children, `Total` group rows; strict grayscale palette
+  (black / dark gray / light gray / white), Helvetica-like font; selection is
+  dark/inverted, never blue. NeXT scrollers (arrows grouped at one end).
+
+Items below are reworded where this direction supersedes them.
+
+## Batch B — layout and hierarchy
+
+| # | Item | Status |
+| --- | --- | --- |
+| B1 | Canvas gets a small fraction of the window. Replace the docked Model/Inspector panels with NeXTSTEP-style separate windows (model browser; Inspector as an Info panel opened from the menu); the worksheet fills its window. | done: matrices are worksheet windows on a full-width workspace (`nxwin`); the model browser (`<file> - Model`, View ▸ Model Browser) and the Info panel (Info ▸ Info Panel…) are NeXT windows on it |
+| B2 | Empty gutter wells: row gutter is a tall grey box for one tile; top-right gutter mostly empty. Size gutters to their tiles; highlight as drop zones only during a drag. | done: gutters size to their tiles, no placeholders, drop highlight only while dragging |
+| B3 | Pages has two controls (tile + separate `< Plan [1/2] >` stepper). Merge into the tile (`Scenario: Plan ▾`). | done: page tile + white item field (ComboBox); stepper removed |
+| B4 | Top bar leads with an empty-state message. Remove the tab strip; views are listed in the model browser and open as worksheet windows; `+ Canvas`/`+ Matrix` move to the Worksheet/View menu. | done: the tab strip is gone (step 2); views are listed in the model browser window and the View submenu and open on the workspace's worksheet windows; Add/Remove Matrix and Save View are in the Worksheet submenu |
+| B5 | Third formula entry point ("New derived measure" form). Add formulas by typing `X = …` on a new formula-list line; drop the form. | done: the form and the top formula bar are gone; the selected formula-list row edits in place and typing `Name = formula` on the list's last line adds one (step 4b) |
+| B6 | Operator palette (`= + - * / ( ) [ ]`) is not in Improv. Remove it; formula pane gets the ✓ column and a `Calc` button. | done: palette removed, formula list moved into each worksheet window with a `Calc` button |
+| B7 | NeXTSTEP chrome: grayscale palette (no blue), Helvetica-like bundled font (license-checked), black title bars, dark tiles with white text, NeXT scrollers, inverted selection. Drop the left tool palette (actions live in the menu). | partial: grayscale palette, square corners, gray selection and dark tiles (spec §1) and bundled Arimo 12 (§2) landed; title bars, scrollers and the tool palette remain |
+
+## Batch C — interaction basics (closes GUI steering gate #4)
+
+| # | Item | Status |
+| --- | --- | --- |
+| C1 | No menus. Add the NeXTSTEP vertical application menu (Info/File/Edit/Format/Worksheet/View/Graph/Print/Services/Hide/Quit) with cascading submenus and key equivalents. | done (`crates/gui/src/menu.rs`); File New/Open/Save As/Close, Format, Print and Services draw disabled until they exist |
+| C2 | Input vs derived cells look identical (modernization). Keep within the grayscale palette, e.g. derived cells in a light-gray band or italic; lock hint on hover. | done: input cells carry a faint inset LIGHT_GRAY underline (spec §6); derived cells show `formula: <text>` on hover and say they are computed when clicked |
+| C3 | No range selection; `Sum` readout is one cell. Drag / Shift+arrow ranges. | done: Shift+arrow/hjkl, Shift+click and drag select a rectangle; the status-bar Sum adds its numbers (capped at 10,000 cells) |
+| C4 | Verify tile-drag ghost + drop-zone highlight and nested group-header result match the reference (needs screenshot/recording, not just a headless test). | done: drop-zone highlight only during a drag; the ghost is egui's dnd default; checked by screenshot |
+| C5 | Selection is a hard blue box on the value. Thin focus ring plus highlighted matching row/column headers. | done: per spec §4.5, cells are plain white with black rules, the selection fills `#AAAAAA` with no ring, and the selected rows' and columns' header items fill `#AAAAAA` too |
+
+## Batch D — polish and qualification
+
+| # | Item | Status |
+| --- | --- | --- |
+| D1 | Window title shows document name and a dirty marker. | done: `Improv — <file>`, ` •` after an unsaved in-memory edit or a failed autosave. Canvas-layout changes since the last saved view are not tracked |
+| D2 | Model tree `·`/`=` prefixes are cryptic; use labelled icons/tooltips. | done: a small dark-gray `input` / `formula` label right of each name |
+| D3 | Status-bar feedback on recalc/save. | done: save, Calc, undo/redo and add-formula report there; a message clears after 5 s |
+| D4 | Contrast: grey-on-grey text fails WCAG AA 4.5:1. The NeXT palette is high-contrast black-on-white; matching it fixes most of this. Optional dark variant is a modernization, off by default. | done for the default theme: black on `#AAAAAA` 9.0:1, black on white 21:1, white on `#555555` 7.5:1. Weak/disabled text (`#555555` on `#AAAAAA`) and non-key title text (`#AAAAAA` on `#555555`) are 3.2:1, per spec §1: enough for disabled text, which WCAG exempts, but empty-state hints drawn weak should become body text as B4/B5 rework them. Dark variant deferred |
+| D5 | Fixed-geometry screenshot regression (Xvfb + `xwd`, scripted) compared side by side with the refs — GUI steering gate #5. | done (`scripts/gui-shot-check.sh` vs `docs/reviews/golden/gui-1400x900.png`, CI job `gui-shot`) |
+
+## Batch E — fidelity gaps found comparing step 6 against the refs (2026-10-04)
+
+| # | Item | Status |
+| --- | --- | --- |
+| E1 | Menu overlaps the first worksheet window's left edge; place the first window right of the menu's actual width. | done: `MENU_CLEAR = MENU_W + 12` |
+| E2 | No NeXT scrollers: grid needs a `#808080` trough scroller with grouped arrows; the rows-tile strip sits inline with the horizontal scroller (spec §4.4, §4.8). | done (trough, beveled knob, grouped arrows; horizontal scroller inline with the row tiles, arrows grouped left) |
+| E3 | Grid's white field stops at the last cell; NeXT fills the grid area white to the window's edges. | done |
+| E4 | `Filters` collapsing header is not in NeXT; move filtering to the tile context menu (right-click → item checklist). | done |
+| E5 | Model browser keeps the old tree; NeXT lists views (`Name - Worksheet` + icon) above a description area, double-click to open (spec §4.2). | done |
+| E6 | Default window too small for its grid; size a fresh worksheet window to its content. | done: `Matrix::new` sizes from its line counts, clamped to 360–900 × 300–700 |
+
+Note: B1/B4/C1 imply multiple OS windows. egui 0.29 supports this via
+`show_viewport_immediate`; where a platform can't, fall back to in-app
+NeXT-styled floating windows. A design spec (`docs/reviews/2026-10-03-nextstep-visual-spec.md`)
+precedes implementation.

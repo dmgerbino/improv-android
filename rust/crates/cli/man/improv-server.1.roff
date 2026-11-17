@@ -1,0 +1,150 @@
+.\" Hand-written sections of improv-server(1); crates/cli/src/man.rs adds the rest.
+.SH DESCRIPTION
+.B improv-server
+serves one model over HTTP/1.1 as JSON: read the model and measures, compute
+what-if edits through the live engine, and write input cells. It listens on
+.I addr
+(default 127.0.0.1:3000, or
+.BR IMPROV_ADDR ).
+.I model
+defaults to
+.IR improv.db .
+.PP
+A model is a store file made by
+.BR improv (1),
+a Postgres model URL,
+.BI postgres:// user @ host / db ?model= name\fR,
+or a model in a DuckDB file,
+.BI duckdb: file ?model= name\fR.
+.PP
+DuckDB lets one program at a time open a file for writing. The server opens
+a DuckDB file before it listens and holds it until it exits: while it runs,
+.BR improv (1)
+and any other program are refused, naming the server, and the model is
+changed through the server's routes, under its access policies, with every
+change on
+.IR /v1/changes .
+A file another program holds stops the server before it listens, with
+exit status 2.
+.SH TLS
+With
+.B \-\-tls\-cert
+and
+.B \-\-tls\-key
+every connection is HTTPS (TLS 1.2 or 1.3, HTTP/1.1 over ALPN), and a
+client that does not speak TLS is dropped. Without them the server speaks
+plain HTTP, and on an address that is not loopback it refuses to start
+with tokens set unless
+.BR IMPROV_ALLOW_PLAIN=1 ,
+so a bearer token never crosses a network in cleartext by default. Behind
+a proxy that terminates TLS, bind a loopback address.
+.SH ROUTES
+Every route is served under
+.I /v1
+and, as an alias, without it.
+.I /v1/openapi.json
+describes them.
+.nf
+GET  /v1/health                 liveness, no token needed
+GET  /v1/openapi.json           the OpenAPI document, no token needed
+GET  /v1/model                  the whole model
+GET  /v1/measures               id, name, kind, categories
+GET  /v1/measures/{id}/values    stored inputs or computed values
+POST /v1/measures/{id}/eval      what-if edits; "persist": true writes through
+POST /v1/measures/{id}/cells     set one input cell (write scope)
+POST /v1/nl/parse, /v1/nl/describe
+                                controlled English to formula and back
+GET  /v1/scheduler/status       refresh scheduler state
+.fi
+.SH ENVIRONMENT
+.TP
+.BR IMPROV_API_TOKEN ", " IMPROV_API_TOKENS
+Write-scope bearer tokens (one, or comma-separated).
+.TP
+.B IMPROV_API_TOKENS_RO
+Read-scope bearer tokens (comma-separated).
+.TP
+.B IMPROV_API_TOKEN_FILE
+A file of
+.IB name : scope : secret
+lines,
+.I scope
+being
+.B read
+or
+.BR write .
+.TP
+.B IMPROV_MAX_BODY_BYTES
+Request body limit (default 1048576).
+.TP
+.B IMPROV_MAX_STREAMS
+Change streams
+.RB ( /v1/changes )
+open at once (default 256; 8 per caller).
+.TP
+.B IMPROV_RATE_LIMIT
+Requests a minute per token, or per client address without one (default
+600; 0 turns it off).
+.TP
+.B IMPROV_AUDIT_LOG
+Append the write audit log (one JSON object per line) to this file instead
+of standard error.
+.TP
+.B IMPROV_ALLOW_OPEN=1
+Allow running without a token on a non-loopback address (otherwise the
+server refuses to start).
+.TP
+.B IMPROV_ALLOW_PLAIN=1
+Allow tokens over plain HTTP on a non-loopback address, without
+.BR \-\-tls\-cert :
+for a container whose published port the host keeps off the network, or a
+proxy on another machine of a network you trust. Otherwise the server
+refuses to start.
+.TP
+.B IMPROV_SCHEDULER=1
+Refresh external-function measures in the background. It runs only functions
+whose digest is listed in the file named by
+.BR IMPROV_EXTFN_ALLOW .
+.TP
+.B IMPROV_ADDR
+The address to listen on when no
+.I addr
+argument is given.
+.TP
+.B IMPROV_EXTFN_ALLOW
+The allowlist file for the scheduler: one lowercase hex SHA-256 of
+.IR name \e0 body
+per line.
+.TP
+.B IMPROV_SCHEDULER_TICK_SECS
+The scheduler's tick period (default 5).
+.TP
+.B IMPROV_HEADER_TIMEOUT_MS
+Header read timeout (default 10000); with TLS, the handshake's too.
+.TP
+.B IMPROV_CORS_ORIGINS
+Comma-separated browser origins
+.RI ( https://host[:port] )
+allowed to call the API from another origin. Unset (the default): no CORS
+headers, so browsers allow only same-origin pages, such as files served
+with
+.BR \-\-static .
+.B *
+is refused.
+.SH EXAMPLES
+.nf
+IMPROV_API_TOKEN=secret improv-server sample.db
+curl -H 'Authorization: Bearer secret' localhost:3000/v1/measures
+
+IMPROV_API_TOKEN_FILE=/etc/improv/tokens improv-server sales.db 0.0.0.0:3443 \e
+  \-\-tls\-cert /etc/improv/fullchain.pem \-\-tls\-key /etc/improv/key.pem
+curl -H 'Authorization: Bearer secret' https://improv.example.com:3443/v1/measures
+.fi
+.SH AUTHOR
+Greg Burd <greg@burd.me>
+.SH SEE ALSO
+.BR improv (1),
+.BR improv-files (5),
+.BR improv-formulas (7),
+.BR improv-tui (1),
+.BR improv-gui (1).

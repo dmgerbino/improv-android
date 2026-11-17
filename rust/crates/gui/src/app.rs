@@ -1,0 +1,22701 @@
+//! GUI application state and rendering.
+//!
+//! State: the loaded `Model`, a live `session::Engine` (built over all derived
+//! measures), the current derived-measure snapshot, and the selected measure.
+//! The panels and windows (model browser, pivot grid, formula editor, Info
+//! panel) are all
+//! rendered each frame from this state. The GUI is a pure *view/controller*
+//! over `improv_engine` + the model; it adds no modeling semantics (see
+//! `.agent/steering/AGENT_GUI_STEERING.md` §9.3).
+//!
+//! The engine is rebuilt (a structural rebuild) only when the measure structure
+//! changes — a formula edit or a new derived measure. Plain cell-value edits go
+//! through `engine.set` incrementally.
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::ops::RangeInclusive;
+use std::sync::{mpsc, Arc};
+
+use improv_core_model::{
+    parser, BinaryOp, CanvasRect, CategoryId, Expr, Filter, FuncId, ItemId, MatrixPlacement,
+    Measure, MeasureId, MeasureKind, Model, Name, NumberFormat, ParseError, UnaryOp, Value,
+    ValueType, View, ViewId,
+};
+use improv_engine::session::{Engine, Snapshot};
+use improv_engine::{encode_coord, CellValue, CoordKey};
+use improv_nl_formula::{describe_formula, parse_nl_formula, NlContext};
+use improv_store::Store;
+
+use crate::csv_wizard::{self, ExportForm, ImportForm};
+use crate::diagnostics;
+use crate::menu::{self, Command};
+
+/// One matrix on the canvas: a measure, that matrix's OWN pivot / filter /
+/// cursor / cell-editor state, and where it sits (`rect`).
+///
+/// This is the GUI-side twin of [`improv_core_model::MatrixPlacement`] (which is
+/// the persisted form): a placement plus the transient bits a placement has no
+/// business storing — the keyboard cursor, the open cell editor, and the
+/// measured gutter geometry. Several of these live on one canvas
+/// (`ImprovApp::matrices`), each independently pivotable, which is plan Step 3
+/// (`docs/reviews/2026-09-22-gui-reconstruction-plan.md`).
+///
+/// Every method here takes `&Model` rather than holding one: a matrix is pure
+/// presentation over the shared model, exactly as the per-view state was before
+/// it became a list.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Matrix {
+    /// Keys this matrix's window and widget state for its lifetime, so they
+    /// stay with it when an earlier matrix is removed (an index would shift).
+    /// Unique per process ([`next_matrix_uid`]); a clone keeps it.
+    uid: u64,
+    /// The measure this matrix shows. `None` only for an empty model.
+    measure: Option<MeasureId>,
+    /// A permutation of `measure`'s categories: the first `n_rows` are stacked
+    /// on rows (outer→inner), the next `n_cols` on columns, the rest are pages.
+    /// Pivoting reorders this without touching formulas. Reset to the measure's
+    /// natural order when this matrix's measure changes.
+    axis_order: Vec<CategoryId>,
+    /// How many leading `axis_order` categories are stacked on the ROW axis,
+    /// and how many (after those) on the COLUMN axis. The rest are pages.
+    /// Default 1/1 (one category per axis); increasing them stacks categories
+    /// on an axis (nested group headers over the Cartesian product of items).
+    n_rows: usize,
+    n_cols: usize,
+    /// Selected item index for each page (extra) dimension, positionally by
+    /// page dim (i.e. `axis_order[n_rows + n_cols + i]`).
+    page_idx: Vec<usize>,
+    /// The measure `axis_order`/`page_idx` currently describe (so the pivot
+    /// state resets when this matrix's measure changes).
+    axis_for: Option<MeasureId>,
+    /// Active per-category display filters for this matrix. Presentation only
+    /// (hides items from the grid; never touches data). Captured when saving a
+    /// view; reset on measure switch.
+    filters: Vec<Filter>,
+    /// Keyboard cell cursor into this matrix's grid (row/col indices), clamped
+    /// to its dimensions.
+    cursor_row: usize,
+    cursor_col: usize,
+    /// The fixed corner of a range selection (Shift+arrow, Shift+click,
+    /// drag); `None` selects just the cursor cell. Transient, never persisted.
+    anchor: Option<(usize, usize)>,
+    /// The cell currently being edited in THIS matrix, and its text buffer.
+    editing: Option<(MeasureId, CoordKey)>,
+    edit_buf: String,
+    /// The bytes of `edit_buf` to select when its editor first shows: all
+    /// of an old value, or a caret after a typed key (H1-1). Dropped once
+    /// the editor has the keyboard.
+    edit_select: Option<std::ops::Range<usize>>,
+    /// Its worksheet window's outer rect, relative to the workspace's top-left
+    /// (persisted in the view).
+    rect: CanvasRect,
+    /// Where THIS matrix's margin gutters and table ended up in the last
+    /// laid-out frame (see [`GutterRects`]). `None` until it has rendered once.
+    /// Layout output, not state.
+    gutters: Option<GutterRects>,
+    /// The row and column category stacks THIS matrix's grid was last rendered
+    /// with, as `(rows, columns)`. `None` until it has rendered once.
+    ///
+    /// Render output, the same role `gutters` plays for the geometry — and for
+    /// the same reason: it makes "each matrix renders its OWN pivot" checkable
+    /// instead of merely intended. Asserting on `axis_order` alone cannot see a
+    /// renderer that ignores its matrix index and draws the focused matrix's
+    /// layout N times.
+    rendered_axes: Option<(Vec<CategoryId>, Vec<CategoryId>)>,
+    /// Whether the selection is items and their cells (an item header was
+    /// clicked), the items only or the cells only (Edit ▸ Select Items Only
+    /// and Cells Only; a cell click selects cells).
+    part: SelPart,
+    /// How this worksheet draws itself: Edit ▸ Inspector…'s Grid and
+    /// Layout pages and Format ▸ Format Panel…'s Alignment.
+    ///
+    /// shortcut: kept with the window, not saved in the view (`View` has
+    /// no field for them); add them to `MatrixPlacement` when it matters.
+    opts: SheetOpts,
+}
+
+/// What a worksheet's selection holds (Improv's structured selection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SelPart {
+    /// Cells (a cell click, a drag, Shift+arrows).
+    #[default]
+    Cells,
+    /// Items and their cells (an item header click): the row items when
+    /// `rows`, else the column items.
+    Both { rows: bool },
+    /// The item names only (Select Items Only).
+    Items { rows: bool },
+}
+
+/// A worksheet's presentation options (Improv's Inspector Grid and Layout
+/// pages, and the Format panel's Alignment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SheetOpts {
+    /// Grid ▸ Show Grid Lines.
+    lines: bool,
+    /// Grid ▸ Lines In.
+    lines_in: LinesIn,
+    /// Layout ▸ Show Markers ▸ Hidden Items: a filtered category's tile
+    /// reads `Name*`.
+    hidden_marker: bool,
+    /// Formulas ▸ Show Errors In Line: a formula's error is spelled out
+    /// under its row; off, its status indicator's tip holds it.
+    errors_inline: bool,
+    /// Format panel ▸ Alignment.
+    align: CellAlign,
+}
+
+impl Default for SheetOpts {
+    fn default() -> Self {
+        SheetOpts {
+            lines: true,
+            lines_in: LinesIn::Both,
+            hidden_marker: true,
+            errors_inline: true,
+            align: CellAlign::Smart,
+        }
+    }
+}
+
+/// Inspector ▸ Grid ▸ Lines In: where the grid is ruled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinesIn {
+    Cells,
+    Items,
+    Both,
+}
+
+/// Format panel ▸ Alignment: Smart puts numbers right and text left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CellAlign {
+    Smart,
+    Left,
+    Center,
+    Right,
+}
+
+/// The Inspector's pages, as its pop-up lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum InspectorPage {
+    #[default]
+    Grid,
+    Layout,
+    Formulas,
+}
+
+/// The Format panel's pages (Improv's also had Line Style and Color).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FormatPage {
+    #[default]
+    Number,
+    Alignment,
+}
+
+/// What the Inspector and the Format panel edit: the focused worksheet's
+/// options and its measure's number format, with the worksheet and measure
+/// they were read from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PanelDraft {
+    from: (u64, Option<MeasureId>),
+    opts: SheetOpts,
+    /// Number page: General (`None`) or a count of decimal places.
+    decimals: Option<u8>,
+    commas: bool,
+}
+
+/// An open Inspector or Format panel: its page, what it read, and the edits
+/// OK or Set applies. When what it reads changes (another worksheet or
+/// measure, a Format menu pick) the edits follow it, as a NeXT panel
+/// follows the selection; Revert reads it again.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Panel<P> {
+    page: P,
+    read: PanelDraft,
+    draft: PanelDraft,
+}
+
+impl<P> Panel<P> {
+    fn new(page: P, read: PanelDraft) -> Self {
+        Panel {
+            page,
+            read,
+            draft: read,
+        }
+    }
+
+    /// Show `now` when what the panel reads has changed under it.
+    fn follow(&mut self, now: PanelDraft) {
+        if now != self.read {
+            self.read = now;
+            self.draft = now;
+        }
+    }
+}
+
+/// The Print panel's fields.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PrintPanel {
+    copies: u32,
+    /// Pages From and To; `None` prints them all.
+    pages: Option<(usize, usize)>,
+    /// Print Selected Data Only.
+    selection: bool,
+    /// The printer, empty for the default (Unix spoolers).
+    printer: String,
+    /// Save as PDF or PostScript: this path.
+    path: String,
+}
+
+/// One of the formula pane's two editors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormulaEditor {
+    /// The selected row's (`formula_buf`, id `formula_edit`).
+    Row,
+    /// The `Name = formula` line (`new_formula_line`, id `formula_new`).
+    NewLine,
+}
+
+impl FormulaEditor {
+    fn id(self) -> egui::Id {
+        egui::Id::unique(match self {
+            FormulaEditor::Row => "formula_edit",
+            FormulaEditor::NewLine => "formula_new",
+        })
+    }
+}
+
+/// Byte offset of the caret in text edit `id` over `text` (its end when
+/// the edit has none yet).
+fn caret_byte(ctx: &egui::Context, id: egui::Id, text: &str) -> usize {
+    egui::TextEdit::load_state(ctx, id)
+        .and_then(|s| s.cursor.char_range())
+        .map_or(text.len(), |r| {
+            text.char_indices()
+                .nth(r.primary.index.0)
+                .map_or(text.len(), |(b, _)| b)
+        })
+}
+
+/// Put the caret of text edit `id` over `text` at byte `at`.
+fn set_caret(ctx: &egui::Context, id: egui::Id, text: &str, at: usize) {
+    select_bytes(ctx, id, text, at..at);
+}
+
+/// Select bytes `r` of `text` in text edit `id` (an empty range is a caret).
+/// Call it after the edit is drawn: an edit without the keyboard drops a
+/// selection to its caret.
+fn select_bytes(ctx: &egui::Context, id: egui::Id, text: &str, r: std::ops::Range<usize>) {
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let c = |at: usize| egui::text::CCursor::new(text[..at.min(text.len())].chars().count());
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(c(r.start), c(r.end))));
+    state.store(ctx, id);
+}
+
+/// What was typed this frame from its first key that is not one of the
+/// grid's own (`h j k l n [ ]`, any case) or a space, taken out of the
+/// input so nothing else reads it; `None` when nothing was.
+fn take_typed(ui: &egui::Ui) -> Option<String> {
+    let starts = |t: &str| {
+        !t.chars()
+            .all(|c| c.is_whitespace() || "hjklHJKLnN[]".contains(c))
+    };
+    ui.input_mut(|i| {
+        let start = i
+            .events
+            .iter()
+            .position(|e| matches!(e, egui::Event::Text(t) if starts(t)))?;
+        let mut typed = String::new();
+        let mut at = 0;
+        i.events.retain(|e| {
+            at += 1;
+            match e {
+                egui::Event::Text(t) if at > start => {
+                    typed.push_str(t);
+                    false
+                }
+                _ => true,
+            }
+        });
+        Some(typed)
+    })
+}
+
+/// The running GUI application.
+pub struct ImprovApp {
+    /// The store path (empty = in-memory scratch); used for saving.
+    db: String,
+    /// Shared with an engine build in flight, which copies it and lets go
+    /// (see [`Self::rebuild_engine`]).
+    model: Arc<Model>,
+    /// Input-cell edits made while a build was still copying `model`:
+    /// written to it once the build lets go, and read before it until then,
+    /// so the edit need not wait for the copy (H3).
+    held: Vec<(MeasureId, improv_core_model::Coordinate, Option<Value>)>,
+    /// Live incremental engine over all derived measures, plus its snapshot.
+    engine: Option<Engine>,
+    snapshot: Snapshot,
+    /// The engine build running off the UI thread, if any (H3).
+    building: Option<Build>,
+    /// The store's model, loading on a thread of its own (H3): the window
+    /// opens on an empty desk that says "Loading…" ([`Self::open`]).
+    loading: Option<mpsc::Receiver<Loaded>>,
+    /// Whether builds run in the background: in the app, yes; tests build
+    /// in the foreground unless they test the background path.
+    background: bool,
+    /// The matrices on the canvas, in canvas order. **Always non-empty**: index
+    /// 0 is the view's primary matrix (see [`View`]'s flat fields), the rest are
+    /// its `placements`.
+    matrices: Vec<Matrix>,
+    /// Which matrix has the keyboard: the only one that consumes grid shortcuts
+    /// and the one every "selected measure" surface (formula editor, inspector,
+    /// chart, status readout) reads from. Always a valid index into `matrices`.
+    focus: usize,
+    /// The saved view this canvas was loaded from, if any — the highlighted
+    /// document tab (see [`ImprovApp::document_tabs`]).
+    current_view: Option<ViewId>,
+    status: String,
+
+    // --- transient UI edit buffers (view state, not model state) ---
+    /// The formula-editor text for the selected derived measure.
+    formula_buf: String,
+    /// The measure whose formula `formula_buf` currently holds (so we reload
+    /// the buffer when the selection changes).
+    formula_for: Option<MeasureId>,
+    /// The last failed `commit_formula`'s error, located in its text (the
+    /// span the editor underlines, the message and hint under the row). Set
+    /// on a failed commit; cleared on a successful one or when the buffer is
+    /// edited again.
+    formula_error: Option<crate::diagnostics::Diagnostic>,
+    /// The formula locale: how formulas are typed and shown (decimal comma,
+    /// `;`, translated names). `Locale::from_env` in the real app; English
+    /// in tests so they do not depend on the machine's locale.
+    locale: improv_core_model::Locale,
+    /// Text buffer for the formula list's last line, where `Name = formula`
+    /// adds a derived measure.
+    new_formula_line: String,
+    /// The last failed add's error, located in `new_formula_line` (as
+    /// `formula_error` is for the selected row).
+    new_formula_error: Option<crate::diagnostics::Diagnostic>,
+    /// Text buffer for the "Save view" name field.
+    view_name: String,
+    /// The model browser's selected view row (single click). A double-click
+    /// opens it; `None` or a deleted id falls back to the current view.
+    browser_sel: Option<ViewId>,
+
+    /// Whether the graph window (Graph ▸ New Graph) is shown, its graph
+    /// type, how the selection becomes series, and whether it is in color
+    /// (else NeXT's four grays).
+    show_chart: bool,
+    chart_kind: crate::chart::ChartKind,
+    chart_parse: crate::chart::ParseBy,
+    chart_color: bool,
+
+    /// CSV/TSV import/export wizard: whether the panel is shown, and its two
+    /// forms (see `csv_wizard`).
+    show_csv_wizard: bool,
+    import_form: ImportForm,
+    /// Whether the Info panel window is shown (off until Info ▸ Info Panel…).
+    show_inspector: bool,
+    /// Whether Help ▸ Keys…'s window is shown.
+    show_keys: bool,
+    /// Edit ▸ Inspector… (Grid, Layout, Formulas), while it is open.
+    inspector: Option<Panel<InspectorPage>>,
+    /// Format ▸ Format Panel… (Number, Alignment), while it is open.
+    format_panel: Option<Panel<FormatPage>>,
+    /// Format ▸ Page Layout… and Report Layout…, for every print; and
+    /// which of their panels is open.
+    page_layout: crate::print::PageLayout,
+    report_layout: crate::print::ReportLayout,
+    show_page_layout: bool,
+    show_report_layout: bool,
+    /// Print…, while its panel is open.
+    print_panel: Option<PrintPanel>,
+    /// The help page shown (Info ▸ Context Help…, Point for Help).
+    help: Option<crate::help::Topic>,
+    /// Point for Help is waiting for its click; and the click, taken from
+    /// the frame's input before egui saw it ([`Self::take_help_click`]).
+    pointing: bool,
+    help_click: Option<egui::Pos2>,
+    /// The window in front as the frame began: Context Help's context.
+    front: Option<egui::LayerId>,
+    /// The function help browser (Help ▸ Functions…, F1).
+    fn_help: crate::function_help::Browser,
+    /// The formula editor last focused: where the help browser inserts.
+    formula_target: FormulaEditor,
+    /// Whether the model browser window is shown (File ▸ Model Browser…).
+    show_browser: bool,
+    /// Quit was picked once on an unsaved in-memory model; the next Quit
+    /// closes. Any other command disarms it.
+    quit_armed: bool,
+    /// The model has edits that are not persisted: an in-memory model with
+    /// undo history, or a db model with a save still queued or one that
+    /// failed. Shown as the title's ` •`; it clears only when the store has
+    /// every edit. (Canvas-layout changes since the last saved view are not
+    /// tracked.)
+    dirty: bool,
+    /// The store high-water this model was loaded/last saved at, so a save
+    /// refuses to clobber another process's writes (`StoreError::Conflict`).
+    /// Lent to the save thread while a save runs ([`Self::saving`]).
+    save_token: improv_store::SaveToken,
+    /// What failed autosaves left unwritten; the next save writes it too.
+    unsaved: improv_store::ChangeSet,
+    /// The save running on the save thread, and the thread (H3): a save
+    /// never runs on the UI thread. See [`Self::save_changes`].
+    saving: Option<Saving>,
+    saver: Option<Saver>,
+    /// A change asked for a save while one ran: [`Self::unsaved`] goes when
+    /// it lands, so saves run one at a time, in order.
+    save_wanted: bool,
+    /// The last save failed: [`Self::unsaved`] holds what it did not write.
+    save_failed: bool,
+    /// The save thread died with the token: nothing more is saved until
+    /// File ▸ Revert to Saved reloads the model.
+    save_lost: bool,
+    /// The native title last sent, so `update` only sends a change.
+    last_title: String,
+    /// The `status` the status bar last drew, and when (egui time) it first
+    /// drew it: a message clears itself [`STATUS_TTL`] seconds later.
+    status_shown: String,
+    status_at: f64,
+    /// The floating application menu's position and open submenu.
+    menu: menu::MenuState,
+    export_form: ExportForm,
+
+    /// Undo/redo history: whole-`Model` snapshots, oldest first. `undo_stack`
+    /// holds the states BEFORE each recorded mutation; `redo_stack` the states
+    /// undone away. See [`ImprovApp::undo`] and `UNDO_DEPTH`.
+    undo_stack: Vec<Step>,
+    redo_stack: Vec<Step>,
+
+    /// Where each formula-list row landed in the last laid-out frame, as
+    /// `(measure, row rect)` in display order. Recorded by
+    /// [`ImprovApp::formula_list`]; empty until the pane has rendered.
+    /// Layout output, not model state — the same role `gutters` plays for the
+    /// grid, and what lets a headless test click a row where a user would.
+    formula_row_rects: Vec<(MeasureId, egui::Rect)>,
+
+    /// File ▸ New, Open… or Save As… is asking for a path (`NewModel`,
+    /// `OpenModel`, `SaveAs`).
+    file_panel: Option<Command>,
+    /// The file panel's path field still has to take the keyboard (H1-12).
+    file_focus: bool,
+    /// The file panel's path field.
+    file_path: String,
+    /// Edit ▸ Add …: open the browser at this "new …" line and focus it
+    /// next frame.
+    reveal: Option<NewThing>,
+    /// The browser row Edit ▸ Rename and Delete… act on (a click picks
+    /// it); `None`, or a deleted one, falls back to the worksheet's measure.
+    browser_pick: Option<Thing>,
+    /// The browser row being renamed in place: what, the line's text, and
+    /// whether the line still has to take the keyboard.
+    renaming: Option<(Thing, String, bool)>,
+    /// Edit ▸ Delete… is asking to confirm this, with its question.
+    confirm_delete: Option<(Thing, String)>,
+    /// H9: when (egui time) the store's high-water was last checked, and
+    /// the outside high-water the Reload panel offers (or was dismissed
+    /// at, `.1`): it shows again only when the mark moves on.
+    probed_at: f64,
+    outside: Option<(i64, bool)>,
+    /// A Postgres model's change notifications (pg_improv 0.15+), from a
+    /// thread on a second connection ([`Self::listen`]), in place of the
+    /// [`PROBE_SECS`] probe. `None` for a Mentat file, or once the thread
+    /// stopped (then the probe again).
+    heard: Option<mpsc::Receiver<Option<improv_store::Heard>>>,
+    /// [`Self::listen`] has run for this store (it tries once).
+    listened: bool,
+    /// The data generation last heard, and the re-read of the inputs it
+    /// asks for when it moves ([`Self::take_inputs`]).
+    data_seen: Option<i64>,
+    reread: Reread,
+    /// A CSV import waiting for its "Importing…" status to be painted (the
+    /// count of frames shown since it was asked for): the import and its
+    /// full save block the UI thread for seconds on a large model.
+    queued_import: Option<u8>,
+    /// The workspace's size in the last frame: where View ▸ New View has room.
+    desk: egui::Vec2,
+}
+
+/// Engine builds run in the background, except in tests (see
+/// [`ImprovApp::background`]).
+const BACKGROUND: bool = !cfg!(test);
+
+/// Seconds between the checks for another writer's save (H9).
+const PROBE_SECS: f64 = 2.0;
+
+/// The measured screen geometry of the grid's margin gutters and the table they
+/// frame, as laid out in the last frame.
+///
+/// The gutters are *docked to the grid's edges*, NeXT-style
+/// (`docs/reviews/refs/improv-next-workspace-1.0.png`): page tiles (each over
+/// its item field) top-left and column tiles top-right, both in the strip along
+/// the table's top edge; row tiles in the bottom-left strip below the table. Recording the
+/// rects makes that adjacency *checkable* instead of merely apparent — see
+/// [`gutters_frame_table`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GutterRects {
+    /// The top strip (pages left, columns right), spanning the table's top edge.
+    top: egui::Rect,
+    /// The table's left edge: a zero-width rect (there is no side gutter).
+    left: egui::Rect,
+    /// The table (header + cells) the two gutters frame.
+    table: egui::Rect,
+    /// The bottom strip: row-axis categories.
+    well: egui::Rect,
+    /// The horizontal scroller, inline in the bottom strip right of the row
+    /// tiles (spec §4.4).
+    hbar: egui::Rect,
+}
+
+/// Tolerance, in points, for the gutter-adjacency invariant. The edges are
+/// computed from the same panel cursor so they agree exactly; half a point of
+/// slack only guards against rounding in egui's pixel alignment.
+const EDGE_EPS: f32 = 0.5;
+
+/// Whether the gutters genuinely *frame* the table: the row gutter's right edge
+/// **is** the table's left edge, the column gutter's bottom edge **is** the
+/// table's top edge, each gutter spans the table along its other axis, and the
+/// corner well sits below the table at the row gutter's left edge.
+///
+/// This is the geometric property the old horizontal "axis shelf" failed: three
+/// drop zones side by side above the grid touch no grid edge at all. It is
+/// `debug_assert!`ed every frame (when the window has room — see
+/// [`gutters_have_room`]) and asserted on recorded rects in the headless layout
+/// test.
+fn gutters_frame_table(g: &GutterRects) -> bool {
+    let adjoins = |a: f32, b: f32| (a - b).abs() <= EDGE_EPS;
+    adjoins(g.left.max.x, g.table.min.x)
+        && adjoins(g.top.max.y, g.table.min.y)
+        // The row gutter runs alongside the table, not merely up to a corner.
+        && g.left.min.y <= g.table.min.y + EDGE_EPS
+        && g.left.max.y + EDGE_EPS >= g.table.min.y
+        // The column gutter spans across the table.
+        && g.top.min.x <= g.table.min.x + EDGE_EPS
+        && g.top.max.x + EDGE_EPS >= g.table.min.x
+        // The well is the bottom-left corner of the framed region: below the row
+        // gutter (whose height IS the framed region's height — the table's own
+        // `min_rect` can overflow that when its content does not fit), and flush
+        // with the row gutter's left edge.
+        && g.well.min.y + EDGE_EPS >= g.left.max.y
+        && adjoins(g.well.min.x, g.left.min.x)
+}
+
+/// A fresh [`Matrix`] uid.
+fn next_matrix_uid() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The [`crate::nxwin::NxWindow`] id of the worksheet window of the matrix
+/// whose uid is `uid`.
+fn matrix_window_id(uid: u64) -> egui::Id {
+    crate::nxwin::NxWindow::new(("matrix", uid), "").id()
+}
+
+/// Height of the graph window's inspector line, above the graph.
+const GRAPH_INSPECTOR_H: f32 = 28.0;
+
+/// The rect to show NxWindow `win` at: `home` on the workspace until the user
+/// moves or resizes it, then where they left it. The workspace settles over
+/// the first frames and follows the native window's size, so a plain
+/// `default_rect` would keep the first frame's guess.
+fn anchored_rect(ctx: &egui::Context, win: egui::Id, home: egui::Rect) -> egui::Rect {
+    let last = win.with("home");
+    let prev_home = ctx.data_mut(|d| {
+        let prev = d.get_temp::<egui::Rect>(last);
+        d.insert_temp(last, home);
+        prev
+    });
+    crate::nxwin::stored_rect(ctx, win)
+        .filter(|&at| Some(at) != prev_home)
+        .unwrap_or(home)
+}
+
+/// Whether the window left the gutters enough room to be laid out at all.
+///
+/// A panel clamps its extent to what is available, so in an absurdly small
+/// window (a few dozen points of central panel) the bottom well is squeezed up
+/// past the table and [`gutters_frame_table`] cannot hold — through no fault of
+/// the layout. The per-frame `debug_assert!` is gated on this so shrinking the
+/// window can never panic a debug build; the invariant itself stays strict, and
+/// the layout test asserts it at a real window size.
+fn gutters_have_room(g: &GutterRects) -> bool {
+    g.well.min.y >= g.top.max.y && g.left.height() > 0.0
+}
+
+/// A grid's horizontal scroll area, wrapping its table's vertical one and
+/// the rect that vertical scroller was laid out in.
+type GridScroll =
+    egui::scroll_area::ScrollAreaOutput<(egui::scroll_area::ScrollAreaOutput<()>, egui::Rect)>;
+
+/// A category tile's height (the NeXT tiles are 17 px tall).
+const TILE_H: f32 = 17.0;
+
+/// The room View ▸ New View leaves between a new window and the last one.
+const WINDOW_GAP: f32 = 8.0;
+
+/// How far View ▸ New View cascades a new window from the last one when neither
+/// beside nor below it has room: past its title bar (nxwin's 23 px and
+/// border) plus [`WINDOW_GAP`], so the old title stays readable (H1-28).
+/// See [`ImprovApp::add_matrix`].
+const CASCADE: f32 = 24.0 + WINDOW_GAP;
+
+/// Seconds a status message stays up before the status bar clears it.
+const STATUS_TTL: f64 = 5.0;
+
+/// The published user guide Help ▸ User Guide opens.
+const USER_GUIDE: &str = crate::help::GUIDE;
+
+/// Help ▸ Keys…'s keys beyond the menu's key equivalents (which it reads
+/// from the menu): `(keys, what they do)`.
+const GRID_KEYS: &[(&str, &str)] = &[
+    ("Arrows, h j k l", "move the cursor"),
+    (
+        "Shift+arrows",
+        "select a range (the status bar shows its Sum)",
+    ),
+    ("Type", "replace the cell's value"),
+    ("Enter, F2", "edit the cell, its value selected"),
+    ("Enter", "commit an edit"),
+    ("Esc", "cancel an edit, close a panel or a menu"),
+    ("[ ], PageUp PageDown", "page"),
+    ("n, Shift+n", "next, previous measure"),
+    ("Tab", "move between fields and buttons"),
+    ("Enter, Space", "press the focused button or menu item"),
+    ("F1", "function help, anywhere"),
+    ("Up Down, Tab", "pick from a formula's completion list"),
+];
+
+/// What an empty workspace says, right of the menu.
+const EMPTY_HINT: &str = "Empty model: Edit ▸ Add Category to begin, or File ▸ Open…";
+
+/// Where a fresh canvas's first matrix starts on the workspace: right of the
+/// application menu (at x 4, about 110 wide), as in the NeXT layout.
+const MENU_CLEAR: f32 = crate::menu::MENU_W + 12.0;
+
+/// Smallest a worksheet window can be resized to. Below roughly this it has no
+/// room for its gutters and a cell, so shrinking further would only hide its
+/// own chrome; [`gutters_have_room`] is the same judgement about the window.
+const MATRIX_MIN_W: f32 = 240.0;
+const MATRIX_MIN_H: f32 = 180.0;
+
+/// Height a worksheet window keeps for its gutters and grid: its formula pane
+/// grows (or defaults) no taller than what leaves this much above it.
+const GRID_MIN_H: f32 = 120.0;
+
+/// How many steps the undo (and redo) stack keeps; older entries are
+/// evicted.
+///
+/// shortcut: an import or a delete records a FULL `Model` clone, up to 50
+/// resident copies. Grid edits record a [`Step::Cell`], and changes that
+/// leave the cells alone a [`Step::Structure`]; undoing either of those two
+/// rebuilds the engine in the background. Give imports and deletes inverse
+/// operations too if huge models need it.
+const UNDO_DEPTH: usize = 50;
+
+/// [`ImprovApp::swap_model`]'s outcome: the model it replaced and the
+/// save's, or why it changed nothing and the candidate back.
+type ModelSwap = Result<(Model, Result<(), String>), (String, Box<Model>)>;
+
+/// [`ImprovApp::swap_structure`]'s outcome: the structure it replaced and
+/// the save's, or why it changed nothing and the candidate back.
+type StructureSwap = Result<(Box<Model>, Result<(), String>), (String, Box<Model>)>;
+
+/// One undo (or redo) step: what to put back.
+#[derive(Debug, Clone)]
+enum Step {
+    /// The whole model, before a change to its cells and structure at
+    /// once (an import, a delete). Boxed: a `Model` is ten times a cell
+    /// step.
+    Model(Box<Model>),
+    /// Everything but the input cells ([`structure_of`]), before a change
+    /// that left them alone (a formula, a name, a new category). Copying
+    /// 1M cells for the step took 140 ms, and diffing them for the save
+    /// 480 ms (H3).
+    Structure(Box<Model>),
+    /// One input cell's value (`None`: empty), before a grid edit. Cloning
+    /// the model per keystroke cost 170 ms at 1M cells, and undoing it was
+    /// a full rebuild; this undoes incrementally.
+    Cell(MeasureId, CoordKey, Option<Value>),
+    /// Several input cells' values, before one change to them all (a
+    /// paste): one undo step, applied cell by cell as [`Step::Cell`] is.
+    Cells(MeasureId, Vec<(CoordKey, Option<Value>)>),
+}
+
+/// An engine build running off the UI thread (see
+/// [`ImprovApp::rebuild_engine`]).
+struct Build {
+    /// The engine for the model the build took, or why it failed.
+    done: mpsc::Receiver<Result<(Option<Engine>, Snapshot), String>>,
+    /// The input-cell edits made since the build took the model: replayed
+    /// onto the new engine when it lands.
+    edits: Vec<improv_engine::session::Edit>,
+    /// The model changed structurally since: build again when this lands.
+    stale: bool,
+}
+
+/// One save for the save thread: the store, what it writes, and the token
+/// it saves over, moved there and back (never copied: a Postgres token
+/// holds every cell).
+struct SaveJob {
+    db: String,
+    /// The structure and the named cells ([`ImprovApp::save_model_for`]),
+    /// or the whole model when the save needs it.
+    model: Arc<Model>,
+    changes: improv_store::ChangeSet,
+    token: improv_store::SaveToken,
+}
+
+/// A finished save: the token after it (as it was, if the save failed),
+/// the changes it was to write (for the next save, if it failed), and how
+/// it went.
+type SaveOutcome = (
+    improv_store::SaveToken,
+    improv_store::ChangeSet,
+    improv_store::Result<()>,
+);
+
+/// The save on the save thread, as the UI thread tracks it.
+struct Saving {
+    done: mpsc::Receiver<SaveOutcome>,
+    /// The job shares the model itself (a save of every cell), not a copy
+    /// of what it writes: see [`ImprovApp::model_mut`].
+    whole: bool,
+    /// It writes changes an earlier save failed to.
+    retry: bool,
+}
+
+/// The thread that runs [`SaveJob`]s (H3): a structural save of a 1M-cell
+/// Mentat store held the UI thread 46–105 ms.
+struct Saver {
+    jobs: mpsc::Sender<(SaveJob, mpsc::Sender<SaveOutcome>)>,
+}
+
+impl Saver {
+    fn spawn() -> Option<Saver> {
+        let (tx, rx) = mpsc::channel::<(SaveJob, mpsc::Sender<SaveOutcome>)>();
+        std::thread::Builder::new()
+            .name("improv-gui-save".into())
+            .spawn(move || {
+                for (job, reply) in rx {
+                    #[cfg(test)]
+                    tests::save_gate();
+                    let _ = reply.send(run_save(job));
+                }
+            })
+            .ok()
+            .map(|_| Saver { jobs: tx })
+    }
+}
+
+/// Run one save: open the store, adopt the job's token, save, take the
+/// token back.
+fn run_save(job: SaveJob) -> SaveOutcome {
+    let SaveJob {
+        db,
+        model,
+        changes,
+        mut token,
+    } = job;
+    let r = Store::open(&db).and_then(|mut s| {
+        s.adopt_save_token(std::mem::take(&mut token));
+        let r = s.save_changes(&model, &changes);
+        // On failure this is the adopted token back, unchanged.
+        token = s.take_save_token();
+        r
+    });
+    // Let go of the model before answering, so the UI thread owns it again.
+    drop(model);
+    (token, changes, r)
+}
+
+/// The save thread died (a bug) and took the save token with it.
+const SAVE_LOST: &str = "save failed: the save stopped, so the change is not saved, and \
+    nothing more can be saved from this window. Choose File ▸ Revert to Saved to reload \
+    the model.";
+
+/// What the status line says while File ▸ Save waits for its save.
+const SAVING: &str = "saving…";
+
+/// What it says when a save writes what earlier ones failed to.
+const SAVED_AGAIN: &str = "saved: the changes that were not saved are in the store now";
+
+/// How often a frame looks for a finished save.
+const SAVE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// A loaded model and the token to save it over, or why it did not load.
+type Loaded = Result<(Model, improv_store::SaveToken), String>;
+
+/// A load thread that ended without an answer (it panicked, or could not
+/// start).
+const LOAD_LOST: &str = "the load stopped";
+
+/// How often a frame looks for a finished build.
+const BUILD_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+/// A build thread that ended without an answer (it panicked, or could not
+/// start).
+const BUILD_LOST: &str = "the engine build stopped";
+
+/// Initial window inner size: room for the menu, a default matrix and the Info
+/// panel side by side on the workspace.
+pub const INITIAL_WINDOW: [f32; 2] = [1280.0, 800.0];
+/// Minimum window inner size. Smaller windows still never overdraw the side
+/// panels (the canvas clips), but the matrix would be mostly scrolled away.
+pub const MIN_WINDOW: [f32; 2] = [960.0, 600.0];
+
+/// Which grid axis a category is assigned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    Rows,
+    Columns,
+    Pages,
+}
+
+/// A filter change asked for from a category tile's menu, applied to that
+/// tile's matrix after the gutters are laid out (like a re-pivot move).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TileReq {
+    /// Show/hide one item of the category.
+    Toggle(CategoryId, ItemId),
+    /// Show every item of the category again.
+    Clear(CategoryId),
+    /// The tile menu's New item line: add `name` to the category (`Id` is
+    /// the line, cleared on success).
+    AddItem(egui::Id, CategoryId, String),
+}
+
+/// What a "new …" line adds: the model browser's lines and a tile's menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewThing {
+    Category,
+    /// An item of this category.
+    Item(CategoryId),
+    /// An input measure: `Name` over every category, or `Name: Category,
+    /// Category, …` over those (`Name:` alone, a scalar).
+    Input,
+}
+
+impl NewThing {
+    /// The model browser's line for it (Edit ▸ Add … focuses it).
+    fn field(self) -> egui::Id {
+        match self {
+            NewThing::Category => egui::Id::unique("new_category"),
+            NewThing::Item(c) => egui::Id::unique(("new_item", c.0)),
+            NewThing::Input => egui::Id::unique("new_input"),
+        }
+    }
+}
+
+/// Whether formula-line text (canonical) is `Name = LAMBDA(…)`: a named
+/// LAMBDA's definition rather than a measure's formula.
+fn is_lambda_definition(text: &str) -> bool {
+    text.split_once('=').is_some_and(|(_, rhs)| {
+        let rhs = rhs.trim_start();
+        rhs.get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("lambda"))
+            && rhs[6..].trim_start().starts_with('(')
+    })
+}
+
+/// What the status line says about a failed save. The change stays in the
+/// window, marked • and kept for the next save, so each message says what
+/// to do (H3). After a conflict nothing is retried: another save would only
+/// be refused again, and the Reload panel offers their changes.
+fn save_error(e: improv_store::StoreError) -> String {
+    match e {
+        improv_store::StoreError::Conflict(_) => "save conflict: another program changed this \
+            model since it was opened, so your change is not saved and nothing was \
+            overwritten. Choose File ▸ Revert to Saved to load their changes (yours are \
+            dropped), then make it again."
+            .into(),
+        e if e.to_string().contains("disk is full") => {
+            "save failed: the disk is full, so the change is not saved yet. Free some space; \
+             the next edit or File ▸ Save writes it."
+                .into()
+        }
+        // What SQLite reports when the disk fills while it grows a side file.
+        e if e.to_string().contains("disk I/O error") => {
+            "save failed: the model's file could not be written (a disk I/O error: is the \
+             disk full?), so the change is not saved yet. Free some space; the next edit or \
+             File ▸ Save writes it."
+                .into()
+        }
+        e => format!(
+            "save failed: {e}; the change is not saved yet (the next edit or File ▸ Save \
+             tries again)"
+        ),
+    }
+}
+
+/// A category, item, measure or saved view: what Edit ▸ Rename and
+/// Delete… act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Thing {
+    Category(CategoryId),
+    Item(ItemId),
+    Measure(MeasureId),
+    View(ViewId),
+}
+
+/// Whether `e` names category `c`: `POSITION(c)`, `x OVER c`, `BY`, `EXCEPT`.
+fn expr_names_category(e: &Expr, c: CategoryId) -> bool {
+    match e {
+        Expr::Category(x) => *x == c,
+        Expr::Ref(_, d) => d.by.contains(&c) || d.over.contains(&c) || d.except.contains(&c),
+        Expr::UnaryOp(_, a) => expr_names_category(a, c),
+        Expr::BinaryOp(_, a, b) => expr_names_category(a, c) || expr_names_category(b, c),
+        Expr::Call(_, a) => a.iter().any(|x| expr_names_category(x, c)),
+        Expr::Literal(_) => false,
+    }
+}
+
+/// Drop item `i` from a view's filters and page pins.
+fn scrub_item(filters: &mut [Filter], pages: &mut Vec<(CategoryId, ItemId)>, i: ItemId) {
+    for f in filters {
+        f.items.retain(|j| *j != i);
+    }
+    pages.retain(|(_, j)| *j != i);
+}
+
+/// `n word`, with an `s` unless `n` is 1.
+fn plural(n: usize, word: &str) -> String {
+    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The model browser's rename line, drawn in place of the row being
+/// renamed, its text selected when it takes the keyboard. Returns
+/// `Some(Some(name))` on Enter and `Some(None)` when it ends otherwise (Esc,
+/// a click elsewhere).
+fn rename_line(ui: &mut egui::Ui, buf: &mut String, focus: &mut bool) -> Option<Option<String>> {
+    let id = egui::Id::unique("rename_line");
+    let resp = ui
+        .scope(|ui| {
+            // The theme's gray, not the list's white: the selection shows.
+            ui.visuals_mut().selection.bg_fill = crate::theme::LIGHT_GRAY;
+            ui.add(
+                egui::TextEdit::singleline(buf)
+                    .id(id)
+                    .desired_width((ui.available_width() - 8.0).clamp(80.0, 220.0)),
+            )
+        })
+        .inner;
+    a11y_name(&resp, "Rename");
+    if *focus {
+        if resp.has_focus() {
+            *focus = false;
+        } else {
+            resp.request_focus();
+            let mut s = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+            let all = egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(buf.chars().count()),
+            );
+            s.cursor.set_char_range(Some(all));
+            s.store(ui.ctx(), id);
+        }
+    }
+    resp.lost_focus().then(|| {
+        ui.input(|i| i.key_pressed(egui::Key::Enter))
+            .then(|| buf.trim().to_owned())
+    })
+}
+
+/// Give `resp`'s widget the accessible name `name` (H2). egui names a
+/// text field after its text only, so an empty field (or one whose hint is
+/// the only clue) is announced as nothing.
+fn a11y_name(resp: &egui::Response, name: &str) {
+    resp.ctx
+        .accesskit_node_builder(resp.id, |b| b.set_label(name));
+}
+
+/// The smallest unused id (>= 1) after `ids`.
+fn next_id(ids: impl Iterator<Item = u32>) -> u32 {
+    ids.max().map_or(1, |m| m + 1)
+}
+
+/// A one-line "new …" field, its text kept in egui memory under `id`, given
+/// the keyboard when `focus`. Returns the trimmed text when Enter is pressed
+/// in it.
+fn add_line(ui: &mut egui::Ui, id: egui::Id, hint: &str, focus: bool) -> Option<String> {
+    let mut buf: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    let resp = ui.add(
+        egui::TextEdit::singleline(&mut buf)
+            .id(id)
+            .hint_text(hint)
+            .desired_width((ui.available_width() - 8.0).clamp(80.0, 220.0)),
+    );
+    a11y_name(&resp, hint);
+    if focus && !resp.has_focus() {
+        resp.request_focus();
+    }
+    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+    let name = buf.trim().to_owned();
+    ui.data_mut(|d| d.insert_temp(id, buf));
+    (entered && !name.is_empty()).then_some(name)
+}
+
+/// The resolved pivot for the chart: the ROW category stack, the COLUMN stack,
+/// and the pinned `(category, item)` for every PAGE dimension.
+pub(crate) type ChartAxes = (Vec<CategoryId>, Vec<CategoryId>, Vec<(CategoryId, ItemId)>);
+
+impl Matrix {
+    /// A matrix showing `measure` with its natural axis order and the default
+    /// canvas geometry.
+    fn new(model: &Model, measure: Option<MeasureId>) -> Matrix {
+        let axis_order = natural_axis_order(model, measure);
+        let mut m = Matrix {
+            uid: next_matrix_uid(),
+            measure,
+            n_rows: 1.min(axis_order.len()),
+            n_cols: 1.min(axis_order.len().saturating_sub(1)),
+            axis_order,
+            axis_for: measure,
+            rect: CanvasRect {
+                x: MENU_CLEAR,
+                ..CanvasRect::default()
+            },
+            ..Matrix::default()
+        };
+        m.fit_to_grid(model);
+        m
+    }
+
+    /// Size the window to its grid (plus the formula pane), within bounds.
+    fn fit_to_grid(&mut self, model: &Model) {
+        let lines = |cats: &[CategoryId]| product_len(&self.axis_item_lists(model, cats)) as f32;
+        let (rows, cols) = (lines(&self.row_cats(model)), lines(&self.col_cats(model)));
+        self.rect.w = (120.0 + 80.0 * cols).clamp(360.0, 900.0);
+        self.rect.h = (200.0 + 20.0 * rows + 110.0).clamp(300.0, 700.0);
+    }
+
+    /// A matrix restoring a saved [`MatrixPlacement`] verbatim: its measure,
+    /// axis split, filters and geometry, with the page pins resolved
+    /// positionally by page dimension (an item that no longer exists falls back
+    /// to the first one).
+    ///
+    /// `None` when the placement's measure is gone — the caller decides whether
+    /// that is an error (a whole view) or one matrix to drop.
+    fn from_placement(model: &Model, p: &MatrixPlacement) -> Option<Matrix> {
+        if !model.measures.contains_key(&p.measure) {
+            return None;
+        }
+        let mut m = Matrix {
+            uid: next_matrix_uid(),
+            measure: Some(p.measure),
+            axis_order: if p.axis_order.is_empty() {
+                natural_axis_order(model, Some(p.measure))
+            } else {
+                p.axis_order.clone()
+            },
+            axis_for: Some(p.measure),
+            filters: p.filters.clone(),
+            // `improv save-view` and pre-canvas views put the window at the
+            // origin, under the menu: it opens beside the menu, as a fresh one
+            // does (H1-14). A place the user dragged it to is kept.
+            rect: if p.rect.x == 0.0 && p.rect.y == 0.0 {
+                CanvasRect {
+                    x: MENU_CLEAR,
+                    ..p.rect
+                }
+            } else {
+                p.rect
+            },
+            ..Matrix::default()
+        };
+        // Clamp the axis split to the restored order's length.
+        let len = m.axis_order.len();
+        m.n_rows = p.n_rows.min(len);
+        m.n_cols = p.n_cols.min(len.saturating_sub(m.n_rows));
+        // Page selections, positionally by page dimension.
+        let page_cats = m.page_cats(model);
+        m.page_idx = vec![0; page_cats.len()];
+        for (pi, cat) in page_cats.iter().enumerate() {
+            if let Some((_, it)) = p.page_items.iter().find(|(c, _)| c == cat) {
+                if let Some(idx) = m
+                    .sorted_items(model, *cat)
+                    .iter()
+                    .position(|(id, _)| id == it)
+                {
+                    if let Some(slot) = m.page_idx.get_mut(pi) {
+                        *slot = idx;
+                    }
+                }
+            }
+        }
+        m.clamp_cursor(model);
+        // No geometry saved (`improv save-view`, a pre-canvas view): sized
+        // as a fresh window is (H1-34 opens such a view at startup).
+        if p.rect == CanvasRect::default() {
+            m.fit_to_grid(model);
+        }
+        Some(m)
+    }
+
+    /// This matrix as a persistable [`MatrixPlacement`] — everything a saved
+    /// view needs to reproduce it, and nothing transient (no cursor, no open
+    /// editor). `None` when no measure is shown: there is no matrix to save.
+    fn to_placement(&self, model: &Model) -> Option<MatrixPlacement> {
+        Some(MatrixPlacement {
+            measure: self.measure?,
+            axis_order: self.axis_order.clone(),
+            n_rows: self.n_rows,
+            n_cols: self.n_cols,
+            page_items: self.pinned_pages(model),
+            filters: self.filters.clone(),
+            rect: self.rect,
+        })
+    }
+
+    /// Open the cell editor on `key` holding `text`, all of it selected, so
+    /// that what is typed next replaces it (H1-1).
+    fn open_editor(&mut self, measure: MeasureId, key: CoordKey, text: String) {
+        self.edit_select = Some(0..text.len());
+        self.editing = Some((measure, key));
+        self.edit_buf = text;
+    }
+
+    /// Show `measure` in this matrix, dropping any open cell editor. The pivot
+    /// state re-homes on the next [`Matrix::sync_axis_state`].
+    fn select(&mut self, measure: Option<MeasureId>) {
+        self.measure = measure;
+        self.editing = None;
+    }
+
+    /// Reset this matrix's pivot state to its measure's natural order when its
+    /// measure has changed. Called each frame before rendering.
+    fn sync_axis_state(&mut self, model: &Model) {
+        if self.axis_for != self.measure {
+            self.axis_for = self.measure;
+            self.axis_order = natural_axis_order(model, self.measure);
+            self.n_rows = 1.min(self.axis_order.len());
+            self.n_cols = 1.min(self.axis_order.len().saturating_sub(self.n_rows));
+            self.page_idx = vec![0; self.page_cats(model).len()];
+            self.filters.clear();
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+            self.anchor = None;
+        } else {
+            // A dimension the measure gained (the Info panel, a re-import)
+            // joins the pages, so every cell stays fully specified.
+            for c in natural_axis_order(model, self.measure) {
+                if !self.axis_order.contains(&c) {
+                    self.axis_order.push(c);
+                }
+            }
+            // Keep page_idx sized to the current page-dimension count.
+            let n = self.page_cats(model).len();
+            self.page_idx.resize(n, 0);
+        }
+        self.clamp_cursor(model);
+    }
+
+    /// This matrix's measure's own dimensions, in declared order.
+    ///
+    /// `axis_order` is not guaranteed to match them: restoring a view keeps a
+    /// saved order verbatim, and a CSV re-import can overwrite
+    /// `measure.categories`, so a stale category can linger in `axis_order`
+    /// while no longer being a dimension of the measure on screen. Such a
+    /// category must not influence this matrix's grid at all — without this
+    /// filter, a stale PAGE category filtered to zero items made
+    /// `pinned_pages_opt` return `None` and blanked a grid whose every cell was
+    /// fully specified.
+    ///
+    /// This is distinct from the case 6a4b862 fixed: a category that IS a real
+    /// dimension of the measure and is filtered to nothing still yields zero
+    /// lines, because those coordinates genuinely would be under-specified.
+    fn measure_dims(&self, model: &Model) -> Vec<CategoryId> {
+        natural_axis_order(model, self.measure)
+    }
+
+    /// `axis_order` restricted to the measure's dimensions, preserving the
+    /// user's axis placement/order. The `n_rows`/`n_cols` split indexes
+    /// `axis_order`, so the split is applied first and each slice is filtered.
+    fn live_axis_slice(&self, model: &Model, skip: usize, take: usize) -> Vec<CategoryId> {
+        let dims = self.measure_dims(model);
+        self.axis_order
+            .iter()
+            .skip(skip)
+            .take(take)
+            .filter(|c| dims.contains(c))
+            .copied()
+            .collect()
+    }
+
+    fn row_cats(&self, model: &Model) -> Vec<CategoryId> {
+        self.live_axis_slice(model, 0, self.n_rows)
+    }
+    fn col_cats(&self, model: &Model) -> Vec<CategoryId> {
+        self.live_axis_slice(model, self.n_rows, self.n_cols)
+    }
+    fn page_cats(&self, model: &Model) -> Vec<CategoryId> {
+        self.live_axis_slice(model, self.n_rows + self.n_cols, usize::MAX)
+    }
+
+    /// The pinned (category, item) for each page dimension, from `page_idx`.
+    /// A page category filtered to zero items pins nothing and is simply
+    /// absent, so the result can be SHORTER than `page_cats()` — grid/cursor
+    /// code must use `pinned_pages_opt`, which rejects that case.
+    fn pinned_pages(&self, model: &Model) -> Vec<(CategoryId, ItemId)> {
+        let mut pinned = Vec::new();
+        for (pi, c) in self.page_cats(model).iter().enumerate() {
+            let its = self.sorted_items(model, *c);
+            if its.is_empty() {
+                continue;
+            }
+            let sel = self
+                .page_idx
+                .get(pi)
+                .copied()
+                .unwrap_or(0)
+                .min(its.len() - 1);
+            pinned.push((*c, its[sel].0));
+        }
+        pinned
+    }
+
+    /// The pinned page items, or `None` if any page category is filtered to zero
+    /// items. In that case no item can be pinned for it, so every cell
+    /// coordinate would omit that category — under-specified for the measure's
+    /// dimensions. Render nothing rather than a cell at such a key.
+    fn pinned_pages_opt(&self, model: &Model) -> Option<Vec<(CategoryId, ItemId)>> {
+        let pinned = self.pinned_pages(model);
+        (pinned.len() == self.page_cats(model).len()).then_some(pinned)
+    }
+
+    /// The Cartesian product of `cats`' filtered items, outer category first.
+    /// Each returned element is one axis line: a tuple of `(ItemId, name)` in
+    /// `cats` order. An empty `cats` yields a single empty tuple (a 1-line
+    /// axis, i.e. a scalar in that direction). Any empty category collapses the
+    /// product to nothing (no lines).
+    fn axis_tuples(&self, model: &Model, cats: &[CategoryId]) -> Vec<Vec<(ItemId, String)>> {
+        let mut out: Vec<Vec<(ItemId, String)>> = vec![Vec::new()];
+        for c in cats {
+            let items = self.sorted_items(model, *c);
+            if items.is_empty() {
+                return Vec::new();
+            }
+            let mut next = Vec::with_capacity(out.len() * items.len());
+            for prefix in &out {
+                for it in &items {
+                    let mut t = prefix.clone();
+                    t.push(it.clone());
+                    next.push(t);
+                }
+            }
+            out = next;
+        }
+        out
+    }
+
+    /// The item lists (sorted, filtered) for each of `cats`, in order. Used to
+    /// virtualize the row axis: with these lists we can compute the total row
+    /// count as a product of lengths and decode the i-th row tuple on demand
+    /// (`nth_tuple`) without materializing the whole Cartesian product.
+    fn axis_item_lists(&self, model: &Model, cats: &[CategoryId]) -> Vec<Vec<(ItemId, String)>> {
+        cats.iter().map(|c| self.sorted_items(model, *c)).collect()
+    }
+
+    /// A category's items sorted by id, honoring THIS matrix's filters (shared
+    /// by paging and grid rendering). A category without a filter shows all
+    /// items; filtering is presentation only — it never touches model data.
+    fn sorted_items(&self, model: &Model, c: CategoryId) -> Vec<(ItemId, String)> {
+        let keep = |id: ItemId| match self.filters.iter().find(|f| f.category == c) {
+            Some(f) => f.items.contains(&id),
+            None => true,
+        };
+        let mut v: Vec<(ItemId, String)> = model
+            .categories
+            .get(&c)
+            .map(|cat| {
+                cat.items
+                    .iter()
+                    .filter(|id| keep(**id))
+                    .filter_map(|id| model.items.get(id).map(|it| (*id, it.name.0.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort_by_key(|(id, _)| id.0);
+        v
+    }
+
+    /// Move `category` to `axis` in THIS matrix, appending it as the innermost
+    /// entry of that axis (so categories *stack*: dropping a second category on
+    /// Rows nests it under the first). Removes it from its previous axis. No-op
+    /// if the category is not among this measure's dimensions. Pivoting is
+    /// formula-free re-projection (the Improv/Quantrix signature move).
+    fn set_axis(&mut self, model: &Model, category: CategoryId, axis: Axis) {
+        if !self.axis_order.contains(&category) {
+            return;
+        }
+        let (mut rows, mut cols, mut pages) = (
+            self.row_cats(model),
+            self.col_cats(model),
+            self.page_cats(model),
+        );
+        for v in [&mut rows, &mut cols, &mut pages] {
+            v.retain(|c| *c != category);
+        }
+        match axis {
+            Axis::Rows => rows.push(category),
+            Axis::Columns => cols.push(category),
+            Axis::Pages => pages.push(category),
+        }
+        self.rebuild_axis_order(model, rows, cols, pages);
+        self.clamp_cursor(model);
+    }
+
+    /// Flatten the three axis groups back into `axis_order` + `n_rows`/`n_cols`,
+    /// and resize `page_idx` to the new page count.
+    fn rebuild_axis_order(
+        &mut self,
+        model: &Model,
+        rows: Vec<CategoryId>,
+        cols: Vec<CategoryId>,
+        pages: Vec<CategoryId>,
+    ) {
+        self.n_rows = rows.len();
+        self.n_cols = cols.len();
+        self.axis_order = rows;
+        self.axis_order.extend(cols);
+        self.axis_order.extend(pages);
+        self.page_idx = vec![0; self.page_cats(model).len()];
+    }
+
+    /// Pivot: swap this matrix's entire row stack with its entire column stack
+    /// (Rows ↔ Columns), keeping pages put. For the classic one-per-axis case
+    /// this is the familiar row/column swap; with stacked categories it swaps
+    /// the two groups. No-op if there is nothing on either of rows/columns.
+    fn pivot_rotate(&mut self, model: &Model) {
+        let rows = self.row_cats(model);
+        let cols = self.col_cats(model);
+        if rows.is_empty() && cols.is_empty() {
+            return;
+        }
+        let pages = self.page_cats(model);
+        // Swap: old columns become rows, old rows become columns.
+        self.rebuild_axis_order(model, cols, rows, pages);
+        self.clamp_cursor(model);
+    }
+
+    /// Set the pinned item index for page dimension `dim_index` (its position
+    /// among this matrix's page dims), clamped to that dimension's item count.
+    /// No-op if out of range.
+    fn set_page(&mut self, model: &Model, dim_index: usize, item_index: usize) {
+        let pages = self.page_cats(model);
+        let Some(cat) = pages.get(dim_index).copied() else {
+            return;
+        };
+        let count = self.sorted_items(model, cat).len();
+        if count == 0 {
+            return;
+        }
+        if self.page_idx.len() != pages.len() {
+            self.page_idx.resize(pages.len(), 0);
+        }
+        if let Some(slot) = self.page_idx.get_mut(dim_index) {
+            *slot = item_index.min(count - 1);
+        }
+    }
+
+    /// Cycle this matrix's first page dimension by `delta` (wrapping).
+    fn page_first(&mut self, model: &Model, delta: isize) {
+        let Some(cat) = self.page_cats(model).first().copied() else {
+            return;
+        };
+        let count = self.sorted_items(model, cat).len();
+        if count == 0 {
+            return;
+        }
+        let cur = self.page_idx.first().copied().unwrap_or(0).min(count - 1);
+        let next = (cur as isize + delta).rem_euclid(count as isize) as usize;
+        self.set_page(model, 0, next);
+    }
+
+    /// Toggle whether `item` of `category` is shown in THIS matrix. On first
+    /// toggle the filter starts from all items minus this one; toggling so all
+    /// items are kept drops the filter. Presentation only.
+    fn toggle_filter_item(&mut self, model: &Model, category: CategoryId, item: ItemId) {
+        let all: Vec<ItemId> = model
+            .categories
+            .get(&category)
+            .map(|c| c.items.clone())
+            .unwrap_or_default();
+        match self.filters.iter().position(|f| f.category == category) {
+            None => {
+                let items: Vec<ItemId> = all.into_iter().filter(|i| *i != item).collect();
+                self.filters.push(Filter { category, items });
+            }
+            Some(i) => {
+                let f = &mut self.filters[i];
+                if let Some(p) = f.items.iter().position(|x| *x == item) {
+                    f.items.remove(p);
+                } else {
+                    f.items.push(item);
+                }
+                if f.items.len() == all.len() && all.iter().all(|x| f.items.contains(x)) {
+                    self.filters.remove(i);
+                }
+            }
+        }
+        self.clamp_cursor(model);
+    }
+
+    /// Drop THIS matrix's filter on `category`, showing all its items again.
+    fn clear_filter(&mut self, model: &Model, category: CategoryId) {
+        self.filters.retain(|f| f.category != category);
+        self.clamp_cursor(model);
+    }
+
+    /// This matrix's (row_count, col_count). An axis with NO categories is
+    /// genuinely scalar and has ONE line; an axis whose category is filtered to
+    /// zero items has ZERO lines (an empty grid with headers — never a synthetic
+    /// line whose coordinate would omit that category). If a PAGE category is
+    /// filtered to zero items nothing is addressable at all, so both counts are
+    /// 0. Matches `render_grid`.
+    fn grid_dims(&self, model: &Model) -> (usize, usize) {
+        if self.pinned_pages_opt(model).is_none() {
+            return (0, 0);
+        }
+        let rows = product_len(&self.axis_item_lists(model, &self.row_cats(model)));
+        let cols = product_len(&self.axis_item_lists(model, &self.col_cats(model)));
+        (rows, cols)
+    }
+
+    /// Move this matrix's cursor by `(drow, dcol)`, clamped to its grid (never
+    /// out of range). Mirrors the TUI's `move_cursor`.
+    fn move_cursor(&mut self, model: &Model, drow: isize, dcol: isize) {
+        let (rows, cols) = self.grid_dims(model);
+        let max_row = rows.saturating_sub(1) as isize;
+        let max_col = cols.saturating_sub(1) as isize;
+        self.cursor_row = (self.cursor_row as isize + drow).clamp(0, max_row) as usize;
+        self.cursor_col = (self.cursor_col as isize + dcol).clamp(0, max_col) as usize;
+    }
+
+    /// An arrow step: `extend` (Shift held) keeps or sets the anchor at the
+    /// current cursor before moving, growing a range; otherwise it collapses.
+    fn step(&mut self, model: &Model, drow: isize, dcol: isize, extend: bool) {
+        self.anchor = extend.then(|| self.anchor.unwrap_or((self.cursor_row, self.cursor_col)));
+        self.part = SelPart::Cells;
+        self.move_cursor(model, drow, dcol);
+    }
+
+    /// Select an item and its cells, as an item header click does: line
+    /// `line` of the row (`rows`) or column axis at category `level`, with
+    /// the lines of its group when the category is an outer one, across
+    /// the whole other axis. `extend` (Shift) reaches it from the anchor.
+    fn select_item(&mut self, model: &Model, rows: bool, line: usize, level: usize, extend: bool) {
+        let (n_rows, n_cols) = self.grid_dims(model);
+        let cats = if rows {
+            self.row_cats(model)
+        } else {
+            self.col_cats(model)
+        };
+        let lists = self.axis_item_lists(model, &cats);
+        let group = lists
+            .iter()
+            .skip(level + 1)
+            .map(Vec::len)
+            .product::<usize>()
+            .max(1);
+        let (first, last) = (line - line % group, line - line % group + group - 1);
+        let (other_last, n) = if rows {
+            (n_cols, n_rows)
+        } else {
+            (n_rows, n_cols)
+        };
+        let last = last.min(n.saturating_sub(1));
+        let other_last = other_last.saturating_sub(1);
+        let from = match self.anchor {
+            Some((r, c)) if extend && self.part == (SelPart::Both { rows }) => {
+                if rows {
+                    r
+                } else {
+                    c
+                }
+            }
+            _ => first,
+        };
+        let (lo, hi) = if from <= first {
+            (from, last)
+        } else {
+            (from.max(last), first)
+        };
+        if rows {
+            self.anchor = Some((lo, 0));
+            (self.cursor_row, self.cursor_col) = (hi, other_last);
+        } else {
+            self.anchor = Some((0, lo));
+            (self.cursor_row, self.cursor_col) = (other_last, hi);
+        }
+        self.part = SelPart::Both { rows };
+    }
+
+    /// The selected items' names (an item selection's, along `rows` or
+    /// the columns): one line per item line, its categories' items
+    /// tab-separated.
+    fn selected_item_names(&self, model: &Model, rows: bool) -> Vec<String> {
+        let (sel_rows, sel_cols) = self.selection();
+        let (cats, range) = if rows {
+            (self.row_cats(model), sel_rows)
+        } else {
+            (self.col_cats(model), sel_cols)
+        };
+        let lists = self.axis_item_lists(model, &cats);
+        if lists.is_empty() {
+            return Vec::new();
+        }
+        let n = product_len(&lists);
+        range
+            .filter(|i| *i < n)
+            .map(|i| {
+                nth_tuple(&lists, i)
+                    .into_iter()
+                    .map(|(_, name)| name)
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect()
+    }
+
+    /// The selected rectangle's (rows, cols): anchor to cursor, inclusive.
+    fn selection(&self) -> (RangeInclusive<usize>, RangeInclusive<usize>) {
+        let (r, c) = (self.cursor_row, self.cursor_col);
+        let (ar, ac) = self.anchor.unwrap_or((r, c));
+        (ar.min(r)..=ar.max(r), ac.min(c)..=ac.max(c))
+    }
+
+    /// The `CoordKey`s of every selected cell, row-major (see
+    /// [`Self::cursor_key`] for when there are none).
+    fn selection_keys(&self, model: &Model) -> Vec<CoordKey> {
+        let Some(pinned) = self.pinned_pages_opt(model) else {
+            return Vec::new();
+        };
+        let row_cats = self.row_cats(model);
+        let col_cats = self.col_cats(model);
+        let row_lists = self.axis_item_lists(model, &row_cats);
+        let col_lists = self.axis_item_lists(model, &col_cats);
+        let (n_rows, n_cols) = (product_len(&row_lists), product_len(&col_lists));
+        let line = |lists: &[Vec<(ItemId, String)>], i: usize| {
+            if lists.is_empty() {
+                Vec::new()
+            } else {
+                nth_tuple(lists, i)
+            }
+        };
+        let (rows, cols) = self.selection();
+        let cols: Vec<_> = cols
+            .filter(|c| *c < n_cols)
+            .map(|c| line(&col_lists, c))
+            .collect();
+        // ponytail: capped at 10,000 cells so a select-all on a huge grid stays
+        // cheap; stream the sum instead if Sum must cover bigger ranges.
+        rows.filter(|r| *r < n_rows)
+            .flat_map(|r| {
+                let rt = line(&row_lists, r);
+                cols.iter()
+                    .map(|ct| cell_key_multi(&row_cats, &rt, &col_cats, ct, &pinned))
+                    .collect::<Vec<_>>()
+            })
+            .take(10_000)
+            .collect()
+    }
+
+    /// The cells of the rectangle with top-left `(row, col)` and `rows` x
+    /// `cols` lines, row by row, clipped to the grid: what a copy reads (the
+    /// selection) and a paste writes (from the cursor).
+    fn block_keys(
+        &self,
+        model: &Model,
+        (row, col): (usize, usize),
+        (rows, cols): (usize, usize),
+    ) -> Vec<Vec<CoordKey>> {
+        let Some(pinned) = self.pinned_pages_opt(model) else {
+            return Vec::new();
+        };
+        let row_cats = self.row_cats(model);
+        let col_cats = self.col_cats(model);
+        let row_lists = self.axis_item_lists(model, &row_cats);
+        let col_lists = self.axis_item_lists(model, &col_cats);
+        let (n_rows, n_cols) = (product_len(&row_lists), product_len(&col_lists));
+        let line = |lists: &[Vec<(ItemId, String)>], i: usize| {
+            if lists.is_empty() {
+                Vec::new()
+            } else {
+                nth_tuple(lists, i)
+            }
+        };
+        let col_tuples: Vec<_> = (col..(col + cols).min(n_cols))
+            .map(|c| line(&col_lists, c))
+            .collect();
+        (row..(row + rows).min(n_rows))
+            .map(|r| {
+                let rt = line(&row_lists, r);
+                col_tuples
+                    .iter()
+                    .map(|ct| cell_key_multi(&row_cats, &rt, &col_cats, ct, &pinned))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Clamp the cursor into this matrix's grid (called after a pivot / measure
+    /// switch that may have shrunk it).
+    fn clamp_cursor(&mut self, model: &Model) {
+        let (rows, cols) = self.grid_dims(model);
+        self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        self.cursor_col = self.cursor_col.min(cols.saturating_sub(1));
+        if let Some((r, c)) = &mut self.anchor {
+            *r = (*r).min(rows.saturating_sub(1));
+            *c = (*c).min(cols.saturating_sub(1));
+        }
+    }
+
+    /// The `CoordKey` of the cell under this matrix's cursor, or `None` when
+    /// there is no cell there: any axis (row, column, or page) category filtered
+    /// to zero items means no coordinate fully specifies the measure's
+    /// dimensions, so there is nothing to address. An axis with no categories at
+    /// all is scalar in that direction and still has one line.
+    fn cursor_key(&self, model: &Model) -> Option<CoordKey> {
+        let pinned = self.pinned_pages_opt(model)?;
+        let row_cats = self.row_cats(model);
+        let col_cats = self.col_cats(model);
+        let row_lists = self.axis_item_lists(model, &row_cats);
+        let col_lists = self.axis_item_lists(model, &col_cats);
+        let (n_rows, n_cols) = (product_len(&row_lists), product_len(&col_lists));
+        if n_rows == 0 || n_cols == 0 {
+            return None;
+        }
+        // Decode only the cursor's row/col line (never the whole product).
+        // `product_len` of an empty list set is 1, the scalar axis -> empty tuple.
+        let row_tuple = if row_lists.is_empty() {
+            Vec::new()
+        } else {
+            nth_tuple(&row_lists, self.cursor_row.min(n_rows - 1))
+        };
+        let col_tuple = if col_lists.is_empty() {
+            Vec::new()
+        } else {
+            nth_tuple(&col_lists, self.cursor_col.min(n_cols - 1))
+        };
+        Some(cell_key_multi(
+            &row_cats, &row_tuple, &col_cats, &col_tuple, &pinned,
+        ))
+    }
+
+    /// Resolved axes for this matrix: (first row cat, first col cat, pinned page
+    /// dims). Test-only: rendering and the chart use the stacked (`_cats`) form.
+    #[cfg(test)]
+    fn resolved_axes(
+        &self,
+        model: &Model,
+    ) -> (
+        Option<CategoryId>,
+        Option<CategoryId>,
+        Vec<(CategoryId, ItemId)>,
+    ) {
+        let row_cat = self.axis_order.first().copied();
+        let col_cat = self.axis_order.get(self.n_rows).copied();
+        (row_cat, col_cat, self.pinned_pages(model))
+    }
+}
+
+impl ImprovApp {
+    /// Open the store at `db` (`""` = a fresh in-memory model) and load its
+    /// model on a thread of its own (H3): at 1M cells that takes seconds, so
+    /// the window opens at once on an empty desk that says "Loading…", and the
+    /// model, then its engine, follow ([`Self::poll_load`]). A store that
+    /// cannot be opened is the error here, before any window; one that opens
+    /// but does not load says so in the status line, and the window carries on
+    /// in memory.
+    pub fn open(db: &str) -> Result<ImprovApp, String> {
+        let loading = if db.is_empty() {
+            None
+        } else {
+            let mut store = Store::open(db).map_err(|e| e.to_string())?;
+            let (tx, rx) = mpsc::channel();
+            // A failed spawn drops `tx`: the load lands as LOAD_LOST. The
+            // engine's stack: a stored formula parses recursively.
+            let _ = std::thread::Builder::new()
+                .name("improv-gui-load".into())
+                .stack_size(improv_engine::dataflow::ENGINE_STACK)
+                .spawn(move || {
+                    let loaded = store
+                        .load_model()
+                        .map(|m| (m, store.take_save_token()))
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(loaded);
+                });
+            Some(rx)
+        };
+        let model = Model::new();
+        let save_token = improv_store::SaveToken::default();
+        let matrices = vec![Matrix::new(&model, None)];
+
+        let mut app = ImprovApp {
+            db: db.to_string(),
+            save_token,
+            unsaved: Default::default(),
+            saving: None,
+            saver: None,
+            save_wanted: false,
+            save_failed: false,
+            save_lost: false,
+            model: Arc::new(model),
+            held: Vec::new(),
+            engine: None,
+            snapshot: Snapshot::default(),
+            building: None,
+            loading: None,
+            background: BACKGROUND,
+            matrices,
+            focus: 0,
+            current_view: None,
+            status: String::new(),
+            formula_buf: String::new(),
+            formula_for: None,
+            formula_error: None,
+            locale: if cfg!(test) {
+                improv_core_model::Locale::en()
+            } else {
+                improv_core_model::Locale::from_env()
+            },
+            view_name: String::new(),
+            browser_sel: None,
+            show_chart: false,
+            chart_kind: Default::default(),
+            chart_parse: Default::default(),
+            chart_color: true,
+            show_csv_wizard: false,
+            import_form: ImportForm::default(),
+            show_inspector: false,
+            show_keys: false,
+            inspector: None,
+            format_panel: None,
+            page_layout: Default::default(),
+            report_layout: Default::default(),
+            show_page_layout: false,
+            show_report_layout: false,
+            print_panel: None,
+            help: None,
+            pointing: false,
+            help_click: None,
+            front: None,
+            fn_help: Default::default(),
+            formula_target: FormulaEditor::NewLine,
+            show_browser: true,
+            quit_armed: false,
+            dirty: false,
+            last_title: String::new(),
+            status_shown: String::new(),
+            status_at: 0.0,
+            menu: menu::MenuState::default(),
+            export_form: ExportForm::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            formula_row_rects: Vec::new(),
+            new_formula_line: String::new(),
+            new_formula_error: None,
+            file_panel: None,
+            file_focus: false,
+            file_path: String::new(),
+            reveal: None,
+            browser_pick: None,
+            renaming: None,
+            confirm_delete: None,
+            probed_at: f64::NEG_INFINITY,
+            outside: None,
+            heard: None,
+            listened: false,
+            data_seen: None,
+            reread: Reread::default(),
+            queued_import: None,
+            desk: egui::vec2(INITIAL_WINDOW[0], INITIAL_WINDOW[1]),
+        };
+        app.loading = loading;
+        if app.loading.is_none() {
+            app.install(Model::new(), improv_store::SaveToken::default());
+        }
+        Ok(app)
+    }
+
+    /// [`Self::open`], then wait for the model: a load failure is the error.
+    #[cfg(test)]
+    pub fn load(db: &str) -> Result<ImprovApp, String> {
+        let mut app = Self::open(db)?;
+        app.finish_load()?;
+        Ok(app)
+    }
+
+    /// Wait for the load in flight, if any, and install its model.
+    fn finish_load(&mut self) -> Result<(), String> {
+        let Some(rx) = self.loading.take() else {
+            return Ok(());
+        };
+        let (model, token) = rx.recv().unwrap_or_else(|_| Err(LOAD_LOST.into()))?;
+        self.install(model, token);
+        Ok(())
+    }
+
+    /// Each frame while loading: install the model once it is in, and keep
+    /// frames coming until then. A failed load says so and leaves an
+    /// in-memory model, so nothing is saved over the store it could not read.
+    fn poll_load(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.loading else {
+            return;
+        };
+        let loaded = match rx.try_recv() {
+            Ok(loaded) => loaded,
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(BUILD_POLL);
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(LOAD_LOST.into()),
+        };
+        self.loading = None;
+        ctx.request_repaint();
+        match loaded {
+            Ok((model, token)) => self.install(model, token),
+            Err(e) => {
+                eprintln!("improv-gui: {}: {e}", self.db);
+                self.status = format!("could not open {}: {e}", self.db);
+                self.db.clear();
+            }
+        }
+    }
+
+    /// Show `model`, loaded with `token`, on a fresh canvas: its first view's
+    /// worksheets, or its first measure, with nothing to undo. The window
+    /// opens on the inputs; the engine follows in the background (H3).
+    fn install(&mut self, model: Model, token: improv_store::SaveToken) {
+        let selected = pick_default_measure(&model);
+        self.matrices = vec![Matrix::new(&model, selected)];
+        self.focus = 0;
+        self.held.clear();
+        self.model = Arc::new(model);
+        self.save_token = token;
+        // Anything asked for while it loaded changed the empty model, and
+        // was never saved ([`Self::writable`]).
+        self.unsaved = Default::default();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.dirty = false;
+        self.open_first_view();
+        self.rebuild_engine();
+    }
+
+    /// Open the first saved view in id order, if there is one (H1-34).
+    /// Opening is not news: the status line stays empty unless a matrix
+    /// was skipped.
+    fn open_first_view(&mut self) {
+        let Some(v) = self.model.views.keys().min_by_key(|v| v.0) else {
+            return;
+        };
+        let v = self.model.views[v].clone();
+        self.apply_view(&v);
+        if self.status == format!("view: {}", v.name.0) {
+            self.status.clear();
+        }
+    }
+
+    // -- the canvas: N matrices, one focused -------------------------------
+
+    /// The focused matrix — the one the keyboard, the formula editor, the
+    /// inspector, the chart and the selection readout all follow.
+    ///
+    /// `matrices` is never empty (an empty model still has one matrix, showing
+    /// no measure) and `focus` is clamped here rather than trusted, so removing
+    /// a matrix can never leave a dangling focus.
+    pub(crate) fn focused(&self) -> &Matrix {
+        &self.matrices[self.focus.min(self.matrices.len() - 1)]
+    }
+
+    /// The focused matrix, mutably (see [`Self::focused`]).
+    pub(crate) fn focused_mut(&mut self) -> &mut Matrix {
+        let i = self.focus.min(self.matrices.len() - 1);
+        &mut self.matrices[i]
+    }
+
+    /// Give the keyboard to matrix `i` (clamped). Focus is what makes grid
+    /// shortcuts unambiguous with several matrices on one canvas.
+    pub fn set_focus(&mut self, i: usize) {
+        self.focus = i.min(self.matrices.len() - 1);
+    }
+
+    /// Which matrix has the keyboard.
+    pub fn focus_index(&self) -> usize {
+        self.focus.min(self.matrices.len() - 1)
+    }
+
+    /// How many matrices are on the canvas (always >= 1).
+    pub fn matrix_count(&self) -> usize {
+        self.matrices.len()
+    }
+
+    /// Add a matrix showing `measure` to the canvas, the size of the last
+    /// one, and focus it. Returns its index. It goes beside the last window,
+    /// else below it, where that is on the desk and clear of every window;
+    /// else it cascades from it by a title bar plus a gap, kept on the desk
+    /// (H1-28).
+    ///
+    /// Canvas layout only — the model is untouched, so this is deliberately NOT
+    /// an undo point; see [`Self::undo`].
+    pub fn add_matrix(&mut self, measure: Option<MeasureId>) -> usize {
+        let mut m = Matrix::new(&self.model, measure);
+        let last = self.matrices.last().map(|m| m.rect).unwrap_or_default();
+        let at = |x: f32, y: f32| CanvasRect { x, y, ..last };
+        let on_desk = |r: &CanvasRect| r.x + r.w <= self.desk.x && r.y + r.h <= self.desk.y;
+        let area =
+            |r: &CanvasRect| egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
+        let clear = |r: &CanvasRect| {
+            self.matrices
+                .iter()
+                .all(|m| !area(&m.rect).intersects(area(r)))
+        };
+        let (right, below) = (last.x + last.w + WINDOW_GAP, last.y + last.h + WINDOW_GAP);
+        m.rect = [at(right, last.y), at(last.x, below)]
+            .into_iter()
+            .find(|r| on_desk(r) && clear(r))
+            .unwrap_or_else(|| {
+                at(
+                    (last.x + CASCADE).min(self.desk.x - last.w).max(0.0),
+                    (last.y + CASCADE).min(self.desk.y - last.h).max(0.0),
+                )
+            });
+        self.matrices.push(m);
+        self.focus = self.matrices.len() - 1;
+        self.focus
+    }
+
+    /// Remove matrix `i` from the canvas. The LAST matrix is never removed (a
+    /// canvas with none has nowhere to show a measure) — that is a no-op
+    /// returning `false`. Layout only, like [`Self::add_matrix`].
+    pub fn remove_matrix(&mut self, i: usize) -> bool {
+        if self.matrices.len() <= 1 || i >= self.matrices.len() {
+            return false;
+        }
+        self.matrices.remove(i);
+        self.focus = self.focus.min(self.matrices.len() - 1);
+        true
+    }
+
+    // -- read-only accessors for the chart module (crate-internal) ---------
+
+    pub(crate) fn selected(&self) -> Option<MeasureId> {
+        self.focused().measure
+    }
+    /// Row/column category stacks and pinned pages for the current pivot — the
+    /// general (stacked) form the chart needs. Row/col tuples come from
+    /// `axis_tuples_pub`; keys from `cell_key_multi_pub`.
+    ///
+    /// `None` when a PAGE category is filtered to zero items: nothing can be
+    /// pinned for it, so every cell key would omit that category. Same rule as
+    /// the grid (`grid_dims`/`cursor_key`) — chart nothing rather than plot
+    /// under-specified keys.
+    ///
+    /// Reads the FOCUSED matrix: with several matrices on the canvas the chart
+    /// follows the keyboard, as every other single-measure surface does.
+    pub(crate) fn chart_axes_pub(&self) -> Option<ChartAxes> {
+        let m = self.focused();
+        Some((
+            m.row_cats(&self.model),
+            m.col_cats(&self.model),
+            m.pinned_pages_opt(&self.model)?,
+        ))
+    }
+    /// The Cartesian product of `cats`' filtered items (see `axis_tuples`),
+    /// exposed for the chart. Empty `cats` -> one empty tuple.
+    pub(crate) fn axis_tuples_pub(&self, cats: &[CategoryId]) -> Vec<Vec<(ItemId, String)>> {
+        self.focused().axis_tuples(&self.model, cats)
+    }
+    /// The sorted `CoordKey` for a stacked cell (see `cell_key_multi`).
+    pub(crate) fn cell_key_multi_pub(
+        &self,
+        row_cats: &[CategoryId],
+        row_tuple: &[(ItemId, String)],
+        col_cats: &[CategoryId],
+        col_tuple: &[(ItemId, String)],
+        pinned: &[(CategoryId, ItemId)],
+    ) -> CoordKey {
+        cell_key_multi(row_cats, row_tuple, col_cats, col_tuple, pinned)
+    }
+    /// The focused matrix's range selection as (rows, cols), when it spans
+    /// more than one cell; a single cell graphs the whole grid.
+    pub(crate) fn chart_selection_pub(
+        &self,
+    ) -> Option<(RangeInclusive<usize>, RangeInclusive<usize>)> {
+        let m = self.focused();
+        m.anchor?;
+        let (rows, cols) = m.selection();
+        (rows.start() != rows.end() || cols.start() != cols.end()).then_some((rows, cols))
+    }
+    pub(crate) fn values_for_pub(&self, measure: MeasureId) -> HashMap<CoordKey, f64> {
+        self.values_for(measure)
+    }
+    pub(crate) fn category_name_pub(&self, c: CategoryId) -> Option<String> {
+        self.model.categories.get(&c).map(|x| x.name.0.clone())
+    }
+
+    // -- pure state logic (unit-tested; no rendering) ----------------------
+
+    /// The numeric value map for a measure (input cells, or the derived
+    /// snapshot), projected to numbers for the CHART, which can only plot
+    /// numbers. Non-numeric cells are absent (a gap).
+    ///
+    /// The GRID must not use this: a Text/Boolean/DateTime cell would render
+    /// blank. Display goes through [`Self::cell_text`], which is type-aware.
+    fn values_for(&self, measure: MeasureId) -> HashMap<CoordKey, f64> {
+        let is_derived = self.model.measures.get(&measure).map(|m| m.is_derived());
+        match is_derived {
+            Some(true) => self
+                .snapshot
+                .get(&measure)
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_num().map(|n| (k.clone(), n)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => {
+                let mut out: HashMap<CoordKey, f64> = self
+                    .model
+                    .inputs
+                    .iter()
+                    .filter(|((mid, _), _)| *mid == measure)
+                    .filter_map(|((_, coord), v)| match v {
+                        Value::Number(n) => Some((encode_coord(coord), *n)),
+                        _ => None,
+                    })
+                    .collect();
+                for (_, at, v) in self.held.iter().filter(|h| h.0 == measure) {
+                    match v {
+                        Some(Value::Number(n)) => out.insert(encode_coord(at), *n),
+                        _ => out.remove(&encode_coord(at)),
+                    };
+                }
+                out
+            }
+        }
+    }
+
+    /// An input cell's value, counting the edits [`Self::held`] back.
+    fn input(&self, measure: MeasureId, at: &improv_core_model::Coordinate) -> Option<&Value> {
+        match self
+            .held
+            .iter()
+            .rev()
+            .find(|h| h.0 == measure && h.1 == *at)
+        {
+            Some((_, _, v)) => v.as_ref(),
+            None => self.model.input(measure, at),
+        }
+    }
+
+    /// Set (`Some`) or clear one input cell: in the model, or in
+    /// [`Self::held`] while a build still shares it.
+    fn write_input(
+        &mut self,
+        measure: MeasureId,
+        at: improv_core_model::Coordinate,
+        value: Option<Value>,
+    ) {
+        self.write_held();
+        match Arc::get_mut(&mut self.model) {
+            Some(model) => put_input(model, measure, at, value),
+            None => self.held.push((measure, at, value)),
+        }
+    }
+
+    /// Write the [`Self::held`] edits to the model once nothing shares it.
+    fn write_held(&mut self) {
+        if self.held.is_empty() {
+            return;
+        }
+        if let Some(model) = Arc::get_mut(&mut self.model) {
+            for (m, at, v) in self.held.drain(..) {
+                put_input(model, m, at, v);
+            }
+        }
+    }
+
+    /// The typed value of a cell: the engine snapshot for a derived measure,
+    /// the model's stored `Value` (mapped to a `CellValue`) for an input one.
+    /// `None` = the cell genuinely holds nothing.
+    fn cell_value(&self, measure: MeasureId, key: &CoordKey) -> Option<CellValue> {
+        if self
+            .model
+            .measures
+            .get(&measure)
+            .is_some_and(|m| m.is_derived())
+        {
+            return self
+                .snapshot
+                .get(&measure)
+                .and_then(|m| m.get(key))
+                .cloned();
+        }
+        self.input(measure, &decode(key))
+            .and_then(CellValue::from_model_value)
+    }
+
+    /// The display text for any cell — derived OR input — via `CellValue`'s
+    /// `Display`: numbers as numbers, text as text, booleans as `true`/`false`,
+    /// dates as RFC3339, error cells as `#ERR`. A cell is blank only when it
+    /// holds no value, never merely because its value is not a number.
+    fn cell_text(&self, measure: MeasureId, key: &CoordKey) -> Option<String> {
+        self.cell_value(measure, key).map(|v| v.to_string())
+    }
+
+    /// A cell as the grid shows it: in its measure's number format, in the
+    /// formula locale (H1-22). [`Self::cell_text`] is the value as typed,
+    /// what the editor opens with.
+    fn cell_shown(&self, measure: MeasureId, key: &CoordKey) -> Option<String> {
+        let v = self.cell_value(measure, key)?;
+        Some(v.formatted(self.number_format(measure).as_ref(), &self.locale))
+    }
+
+    /// The number format of `measure` (`None`: General).
+    fn number_format(&self, measure: MeasureId) -> Option<NumberFormat> {
+        self.model.measures.get(&measure).and_then(|m| m.format)
+    }
+
+    /// Format ▸ (H1-22): give the selected measure `decimals` (`None`:
+    /// General) or flip its thousands separators, keeping the other half
+    /// of its format. One undo step; autosaved with the structure.
+    pub fn set_number_format(&mut self, decimals: Option<Option<u8>>) -> Result<String, String> {
+        let id = self.selected().ok_or("select a measure first")?;
+        let m = self
+            .model
+            .measures
+            .get(&id)
+            .ok_or("the measure no longer exists")?;
+        if m.value_type != ValueType::Number {
+            return Err(format!("{} holds no numbers to format", m.name.0));
+        }
+        let mut f = m.format.unwrap_or_default();
+        match decimals {
+            Some(d) => f.decimals = d,
+            None => f.grouping = !f.grouping,
+        }
+        self.set_format(f)
+    }
+
+    /// Give the selected number measure the format `f` (Format ▸ Format
+    /// Panel…'s Set, and the Format menu's rows): one undo step, autosaved
+    /// with the structure.
+    pub fn set_format(&mut self, f: NumberFormat) -> Result<String, String> {
+        let id = self.selected().ok_or("select a measure first")?;
+        let m = self
+            .model
+            .measures
+            .get(&id)
+            .ok_or("the measure no longer exists")?;
+        if m.value_type != ValueType::Number {
+            return Err(format!("{} holds no numbers to format", m.name.0));
+        }
+        let (name, f) = (
+            m.name.0.clone(),
+            (f != NumberFormat::default()).then_some(f),
+        );
+        if f == m.format {
+            return Ok(format!("{name} is unchanged"));
+        }
+        let mut candidate = structure_of(self.model_mut());
+        if let Some(x) = candidate.measures.get_mut(&id) {
+            x.format = f;
+        }
+        self.publish_structure(candidate)?;
+        Ok(format!("{name}: {}", f.unwrap_or_default()))
+    }
+
+    /// Set an input cell to a TYPED value and push the edit through the live
+    /// engine, refreshing the snapshot.
+    ///
+    /// `value`'s type must match the measure's DECLARED `value_type`: a Text
+    /// measure refuses a `Value::Number` (and vice versa) rather than silently
+    /// replacing a typed cell with a number. Editing UI must parse by declared
+    /// type — see [`Self::commit_cell_text`].
+    ///
+    /// Returns an error string on failure. A refused edit (derived cell, type
+    /// mismatch) leaves the model, engine, and snapshot as they were; a failed
+    /// autosave keeps the edit, unsaved (see [`Self::save_changes`]).
+    pub fn set_cell(
+        &mut self,
+        measure: MeasureId,
+        coord: CoordKey,
+        value: Value,
+    ) -> Result<(), String> {
+        self.write_cell(measure, coord, Some(value))
+    }
+
+    /// Remove an input cell's value (the empty-commit path) and push the
+    /// retraction through the live engine. Same atomicity as [`Self::set_cell`].
+    pub fn clear_cell(&mut self, measure: MeasureId, coord: CoordKey) -> Result<(), String> {
+        self.write_cell(measure, coord, None)
+    }
+
+    /// The one write path for input cells: `Some(v)` sets, `None` clears.
+    fn write_cell(
+        &mut self,
+        measure: MeasureId,
+        coord: CoordKey,
+        value: Option<Value>,
+    ) -> Result<(), String> {
+        let m = self
+            .model
+            .measures
+            .get(&measure)
+            .ok_or_else(|| format!("no measure with id {}", measure.0))?;
+        if m.is_derived() {
+            return Err("derived cells are computed, not editable".into());
+        }
+        // The declared type is the contract: never coerce, never overwrite a
+        // typed cell with a value of another type.
+        if let Some(v) = &value {
+            if v.type_of() != Some(m.value_type) {
+                return Err(format!(
+                    "measure '{}' is declared {:?}; refusing to store {v:?}",
+                    m.name.0, m.value_type
+                ));
+            }
+        }
+        let (prior, saved) = self.put_cell(measure, coord.clone(), value)?;
+        self.record_step(Step::Cell(measure, coord, prior));
+        saved
+    }
+
+    /// Set (or, with `None`, clear) one input cell in the model and the
+    /// engine, and queue its save. Returns the cell's prior value, and the
+    /// save's failure if it failed at once. Records no history (undo and
+    /// redo use it too).
+    ///
+    /// A failed engine update puts the cell back (`Err`). A failed save does
+    /// not: the edit stays, marked unsaved (•), and the next save writes it
+    /// (H3, see [`Self::save_changes`]).
+    fn put_cell(
+        &mut self,
+        measure: MeasureId,
+        coord: CoordKey,
+        value: Option<Value>,
+    ) -> Result<(Option<Value>, Result<(), String>), String> {
+        // Precise rollback rather than publish()'s clone-and-swap: a single cell
+        // edit goes through the INCREMENTAL engine (`engine.set`), so cloning the
+        // whole model and rebuilding the graph per keystroke would throw away the
+        // very thing that makes editing cheap.
+        let key = decode(&coord);
+        let prior = self.input(measure, &key).cloned();
+        self.write_input(measure, key.clone(), value.clone());
+        if let Err(e) = self.push_engine(measure, &coord, value.as_ref()) {
+            // Restore the model, then push the restored value back through the
+            // engine so its graph and our snapshot agree with the model again.
+            self.write_input(measure, key, prior.clone());
+            if self.push_engine(measure, &coord, prior.as_ref()).is_err() {
+                // The engine is gone: a fresh one agrees with the model.
+                self.rebuild_engine();
+            }
+            return Err(e);
+        }
+        let saved = self.save_changes(&improv_store::ChangeSet::cell(measure, key));
+        Ok((prior, saved))
+    }
+
+    /// Push one input-cell edit through the live engine and adopt the recomputed
+    /// snapshot. No engine (no derived measures) -> nothing to do. While an
+    /// engine builds, the edit waits for it ([`Self::rebuild_engine`]).
+    ///
+    /// A value of the measure's type (number, boolean, text, date) enters the
+    /// engine as that cell; anything else (text in a number measure, an
+    /// error) CLEARS it, exactly what a rebuild would seed
+    /// ([`improv_engine::session::input_cell`]). Without that, retyping a
+    /// numeric cell as text would leave derived measures computing with a
+    /// number the cell no longer holds.
+    fn push_engine(
+        &mut self,
+        measure: MeasureId,
+        coord: &CoordKey,
+        value: Option<&Value>,
+    ) -> Result<(), String> {
+        let ty = self.model.measures.get(&measure).map(|m| m.value_type);
+        let cell = ty
+            .zip(value)
+            .and_then(|(t, v)| improv_engine::session::input_cell(t, v));
+        let edit = improv_engine::session::Edit {
+            measure,
+            coord: coord.clone(),
+            value: cell,
+        };
+        if let Some(b) = &mut self.building {
+            // A stale build is built again from the model, edit and all.
+            if !b.stale {
+                b.edits.push(edit);
+            }
+            return Ok(());
+        }
+        let Some(engine) = &mut self.engine else {
+            return Ok(());
+        };
+        // Let go of the old snapshot first: the engine then updates its
+        // results in place, O(the change), where one still held is copied
+        // whole (52 ms an edit at 1M cells).
+        self.snapshot = Snapshot::default();
+        let snapshot = engine.apply(vec![edit]).map_err(|e| e.to_string())?;
+        self.snapshot = snapshot;
+        Ok(())
+    }
+
+    /// Commit a grid edit buffer for `measure[coord]`, interpreting the text by
+    /// the measure's DECLARED `value_type`. Returns the status message.
+    ///
+    /// * An EMPTY (or whitespace-only) buffer **clears the cell**. Escape
+    ///   already cancels an edit, so an empty commit is the GUI's only way to
+    ///   delete a value; treating it as a second cancel would make cells
+    ///   un-clearable.
+    /// * Otherwise the declared type wins over the text's shape: `"42"` typed
+    ///   into a Text measure stores `Value::Text("42")`, never a number.
+    /// * Text that does not parse as the declared type is REJECTED (`Err`); the
+    ///   prior typed value stays exactly as it was.
+    pub fn commit_cell_text(
+        &mut self,
+        measure: MeasureId,
+        coord: CoordKey,
+        text: &str,
+    ) -> Result<String, String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            self.clear_cell(measure, coord)?;
+            return Ok("cell cleared".into());
+        }
+        let declared = self
+            .model
+            .measures
+            .get(&measure)
+            .map(|m| m.value_type)
+            .ok_or_else(|| format!("no measure with id {}", measure.0))?;
+        let value = parse_typed(&self.model, &self.locale, declared, trimmed)?;
+        self.set_cell(measure, coord, value)?;
+        Ok("cell updated".into())
+    }
+
+    // -- pivot / page state: delegated to the FOCUSED matrix ---------------
+    //
+    // Each matrix on the canvas owns its own axis order, filters and cursor
+    // (see [`Matrix`]). These wrappers keep the app-level API the panels and
+    // tests use and route it at the focused matrix; the per-matrix rendering
+    // path calls the `Matrix` methods directly with its own index.
+
+    /// Run `f` on the focused matrix with the model alongside it. Two disjoint
+    /// field borrows (`matrices` mutably, `model` immutably), which is why the
+    /// per-matrix methods take `&Model` instead of holding one.
+    fn with_focused<R>(&mut self, f: impl FnOnce(&mut Matrix, &Model) -> R) -> R {
+        let i = self.focus.min(self.matrices.len() - 1);
+        f(&mut self.matrices[i], &self.model)
+    }
+
+    /// Re-home every matrix's pivot state whose measure changed, and clamp the
+    /// focus. Called each frame before rendering.
+    fn sync_axis_state(&mut self) {
+        // `matrices` is never empty, so `focus` always has something to point at.
+        if self.matrices.is_empty() {
+            self.matrices.push(Matrix::new(&self.model, None));
+        }
+        self.focus = self.focus.min(self.matrices.len() - 1);
+        let model = &self.model;
+        for m in &mut self.matrices {
+            m.sync_axis_state(model);
+        }
+    }
+
+    /// Pivot the focused matrix: swap its row and column stacks (View ▸ Swap Rows/Columns,
+    /// Command-/).
+    pub fn pivot_rotate(&mut self) {
+        self.with_focused(|m, model| m.pivot_rotate(model));
+    }
+
+    // The rest of the focused matrix's pivot surface reads the same way, and is
+    // reached per-matrix-index from the rendering path (a click drives THAT
+    // matrix, never the focused one). These focused-matrix wrappers exist for
+    // the tests, which assert app-level behavior; production code calls the
+    // [`Matrix`] methods with the index it is rendering.
+    #[cfg(test)]
+    fn resolved_axes(
+        &self,
+    ) -> (
+        Option<CategoryId>,
+        Option<CategoryId>,
+        Vec<(CategoryId, ItemId)>,
+    ) {
+        self.focused().resolved_axes(&self.model)
+    }
+    #[cfg(test)]
+    fn row_cats(&self) -> Vec<CategoryId> {
+        self.focused().row_cats(&self.model)
+    }
+    #[cfg(test)]
+    fn col_cats(&self) -> Vec<CategoryId> {
+        self.focused().col_cats(&self.model)
+    }
+    #[cfg(test)]
+    fn page_cats(&self) -> Vec<CategoryId> {
+        self.focused().page_cats(&self.model)
+    }
+    #[cfg(test)]
+    fn axis_tuples(&self, cats: &[CategoryId]) -> Vec<Vec<(ItemId, String)>> {
+        self.focused().axis_tuples(&self.model, cats)
+    }
+    #[cfg(test)]
+    fn axis_item_lists(&self, cats: &[CategoryId]) -> Vec<Vec<(ItemId, String)>> {
+        self.focused().axis_item_lists(&self.model, cats)
+    }
+    #[cfg(test)]
+    fn sorted_items(&self, c: CategoryId) -> Vec<(ItemId, String)> {
+        self.focused().sorted_items(&self.model, c)
+    }
+    /// Move `category` to `axis` in the FOCUSED matrix (see
+    /// [`Matrix::set_axis`]). Pivoting is formula-free re-projection.
+    #[cfg(test)]
+    fn set_axis(&mut self, category: CategoryId, axis: Axis) {
+        self.with_focused(|m, model| m.set_axis(model, category, axis));
+    }
+    /// Set the focused matrix's pinned item for page dimension `dim_index`.
+    #[cfg(test)]
+    fn set_page(&mut self, dim_index: usize, item_index: usize) {
+        self.with_focused(|m, model| m.set_page(model, dim_index, item_index));
+    }
+
+    // -- views & filters (pure; unit-tested without egui) ------------------
+
+    /// Build a `View` capturing the WHOLE canvas: every matrix's measure, axis
+    /// order, pinned page items, filters and geometry. Presentation only.
+    ///
+    /// Matrix 0 becomes the view's *primary* matrix (its flat fields), the rest
+    /// its `placements` — which is exactly what makes a one-matrix canvas save
+    /// as a view a pre-canvas Improv would also understand. A matrix with no
+    /// measure (an empty model) contributes nothing; if that leaves no matrices
+    /// at all there is no view to build (`None`).
+    pub fn build_view(&self, id: ViewId, name: &str) -> Option<View> {
+        let mut placements: Vec<MatrixPlacement> = self
+            .matrices
+            .iter()
+            .filter_map(|m| m.to_placement(&self.model))
+            .collect();
+        if placements.is_empty() {
+            return None;
+        }
+        let primary = placements.remove(0);
+        Some(View::from_matrices(
+            id,
+            Name(name.to_string()),
+            primary,
+            placements,
+        ))
+    }
+
+    /// The smallest unused view id (>= 1).
+    fn next_view_id(&self) -> ViewId {
+        ViewId(
+            self.model
+                .views
+                .keys()
+                .map(|v| v.0)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(1),
+        )
+    }
+
+    /// Save the current canvas as a named view: mint an id, add it to the
+    /// model, and autosave. Returns the id, or `None` when nothing was saved
+    /// (no measure on the canvas, or a blank name). A failed store write keeps
+    /// the view, unsaved (•), with the error in `status`.
+    pub fn save_view(&mut self, name: &str) -> Option<ViewId> {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status = "view name is required".into();
+            return None;
+        }
+        let id = self.next_view_id();
+        let view = self.build_view(id, name)?;
+        let prior = Box::new(structure_of(self.model_mut()));
+        self.model_mut().add_view(view);
+        let structure = improv_store::ChangeSet {
+            structure: true,
+            ..Default::default()
+        };
+        let saved = self.save_changes(&structure);
+        self.record_step(Step::Structure(prior));
+        self.current_view = Some(id);
+        self.status = match saved {
+            Ok(()) => format!("saved view '{name}'"),
+            Err(e) => e,
+        };
+        Some(id)
+    }
+
+    /// Apply a saved `View` to the canvas: rebuild the matrices from its
+    /// placements (measure, axis order, page items, filters, geometry), focus
+    /// the first, and mark it the current document tab. Presentation only —
+    /// measures and data untouched.
+    ///
+    /// **Legacy views load unchanged.** A view written before canvases has no
+    /// `placements`, so `View::matrices()` yields exactly one matrix — its flat
+    /// fields — and the canvas is the single-matrix canvas it always was, down
+    /// to the default geometry.
+    ///
+    /// A placement whose measure no longer exists is dropped rather than shown
+    /// blank; if that leaves nothing the view is refused and the canvas is left
+    /// exactly as it was.
+    pub fn apply_view(&mut self, view: &View) {
+        let matrices: Vec<Matrix> = view
+            .matrices()
+            .iter()
+            .filter_map(|p| Matrix::from_placement(&self.model, p))
+            .collect();
+        if matrices.is_empty() {
+            self.status = "view's measure no longer exists".into();
+            return;
+        }
+        let dropped = view.matrices().len() - matrices.len();
+        self.matrices = matrices;
+        self.focus = 0;
+        self.current_view = Some(view.id);
+        self.status = if dropped == 0 {
+            format!("view: {}", view.name.0)
+        } else {
+            format!(
+                "view: {} ({dropped} matrix(es) skipped: measure gone)",
+                view.name.0
+            )
+        };
+    }
+
+    /// The saved views as document tabs, in id order: `(id, name, is current)`.
+    /// The reference's `Welcome / Concepts / P&L Canvas` strip — switching tabs
+    /// switches canvases via [`Self::apply_view`].
+    pub fn document_tabs(&self) -> Vec<(ViewId, String, bool)> {
+        let mut ids: Vec<ViewId> = self.model.views.keys().copied().collect();
+        ids.sort_by_key(|v| v.0);
+        ids.into_iter()
+            .map(|id| {
+                (
+                    id,
+                    self.model.views[&id].name.0.clone(),
+                    self.current_view == Some(id),
+                )
+            })
+            .collect()
+    }
+
+    /// Switch to the saved view `id` (a document-tab click). No-op on an
+    /// unknown id.
+    pub fn open_view(&mut self, id: ViewId) {
+        if let Some(v) = self.model.views.get(&id).cloned() {
+            self.apply_view(&v);
+        }
+    }
+
+    /// Toggle whether `item` of `category` is shown in the FOCUSED matrix. On
+    /// first toggle the filter starts from all items minus this one; toggling so
+    /// all items are kept drops the filter. Presentation only. (The filter shelf
+    /// drives [`Matrix::toggle_filter_item`] on the matrix it belongs to.)
+    #[cfg(test)]
+    fn toggle_filter_item(&mut self, category: CategoryId, item: ItemId) {
+        self.with_focused(|m, model| m.toggle_filter_item(model, category, item));
+    }
+
+    // -- CSV/TSV import/export wizard (pure orchestration; unit-tested) ----
+
+    /// Toggle the CSV/TSV wizard panel. On first open, prefill the import
+    /// form's measure id with the next free one (mirrors `next_view_id`'s
+    /// auto-assign pattern) if the field is still blank.
+    pub fn toggle_csv_wizard(&mut self) {
+        self.show_csv_wizard = !self.show_csv_wizard;
+        if self.show_csv_wizard && self.import_form.measure_id.trim().is_empty() {
+            self.import_form.measure_id = self.next_measure_id().to_string();
+        }
+    }
+
+    /// Run the import wizard: build an `ImportSpec` from `self.import_form`,
+    /// import it into the live model, rebuild the engine (structure changed),
+    /// autosave, and report the cell count (or the error) in `self.status`.
+    /// Never panics — every failure path (bad form, bad file, `CsvError`)
+    /// lands in `self.status` as a clear message.
+    /// The Import button: a bad form is reported at once; a good one shows
+    /// "Importing and saving…" (and a wait cursor) for a painted frame
+    /// before [`Self::run_csv_import`] blocks the UI thread, so a large
+    /// import (8 s at 1M cells, B12) does not look like a hang.
+    pub fn queue_csv_import(&mut self) {
+        match csv_wizard::build_import_spec(&self.import_form) {
+            Err(e) => self.status = format!("import error: {e}"),
+            Ok(_) => {
+                self.status = "importing and saving… (the window waits until it is done)".into();
+                self.queued_import = Some(0);
+            }
+        }
+    }
+
+    /// Run a queued import once its status has been on screen for a frame.
+    fn run_queued_import(&mut self, ctx: &egui::Context) {
+        match self.queued_import {
+            None => {}
+            Some(0) => {
+                self.queued_import = Some(1);
+                ctx.set_cursor_icon(egui::CursorIcon::Wait);
+                ctx.request_repaint();
+            }
+            Some(_) => {
+                self.queued_import = None;
+                self.run_csv_import();
+            }
+        }
+    }
+
+    pub fn run_csv_import(&mut self) {
+        let spec = match csv_wizard::build_import_spec(&self.import_form) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("import error: {e}");
+                return;
+            }
+        };
+        // `import_csv` is read-only on the model until it commits, so a failed
+        // import leaves nothing to undo; the snapshot is kept only on success.
+        let prior_model = self.model_mut().clone();
+        match improv_storage_csv::import_csv(self.model_mut(), &spec) {
+            Ok(n) => {
+                self.rebuild_engine();
+                self.focused_mut().select(Some(spec.measure_id));
+                // The model changed whether or not the store write worked, so
+                // the import is undoable either way.
+                self.record_history(prior_model);
+                // A failed autosave is reported as the failure it is; the
+                // imported cells are already in the live model.
+                let changes = improv_store::ChangeSet::between(
+                    self.undo_model().expect("just recorded"),
+                    &self.model,
+                );
+                self.status = match self.save_changes(&changes) {
+                    Ok(()) => format!(
+                        "imported {n} cell(s) into measure {} '{}'",
+                        spec.measure_id.0, spec.measure_name
+                    ),
+                    Err(e) => e,
+                };
+            }
+            Err(e) => self.status = format!("import error: {e}"),
+        }
+    }
+
+    /// Run the export wizard: resolve `self.export_form` and write the
+    /// selected measure's cells to disk, reporting the row count (or the
+    /// error) in `self.status`. Never panics.
+    pub fn run_csv_export(&mut self) {
+        let (measure, path, delimiter) = match csv_wizard::build_export_args(&self.export_form) {
+            Ok(a) => a,
+            Err(e) => {
+                self.status = format!("export error: {e}");
+                return;
+            }
+        };
+        match improv_storage_csv::export_measure_csv(self.model_mut(), measure, &path, delimiter) {
+            Ok(n) => {
+                self.status = format!("exported {n} row(s) to {}", path.display());
+            }
+            Err(e) => self.status = format!("export error: {e}"),
+        }
+    }
+
+    /// Rebuild the live engine after a structural change (a formula, a new
+    /// derived measure, an import, the undo of one), off the UI thread (H3):
+    /// at 1M cells a build takes seconds. Until it lands the grid shows the
+    /// last snapshot (less the measures the model no longer computes), the
+    /// status bar says "Recalculating…", and cell edits wait for the new
+    /// engine ([`Self::push_engine`]). A rebuild asked for while one runs
+    /// marks that one stale: when it lands it is thrown away and the model,
+    /// edits and all, is built again.
+    fn rebuild_engine(&mut self) {
+        if let Some(b) = &mut self.building {
+            b.stale = true;
+            b.edits.clear();
+        } else {
+            self.spawn_build();
+        }
+        if !self.background {
+            self.finish_build();
+        }
+    }
+
+    /// The model, to change, with the [`Self::held`] cell edits in it. A
+    /// build thread holds it only while it copies it (see
+    /// [`Self::spawn_build`]): wait for that copy rather than make a second
+    /// one here, which at 1M cells is as slow and doubles the memory. A cell
+    /// edit does not come here ([`Self::write_input`]); a structural change
+    /// in a build's first ~150 ms (at 1M cells) still waits.
+    fn model_mut(&mut self) -> &mut Model {
+        // A build thread lets go before building; a save of every cell holds
+        // it to the end (seconds at 1M cells), so wait for the build alone.
+        // shortcut: a structural change while such a save runs copies the
+        // model (150 ms at 1M cells); only an import or a big delete saves
+        // whole, and before H3 their save held the window for all of it.
+        let save = usize::from(self.saving.as_ref().is_some_and(|s| s.whole));
+        while self.building.is_some() && Arc::strong_count(&self.model) > 1 + save {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let model = Arc::make_mut(&mut self.model);
+        for (m, at, v) in self.held.drain(..) {
+            put_input(model, m, at, v);
+        }
+        model
+    }
+
+    /// Start building an engine for the model as it is now, on a thread
+    /// with the engine's stack (a formula compiles recursively).
+    fn spawn_build(&mut self) {
+        // Build what the window shows: the held edits too. (A build that
+        // went stale let go of the model before it landed.) Without any, a
+        // save of every cell shares the model with the build, uncopied.
+        if !self.held.is_empty() {
+            let _ = self.model_mut();
+        }
+        let model = Arc::clone(&self.model);
+        // What the old engine computed for a measure the model no longer
+        // computes would show under a new measure that reuses its id.
+        let keep: HashMap<_, _> = self
+            .snapshot
+            .iter()
+            .filter(|(id, _)| model.measures.get(id).is_some_and(Measure::is_derived))
+            .map(|(id, v)| (*id, Arc::clone(v)))
+            .collect();
+        let old = (
+            self.engine.take(),
+            std::mem::replace(&mut self.snapshot, Arc::new(keep)),
+        );
+        let (tx, rx) = mpsc::channel();
+        // A failed spawn drops `tx`: the build lands as BUILD_LOST.
+        let _ = std::thread::Builder::new()
+            .name("improv-gui-build".into())
+            .stack_size(improv_engine::dataflow::ENGINE_STACK)
+            .spawn(move || {
+                // Copy the model and let go of it first, so an edit meanwhile
+                // need not copy it on the UI thread; free the old engine
+                // here, not there.
+                let owned = engine_model(&model).into_owned();
+                drop(model);
+                drop(old);
+                let _ = tx.send(try_build_engine(&owned));
+            });
+        self.building = Some(Build {
+            done: rx,
+            edits: Vec::new(),
+            stale: false,
+        });
+    }
+
+    /// Adopt a finished build: replay the cell edits made while it ran, or,
+    /// when the structure moved on meanwhile, build again. A failed build
+    /// leaves no engine (inputs still show) and says why.
+    fn land(&mut self, b: Build, built: Result<(Option<Engine>, Snapshot), String>) {
+        // The build let go of the model before it answered.
+        self.write_held();
+        if b.stale {
+            drop_off_thread(built);
+            self.spawn_build();
+            return;
+        }
+        let edits = b.edits;
+        let adopted = built.and_then(|(mut engine, snapshot)| {
+            let Some(e) = engine.as_mut().filter(|_| !edits.is_empty()) else {
+                return Ok((engine, snapshot));
+            };
+            // Let go of the snapshot first, as push_engine does.
+            drop(snapshot);
+            let snapshot = e.apply(edits).map_err(|e| e.to_string())?;
+            Ok((engine, snapshot))
+        });
+        let old = match adopted {
+            Ok((engine, snapshot)) => {
+                self.engine = engine;
+                std::mem::replace(&mut self.snapshot, snapshot)
+            }
+            Err(e) => {
+                self.status = format!("recalculation failed: {e}");
+                self.engine = None;
+                std::mem::take(&mut self.snapshot)
+            }
+        };
+        drop_off_thread(old);
+    }
+
+    /// Each frame: land the build if it is done, and keep frames coming
+    /// while one runs.
+    fn poll_build(&mut self, ctx: &egui::Context) {
+        self.write_held();
+        let Some(b) = &self.building else {
+            return;
+        };
+        let built = match b.done.try_recv() {
+            Ok(built) => built,
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(BUILD_POLL);
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(BUILD_LOST.into()),
+        };
+        if let Some(b) = self.building.take() {
+            self.land(b, built);
+        }
+        ctx.request_repaint();
+    }
+
+    /// Wait for the build in flight, and any it starts, and land it.
+    fn finish_build(&mut self) {
+        while let Some(b) = self.building.take() {
+            let built = b.done.recv().unwrap_or_else(|_| Err(BUILD_LOST.into()));
+            self.land(b, built);
+        }
+    }
+
+    // -- keyboard cell cursor: delegated to the FOCUSED matrix -------------
+
+    /// The focused matrix's (row_count, col_count) (see [`Matrix::grid_dims`]).
+    #[cfg(test)]
+    fn grid_dims(&self) -> (usize, usize) {
+        self.focused().grid_dims(&self.model)
+    }
+
+    /// Move the focused matrix's cursor by `(drow, dcol)`, clamped to its grid.
+    /// Mirrors the TUI's `move_cursor`; collapses any range selection.
+    #[cfg(test)]
+    pub fn move_cursor(&mut self, drow: isize, dcol: isize) {
+        self.with_focused(|m, model| m.step(model, drow, dcol, false));
+    }
+
+    /// The `CoordKey` of the cell under the focused matrix's cursor (see
+    /// [`Matrix::cursor_key`]).
+    pub fn cursor_key(&self) -> Option<CoordKey> {
+        self.focused().cursor_key(&self.model)
+    }
+
+    /// True if the focused matrix's cursor cell is an editable input cell: its
+    /// measure is an input measure AND the cursor addresses a real,
+    /// fully-specified coordinate (see `cursor_key`). Derived measures are
+    /// read-only.
+    pub fn cursor_is_editable(&self) -> bool {
+        self.selected()
+            .and_then(|m| self.model.measures.get(&m))
+            .is_some_and(|m| !m.is_derived())
+            && self.cursor_key().is_some()
+    }
+
+    /// Begin editing the focused matrix's cursor cell if it is editable, seeding
+    /// its buffer with the current value. On a derived cell, sets the status
+    /// message instead. Mirrors the TUI's `begin_edit`.
+    fn begin_edit_cursor(&mut self) {
+        let Some(measure) = self.selected() else {
+            return;
+        };
+        // Order matters: report a missing cell (empty filtered axis) before the
+        // derived check, so the message names the real reason.
+        let Some(key) = self.cursor_key() else {
+            self.status = "no cell here: an axis category is filtered to nothing".into();
+            return;
+        };
+        if !self.cursor_is_editable() {
+            self.status = "derived cells are computed, not editable".into();
+            return;
+        }
+        let seed = self.cell_text(measure, &key).unwrap_or_default();
+        self.focused_mut().open_editor(measure, key, seed);
+    }
+
+    /// Start editing the cursor cell with `typed` as its whole text and the
+    /// caret after it: typing on a cell replaces its value, as in every
+    /// spreadsheet (H1-1). A cell that is not editable says why.
+    fn begin_edit_typed(&mut self, typed: String) {
+        self.begin_edit_cursor();
+        let m = self.focused_mut();
+        if m.editing.is_some() {
+            m.edit_select = Some(typed.len()..typed.len());
+            m.edit_buf = typed;
+        }
+    }
+
+    /// The editable source text the formula editor shows for `measure`: symbolic
+    /// DSL (`Price * Quantity`) whenever the v1 grammar can spell the formula
+    /// exactly, else the controlled-English description (`Price times
+    /// Quantity`).
+    ///
+    /// `None` when there is nothing editable to show: `measure` is unknown or
+    /// an input measure, or *neither* surface language can spell the formula.
+    /// Since plan Step 4b the printer quotes awkward names (`'Unit Price'`), so
+    /// a CSV-imported measure name is no longer a reason to go read-only; what
+    /// remains unspellable is a formula *shape* the v1 grammar has no form for
+    /// (see [`formula_dsl`]) whose controlled-English rendering also fails to
+    /// round-trip. The bar renders that read-only instead of inviting a commit
+    /// of text that no parser accepts.
+    ///
+    /// Whatever this returns, [`Self::commit_formula`] accepts unchanged and
+    /// leaves the identical AST — the invariant this pair exists to keep. It is
+    /// *checked* here, by reparsing the candidate text through the very same
+    /// [`Self::parse_formula_text`] `commit_formula` uses, so no printer/parser
+    /// drift can quietly violate it.
+    pub fn formula_source(&self, measure: MeasureId) -> Option<String> {
+        let Some(MeasureKind::Derived(f)) = self.model.measures.get(&measure).map(|m| &m.kind)
+        else {
+            return None;
+        };
+        let dsl = formula_dsl(&self.model, f).map(|d| self.locale.localize(&d));
+        let cnl = describe_formula(&NlContext::new(&self.model), f);
+        dsl.into_iter()
+            .chain(std::iter::once(cnl))
+            .find(|text| self.parse_formula_text(text).ok().as_ref() == Some(f))
+    }
+
+    /// Parse `text` as the RHS expression for an existing measure and make it
+    /// derived (replacing any prior formula/input kind). Rebuilds the engine
+    /// (structure changed), refreshes the snapshot, and autosaves.
+    ///
+    /// **Atomic:** the change is validated on a *candidate* model (parse, then
+    /// a real engine build) and only published once the engine is known good.
+    /// A refused formula leaves the previous model, engine, and snapshot
+    /// intact; a failed save keeps it, unsaved ([`Self::save_changes`]). On a
+    /// parse or compile error `formula_error` is also set (located in `text`,
+    /// for the editor's underline and the explanation under the row). It is
+    /// cleared the moment `text` parses — a later save failure is a save
+    /// error, not a fault at some place in text that has none.
+    ///
+    /// `text` may be either the symbolic DSL (`Price * Quantity`) or the
+    /// controlled English the formula editor displays (`Price times Quantity`);
+    /// see [`Self::formula_source`].
+    pub fn commit_formula(&mut self, measure: MeasureId, text: &str) -> Result<(), String> {
+        let formula = match self.parse_formula_text(text) {
+            Ok(f) => f,
+            Err(e) => {
+                self.formula_error = Some(diagnostics::parse_error(&self.model, text, &e));
+                return Err(e.to_string());
+            }
+        };
+        // `text` parsed: any previous inline parse error no longer describes
+        // it. Clear BEFORE publishing, so a failed save does not leave an
+        // underline at an offset where this text is perfectly fine.
+        self.formula_error = None;
+        // Validate on a candidate copy: a formula that parses can still fail to
+        // build (cycle, type/dimension error), which would otherwise leave the
+        // app with a saved-but-broken model and a dead engine.
+        let mut candidate = structure_of(self.model_mut());
+        let m = candidate
+            .measures
+            .get_mut(&measure)
+            .ok_or_else(|| format!("no measure with id {}", measure.0))?;
+        m.kind = MeasureKind::Derived(formula);
+        self.publish_structure(candidate).inspect_err(|e| {
+            self.formula_error = formula_fault(&self.model, text, e);
+        })
+    }
+
+    /// Whether `measure`'s formula is currently enabled (the reference's `✓`).
+    /// True for an input measure too — it has no formula to disable, so there is
+    /// no unchecked state for it to be in.
+    #[cfg(test)]
+    pub fn formula_enabled(&self, measure: MeasureId) -> bool {
+        self.model
+            .measures
+            .get(&measure)
+            .is_some_and(|m| !formula_disabled(m))
+    }
+
+    /// Enable or disable `measure`'s formula — the reference's per-formula
+    /// checkmark, as a real **model** operation (see [`DISABLED_MARKER`]).
+    ///
+    /// Disabled, the measure keeps its formula but computes nothing, and every
+    /// dependent recomputes without it. Because the flag lives on the measure's
+    /// `description`, it survives save/reload unchanged.
+    ///
+    /// Atomic and undoable on exactly the same terms as [`Self::commit_formula`]
+    /// — it goes through [`Self::publish`], so a toggle that cannot build
+    /// leaves the model, engine and snapshot untouched.
+    ///
+    /// A no-op (still `Ok`) on an input measure or an unknown id: neither has a
+    /// formula, so there is nothing to toggle and nothing to report.
+    pub fn set_formula_enabled(&mut self, measure: MeasureId, enabled: bool) -> Result<(), String> {
+        let Some(m) = self.model.measures.get(&measure) else {
+            return Ok(());
+        };
+        // Nothing to toggle: an input measure has no formula, and a formula
+        // already in the requested state needs no rebuild (and must not become
+        // a spurious undo point).
+        if !m.is_derived() || !formula_disabled(m) == enabled {
+            return Ok(());
+        }
+        let mut candidate = structure_of(self.model_mut());
+        let m = candidate
+            .measures
+            .get_mut(&measure)
+            .ok_or_else(|| format!("no measure with id {}", measure.0))?;
+        // Preserve the user's own description text across the toggle.
+        let (_, user) = split_marker(m.description.as_deref());
+        m.description = join_marker(!enabled, user);
+        self.publish_structure(candidate)
+    }
+
+    /// Every formula in the model, in id order, as the formula pane lists them
+    /// (see [`FormulaRow`] and [`Self::formula_list`]). Numbering is the
+    /// caller's: row `i` is displayed as `i + 1`, matching the reference's
+    /// 1-based list.
+    ///
+    /// Derived measures only — an input measure has no formula, so it has no row.
+    pub fn formula_rows(&self) -> Vec<FormulaRow> {
+        let mut ids: Vec<MeasureId> = self
+            .model
+            .measures
+            .values()
+            .filter(|m| m.is_derived())
+            .map(|m| m.id)
+            .collect();
+        ids.sort_by_key(|m| m.0);
+        ids.into_iter()
+            .filter_map(|id| {
+                let m = self.model.measures.get(&id)?;
+                let MeasureKind::Derived(f) = &m.kind else {
+                    return None;
+                };
+                // Prefer the editable spelling the bar would show; fall back to
+                // the controlled English so a row is never blank.
+                let text = self
+                    .formula_source(id)
+                    .unwrap_or_else(|| describe_formula(&NlContext::new(&self.model), f));
+                Some(FormulaRow {
+                    measure: id,
+                    target: m.name.0.clone(),
+                    text,
+                    enabled: !formula_disabled(m),
+                    error: self.formula_row_error(id, f),
+                })
+            })
+            .collect()
+    }
+
+    /// The inline error for one formula row, or `None` if the formula is sound.
+    ///
+    /// Two distinct failures, both of which the reference's list shows in place
+    /// rather than hiding:
+    ///
+    /// * It does not **build** — a type/dimension error or a cycle. Found by
+    ///   compiling this one formula, not by rebuilding the whole engine, so
+    ///   listing N formulas costs N compiles and no dataflow graphs.
+    /// * It does not **round-trip** — no surface spelling of it parses back to
+    ///   the identical AST, so the text shown is a description, not source. Said
+    ///   plainly, because that row is the read-only one in the editor above.
+    ///
+    /// A DISABLED formula is still checked: an unchecked row with a broken
+    /// formula should say so, not look clean because it is not running.
+    fn formula_row_error(&self, id: MeasureId, f: &improv_core_model::Formula) -> Option<String> {
+        let ctx = improv_engine::compiler::CompileContext::new(&self.model.measures);
+        if let Err(e) = improv_engine::compiler::compile_formula(&ctx, id, f) {
+            return Some(e.to_string());
+        }
+        self.formula_source(id)
+            .is_none()
+            .then(|| "no editable spelling (shown as description)".to_string())
+    }
+
+    /// Parse formula text in either supported surface language: the symbolic
+    /// DSL first (the primary language, and the one whose error positions the
+    /// formula bar highlights), then the controlled English of
+    /// `improv_nl_formula`. The DSL error is what surfaces if both fail.
+    fn parse_formula_text(&self, text: &str) -> Result<improv_core_model::Formula, ParseError> {
+        // Typed in the user's locale (`IMPROV_LOCALE` / the OS locale):
+        // decimal comma, `;` separators and translated names are accepted.
+        let canonical = self.locale.canonicalize(text);
+        match parser::parse_expr(&self.model, &canonical) {
+            Ok(f) => Ok(f),
+            Err(dsl_err) => {
+                parse_nl_formula(&NlContext::new(&self.model), text).map_err(|_| dsl_err)
+            }
+        }
+    }
+
+    /// Replace the model with `candidate`, but only if it builds a working
+    /// engine: check first, then publish and save. If it does not build
+    /// nothing is touched (`self` keeps its model, engine, and snapshot);
+    /// otherwise the replaced model becomes an undo point, and a failed save
+    /// is returned with the change kept ([`Self::save_changes`]).
+    ///
+    /// ponytail: a full model clone per structural edit (the candidate, then
+    /// the undo point). The engine is checked over the structure alone
+    /// ([`check_engine`]) and rebuilt in the background (H3).
+    fn publish(&mut self, candidate: Model) -> Result<(), String> {
+        let (previous, saved) = self.swap_model(Box::new(candidate)).map_err(|(e, _)| e)?;
+        self.record_history(previous);
+        saved
+    }
+
+    /// The atomic model swap behind [`Self::publish`] and undo/redo: check
+    /// that `candidate` builds an engine ([`check_engine`]), then adopt it,
+    /// save it, and rebuild the engine (in the background, see
+    /// [`Self::rebuild_engine`]). Returns the model it replaced and the save's
+    /// outcome; if it does not build, the error and `candidate`, so a refused
+    /// undo keeps its step without a copy. Records no history — callers decide (an undo must not become
+    /// an undo point of its own).
+    fn swap_model(&mut self, mut candidate: Box<Model>) -> ModelSwap {
+        if let Err(e) = check_engine(&mut candidate) {
+            return Err((e, candidate));
+        }
+        let _ = self.model_mut();
+        let previous = std::mem::replace(&mut self.model, Arc::new(*candidate));
+        let changes = improv_store::ChangeSet::between(&previous, &self.model);
+        let saved = self.save_changes(&changes);
+        self.rebuild_engine();
+        Ok((into_model(previous), saved))
+    }
+
+    /// [`Self::publish`] for a change that leaves the input cells alone:
+    /// `candidate` is the new model without them ([`structure_of`]).
+    fn publish_structure(&mut self, candidate: Model) -> Result<(), String> {
+        let (previous, saved) = self
+            .swap_structure(Box::new(candidate))
+            .map_err(|(e, _)| e)?;
+        self.record_step(Step::Structure(previous));
+        saved
+    }
+
+    /// [`Self::swap_model`] for a model without input cells: `candidate`
+    /// takes the current cells, so nothing copies or diffs them. Returns the
+    /// structure it replaced, also without cells; on failure, the error and
+    /// `candidate`.
+    fn swap_structure(&mut self, mut candidate: Box<Model>) -> StructureSwap {
+        debug_assert!(candidate.inputs.is_empty(), "a structure has no cells");
+        if let Err(e) = check_engine(&mut candidate) {
+            return Err((e, candidate));
+        }
+        let model = self.model_mut();
+        candidate.inputs = std::mem::take(&mut model.inputs);
+        let previous = std::mem::replace(model, *candidate);
+        let structure = improv_store::ChangeSet {
+            structure: true,
+            ..Default::default()
+        };
+        let saved = self.save_changes(&structure);
+        self.rebuild_engine();
+        Ok((Box::new(previous), saved))
+    }
+
+    // -- undo / redo -------------------------------------------------------
+
+    /// Record `prior` (the model as it was *before* the mutation that just
+    /// succeeded) as an undo point, and drop the redo stack — a fresh mutation
+    /// makes the undone future unreachable (standard semantics).
+    fn record_history(&mut self, prior: Model) {
+        self.record_step(Step::Model(Box::new(prior)));
+    }
+
+    /// Record an undo step (see [`Self::record_history`]).
+    fn record_step(&mut self, step: Step) {
+        push_bounded(&mut self.undo_stack, step);
+        self.redo_stack.clear();
+    }
+
+    /// The model the last undo step restores, if it is a whole-model step.
+    fn undo_model(&self) -> Option<&Model> {
+        match self.undo_stack.last()? {
+            Step::Model(m) => Some(m),
+            Step::Structure(_) | Step::Cell(..) | Step::Cells(..) => None,
+        }
+    }
+
+    /// Put `step` back, returning the step that restores what it replaced
+    /// and the save's outcome (a failed save keeps the change, see
+    /// [`Self::save_changes`]), or on failure the error and `step` itself
+    /// (nothing changed).
+    fn apply_step(&mut self, step: Step) -> Result<(Step, Result<(), String>), (String, Step)> {
+        match step {
+            Step::Model(m) => self
+                .swap_model(m)
+                .map(|(m, saved)| (Step::Model(Box::new(m)), saved))
+                .map_err(|(e, m)| (e, Step::Model(m))),
+            Step::Structure(m) => self
+                .swap_structure(m)
+                .map(|(m, saved)| (Step::Structure(m), saved))
+                .map_err(|(e, m)| (e, Step::Structure(m))),
+            Step::Cells(measure, cells) => {
+                // All or nothing: a failure part way puts the done ones back.
+                let mut inverse = Vec::with_capacity(cells.len());
+                let mut saved = Ok(());
+                for (coord, value) in &cells {
+                    match self.put_cell(measure, coord.clone(), value.clone()) {
+                        Ok((now, s)) => {
+                            inverse.push((coord.clone(), now));
+                            saved = saved.and(s);
+                        }
+                        Err(e) => {
+                            for (c, v) in inverse.into_iter().rev() {
+                                let _ = self.put_cell(measure, c, v);
+                            }
+                            return Err((e, Step::Cells(measure, cells)));
+                        }
+                    }
+                }
+                inverse.reverse();
+                Ok((Step::Cells(measure, inverse), saved))
+            }
+            Step::Cell(measure, coord, value) => {
+                match self.put_cell(measure, coord.clone(), value.clone()) {
+                    Ok((now, saved)) => Ok((Step::Cell(measure, coord, now), saved)),
+                    Err(e) => Err((e, Step::Cell(measure, coord, value))),
+                }
+            }
+        }
+    }
+
+    /// True when there is a recorded state to undo (for enabling UI).
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    /// True when there is an undone state to redo.
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    /// Undo the last model mutation: restore the previous model, rebuild the
+    /// engine and snapshot from it, and persist it (so undo-then-quit does not
+    /// resurrect the undone state). The current model moves to the redo stack.
+    ///
+    /// An empty history is a no-op, not an error. A failed restore (a store
+    /// write failure) leaves everything as it was and keeps the undo point, so
+    /// the step is not lost; the error is returned for the caller to surface.
+    pub fn undo(&mut self) -> Result<(), String> {
+        let Some(step) = self.undo_stack.pop() else {
+            return Ok(());
+        };
+        match self.apply_step(step) {
+            Ok((inverse, saved)) => {
+                push_bounded(&mut self.redo_stack, inverse);
+                self.after_history_restore();
+                saved
+            }
+            Err((e, step)) => {
+                // Nothing changed, so the step still applies: keep it.
+                self.undo_stack.push(step);
+                Err(e)
+            }
+        }
+    }
+
+    /// Redo the last undone mutation (the mirror of [`Self::undo`]).
+    pub fn redo(&mut self) -> Result<(), String> {
+        let Some(step) = self.redo_stack.pop() else {
+            return Ok(());
+        };
+        match self.apply_step(step) {
+            Ok((inverse, saved)) => {
+                push_bounded(&mut self.undo_stack, inverse);
+                self.after_history_restore();
+                saved
+            }
+            Err((e, step)) => {
+                self.redo_stack.push(step);
+                Err(e)
+            }
+        }
+    }
+
+    /// [`Self::undo`], with the outcome reported in the status line (the UI
+    /// path). A store-write failure during undo is surfaced, never swallowed;
+    /// an empty history says so rather than looking like a broken key.
+    fn undo_with_status(&mut self) {
+        let had = self.can_undo();
+        self.status = match self.undo() {
+            Ok(()) if had => "undo".into(),
+            Ok(()) => "nothing to undo".into(),
+            Err(e) => format!("undo failed: {e}"),
+        };
+    }
+
+    /// [`Self::redo`], with the outcome reported in the status line.
+    fn redo_with_status(&mut self) {
+        let had = self.can_redo();
+        self.status = match self.redo() {
+            Ok(()) if had => "redo".into(),
+            Ok(()) => "nothing to redo".into(),
+            Err(e) => format!("redo failed: {e}"),
+        };
+    }
+
+    /// Re-point the transient UI state at the restored model: a measure the
+    /// restored model no longer has (an undone CSV import, an undone new
+    /// derived measure) cannot stay on a matrix or half-edited. Applied to
+    /// EVERY matrix on the canvas, not just the focused one — an undo that
+    /// removes a measure must not leave another matrix pointing at it.
+    fn after_history_restore(&mut self) {
+        let fallback = pick_default_measure(&self.model);
+        for m in &mut self.matrices {
+            m.editing = None;
+            if !m
+                .measure
+                .is_some_and(|id| self.model.measures.contains_key(&id))
+            {
+                m.measure = fallback;
+            }
+        }
+        // Force the formula editor to reload from the restored model.
+        self.formula_for = None;
+        self.formula_error = None;
+        self.sync_axis_state();
+    }
+
+    /// Create a new derived measure named `name` with RHS `text`. Categories
+    /// are inferred as the union of the referenced measures' categories (same
+    /// rule as the CLI's `add-derived`). Rebuilds the engine and autosaves. A
+    /// refusal (parse error, duplicate name, engine build failure) leaves the
+    /// model, engine, and snapshot unchanged; a failed save keeps the measure,
+    /// unsaved ([`Self::save_changes`]).
+    ///
+    /// A parse or compile error is also left in `new_formula_error`, located
+    /// in `text`.
+    pub fn add_derived_measure(&mut self, name: &str, text: &str) -> Result<MeasureId, String> {
+        self.new_formula_error = None;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("measure name is required".into());
+        }
+        if self.model.measure_by_name(name).is_some() {
+            return Err(format!("a measure named {name:?} already exists"));
+        }
+        let id = MeasureId(self.next_measure_id());
+        let mut candidate = structure_of(self.model_mut());
+        // A new measure may refer to itself (a PREV recurrence).
+        let formula = {
+            let provisional = candidate.with_provisional(id, name);
+            let canonical = self.locale.canonicalize(text);
+            parser::parse_expr(&provisional, &canonical)
+                .or_else(|e| parse_nl_formula(&NlContext::new(&provisional), text).map_err(|_| e))
+                .map_err(|e| {
+                    self.new_formula_error = Some(diagnostics::parse_error(&provisional, text, &e));
+                    e.to_string()
+                })?
+        };
+        // The engine's shape: an aggregation drops what it reduces, `@ITEM`
+        // is text, and so on.
+        let (value_type, cats) = improv_engine::compiler::derived_shape(
+            &candidate, id, name, &formula,
+        )
+        .map_err(|e| {
+            let e = e.to_string();
+            self.new_formula_error = formula_fault(&self.model, text, &e);
+            e
+        })?;
+        candidate.add_measure(Measure {
+            id,
+            name: Name(name.to_string()),
+            value_type,
+            categories: cats,
+            kind: MeasureKind::Derived(formula),
+            description: None,
+            format: None,
+        });
+        self.publish_structure(candidate).inspect_err(|e| {
+            self.new_formula_error = formula_fault(&self.model, text, e);
+        })?;
+        Ok(id)
+    }
+
+    /// Define (or redefine) the named LAMBDA `line` spells, `Name =
+    /// LAMBDA(p, …, body)`, as the CLI's `define` does: parsed by
+    /// `parse_definition`, a redefinition keeps its id (calls store it), and
+    /// a measure's or category's name is refused. Autosaved and undoable; a
+    /// redefinition that breaks a formula calling it is refused like any
+    /// formula that fails to build. A parse error is left in
+    /// `new_formula_error`, located in `line`.
+    pub fn define_lambda(&mut self, line: &str) -> Result<String, String> {
+        self.new_formula_error = None;
+        let canonical = self.locale.canonicalize(line);
+        let parsed = parser::parse_definition(&self.model, &canonical).map_err(|e| {
+            self.new_formula_error = Some(diagnostics::parse_error(&self.model, line, &e));
+            e.to_string()
+        })?;
+        let parser::Definition::Lambda(lt) = parsed else {
+            return Err("type Name = LAMBDA(parameters, body)".into());
+        };
+        let name = lt.name.0.clone();
+        if self.model.measure_by_name(&name).is_some()
+            || self.model.category_by_name(&name).is_some()
+        {
+            return Err(format!(
+                "{name:?} is a measure or category; name the LAMBDA differently"
+            ));
+        }
+        let old = self.model.lambda_by_name(&name).map(|(id, _)| id);
+        let id = old.unwrap_or_else(|| next_id(self.model.lambdas.keys().copied()));
+        let params = lt.lambda.params.join(", ");
+        let mut candidate = structure_of(self.model_mut());
+        candidate.lambdas.insert(id, lt.lambda);
+        self.publish_structure(candidate)?;
+        let verb = if old.is_some() {
+            "redefined"
+        } else {
+            "defined"
+        };
+        Ok(format!("{verb} LAMBDA {name}({params})"))
+    }
+
+    /// The smallest unused measure id (>= 1).
+    fn next_measure_id(&self) -> u32 {
+        self.model
+            .measures
+            .keys()
+            .map(|m| m.0)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1)
+    }
+
+    /// Autosave the model to the store when `db` is set. In-memory (`""`)
+    /// models skip saving. Returns the failure message so callers can report
+    /// it — never overwrite a save failure with a success message.
+    ///
+    /// Test-only: the app saves through [`Self::save_changes`]; tests that
+    /// edit `model` directly save it whole.
+    #[cfg(test)]
+    #[must_use = "a failed save must be surfaced, not reported as success"]
+    fn save(&mut self) -> Result<(), String> {
+        let _ = self.model_mut();
+        let model = Arc::clone(&self.model);
+        let r = self.store_with(&model, |s, m| s.save_model(m));
+        if r.is_ok() {
+            self.unsaved = Default::default();
+        }
+        r
+    }
+
+    /// Autosave `changes` (everything changed since the last load or save),
+    /// plus whatever failed saves left unwritten, when `db` is set: a cell
+    /// edit writes that cell alone, not the whole model. In-memory (`""`)
+    /// models skip saving.
+    ///
+    /// In the app the save runs on the save thread ([`Saver`]) and this
+    /// returns at once (H3); [`Self::poll_saves`] reports how it went. One
+    /// save runs at a time: changes made meanwhile go in the next, in order,
+    /// over the token the last one left. A failed save keeps its changes in
+    /// memory, marked dirty, and the next save writes them too: the change
+    /// sets of every failed save merge. Tests save in the foreground (see
+    /// [`Self::background`]), so the error comes back here.
+    #[must_use = "a failed save must be surfaced, not reported as success"]
+    fn save_changes(&mut self, changes: &improv_store::ChangeSet) -> Result<(), String> {
+        if self.db.is_empty() {
+            return Ok(());
+        }
+        self.unsaved.add(changes.clone());
+        self.dirty = true;
+        self.writable()?;
+        if self.saving.is_some() {
+            self.save_wanted = true;
+            return Ok(());
+        }
+        self.send_save()?;
+        if self.background {
+            return Ok(());
+        }
+        self.finish_saves()
+    }
+
+    /// Refuse a change once another program's save is known (H9), or the
+    /// save thread is lost: this window's save would be refused, and nothing
+    /// is retried behind their back. File ▸ Revert to Saved is the way on.
+    fn writable(&self) -> Result<(), String> {
+        if self.db.is_empty() {
+            Ok(())
+        } else if self.loading.is_some() {
+            Err("the model is still loading: nothing was changed".into())
+        } else if self.save_lost {
+            Err(SAVE_LOST.into())
+        } else if self.outside.is_some() {
+            Err(save_error(
+                improv_store::StoreError::Conflict(String::new()),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Hand everything unsaved to the save thread.
+    fn send_save(&mut self) -> Result<(), String> {
+        if self.saver.is_none() {
+            self.saver = Saver::spawn();
+        }
+        let Some(jobs) = self.saver.as_ref().map(|s| s.jobs.clone()) else {
+            return Err(SAVE_LOST.into());
+        };
+        let changes = std::mem::take(&mut self.unsaved);
+        let model = self.save_model_for(&changes);
+        let whole = Arc::ptr_eq(&model, &self.model);
+        let job = SaveJob {
+            db: self.db.clone(),
+            model,
+            changes,
+            token: std::mem::take(&mut self.save_token),
+        };
+        let (tx, rx) = mpsc::channel();
+        if let Err(mpsc::SendError((job, _))) = jobs.send((job, tx)) {
+            // The thread is gone: the next save starts another.
+            self.saver = None;
+            self.save_token = job.token;
+            self.unsaved = job.changes;
+            return Err(SAVE_LOST.into());
+        }
+        self.saving = Some(Saving {
+            done: rx,
+            whole,
+            retry: self.save_failed,
+        });
+        Ok(())
+    }
+
+    /// Adopt a finished save (`None`: its thread died): the token, and on
+    /// failure its changes back into [`Self::unsaved`], merged with those
+    /// made since. Then send what was asked for meanwhile, unless the store
+    /// refused this window. `Ok(true)`: it wrote what an earlier save failed
+    /// to.
+    fn land_save(&mut self, s: Saving, outcome: Option<SaveOutcome>) -> Result<bool, String> {
+        let r = match outcome {
+            Some((token, _, Ok(()))) => {
+                self.save_token = token;
+                self.save_failed = false;
+                Ok(s.retry)
+            }
+            Some((token, changes, Err(e))) => {
+                self.save_token = token;
+                self.unsaved.add(changes);
+                self.save_failed = true;
+                if matches!(e, improv_store::StoreError::Conflict(_)) {
+                    // Show the Reload panel at once: the H9 way on.
+                    self.outside = Some((self.outside_save().unwrap_or_default(), true));
+                }
+                Err(save_error(e))
+            }
+            None => {
+                self.saver = None;
+                self.save_lost = true;
+                self.save_failed = true;
+                Err(SAVE_LOST.into())
+            }
+        };
+        if std::mem::take(&mut self.save_wanted) && self.writable().is_ok() {
+            if let Err(e) = self.send_save() {
+                self.dirty = true;
+                return r.and(Err(e));
+            }
+        }
+        self.dirty = self.saving.is_some() || !self.unsaved.is_empty();
+        r
+    }
+
+    /// Each frame: report a finished save on the status line, and keep
+    /// frames coming while one runs.
+    fn poll_saves(&mut self, ctx: &egui::Context) {
+        while let Some(s) = &self.saving {
+            let outcome = match s.done.try_recv() {
+                Ok(o) => Some(o),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(SAVE_POLL);
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            };
+            let Some(s) = self.saving.take() else {
+                return;
+            };
+            match self.land_save(s, outcome) {
+                Err(e) => self.status = e,
+                Ok(true) => self.status = SAVED_AGAIN.into(),
+                Ok(false) if self.saving.is_none() && self.status == SAVING => {
+                    self.status = "saved model".into();
+                }
+                Ok(false) => {}
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    /// Wait for the save running, and any it starts, and land them: the
+    /// first failure, if any.
+    fn finish_saves(&mut self) -> Result<(), String> {
+        let mut first = Ok(());
+        while let Some(s) = self.saving.take() {
+            let outcome = s.done.recv().ok();
+            let r = self.land_save(s, outcome);
+            if first.is_ok() {
+                first = r.map(drop);
+            }
+        }
+        first
+    }
+
+    /// What a save of `changes` reads: the structure and the named cells,
+    /// copied in microseconds without waiting for a build that still shares
+    /// the model (H3). A change too big to save cell by cell, or a store
+    /// handle with nothing loaded, saves the whole model: shared, not copied.
+    fn save_model_for(&mut self, changes: &improv_store::ChangeSet) -> Arc<Model> {
+        if changes.cells.len() > improv_store::SEEK_SAVE_LIMIT || self.save_token.tx().is_none() {
+            let _ = self.model_mut();
+            return Arc::clone(&self.model);
+        }
+        let mut m = structure_copy(&self.model);
+        for (id, at) in &changes.cells {
+            if let Some(v) = self.input(*id, at) {
+                m.set_input(*id, at.clone(), v.clone());
+            }
+        }
+        Arc::new(m)
+    }
+
+    /// Open the store, adopt the save token, run `save`, keep the new token,
+    /// on this thread (after any queued saves). A failed save keeps the old
+    /// token (nothing was written) and marks the model dirty.
+    #[cfg(test)]
+    fn store_with(
+        &mut self,
+        model: &Model,
+        save: impl FnOnce(&mut Store, &Model) -> improv_store::Result<()>,
+    ) -> Result<(), String> {
+        if self.db.is_empty() {
+            return Ok(());
+        }
+        self.finish_saves()?;
+        let r = Store::open(&self.db).map_err(save_error).and_then(|mut s| {
+            s.adopt_save_token(std::mem::take(&mut self.save_token));
+            let r = save(&mut s, model).map_err(save_error);
+            // On failure this is the adopted token back, unchanged.
+            self.save_token = s.take_save_token();
+            r
+        });
+        self.dirty = r.is_err();
+        self.save_failed = r.is_err();
+        r
+    }
+
+    /// File ▸ Revert to Saved: reload the model from the store (with a fresh
+    /// save token) and rebuild the engine. After a save conflict this is the
+    /// way forward: the reload picks up the other writer's changes and drops
+    /// this window's unsaved ones. Undo history is dropped
+    /// (it describes a model that no longer matches the store). On failure
+    /// nothing changes.
+    pub fn revert_to_saved(&mut self) -> Result<(), String> {
+        if self.db.is_empty() {
+            return Ok(());
+        }
+        // Its outcome is moot: the reload takes what the store holds.
+        let _ = self.finish_saves();
+        let mut store = Store::open(&self.db).map_err(|e| format!("revert failed: {e}"))?;
+        let mut model = store
+            .load_model()
+            .map_err(|e| format!("revert failed: {e}"))?;
+        check_engine(&mut model)?;
+        self.held.clear();
+        self.model = Arc::new(model);
+        self.rebuild_engine();
+        self.save_token = store.take_save_token();
+        self.unsaved = Default::default();
+        (self.save_failed, self.save_lost, self.save_wanted) = (false, false, false);
+        self.outside = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.dirty = false;
+        self.after_history_restore();
+        Ok(())
+    }
+
+    /// The store's high-water when another writer has saved since this
+    /// window loaded or saved, else `None` (also for an in-memory model, a
+    /// model never saved, and a store that cannot be read now).
+    // shortcut: opens the store per check (a new connection for Postgres),
+    // on the UI thread; keep a probe handle, as the server does, if it lags.
+    pub fn outside_save(&self) -> Option<i64> {
+        let mine = self.save_token.tx()?;
+        let hw = Store::open(&self.db)
+            .and_then(|mut s| s.tx_high_water())
+            .ok()?;
+        (hw != mine).then_some(hw)
+    }
+
+    /// H9: look for another writer's save, and offer Reload when there is
+    /// a new one: when a Postgres model's notification says its version
+    /// moved ([`Self::listen`]), else every [`PROBE_SECS`] (egui time
+    /// `now`). A notification that its data moved re-reads the inputs, at
+    /// most once a [`REREAD_SECS`], and applies what differs
+    /// ([`Self::take_inputs`]).
+    fn probe_store(&mut self, now: f64) {
+        if self.heard.is_some() {
+            self.follow_notifications(now);
+            if self.heard.is_some() && self.probed_at != f64::NEG_INFINITY {
+                return;
+            }
+        }
+        // A save in flight moves the high-water itself: look after it lands.
+        if self.db.is_empty() || now - self.probed_at < PROBE_SECS || self.saving.is_some() {
+            return;
+        }
+        self.probed_at = now;
+        match (self.outside_save(), self.outside) {
+            (None, _) => self.outside = None,
+            (Some(hw), Some((seen, _))) if hw == seen => {}
+            (Some(hw), _) => self.outside = Some((hw, true)),
+        }
+    }
+
+    /// Take in the listener's news: a version this window did not save
+    /// at asks for the probe (`probed_at` = -inf); a data move asks for a
+    /// re-read of the inputs, run off the UI thread when one is due, and
+    /// its answer is applied.
+    fn follow_notifications(&mut self, now: f64) {
+        let Some(rx) = &self.heard else { return };
+        let mine = self.save_token.tx();
+        let mut moved = false;
+        let gone = loop {
+            match rx.try_recv() {
+                Ok(Some(h)) => {
+                    moved |= Some(h.tx) != mine;
+                    if self.data_seen.replace(h.data) != Some(h.data) {
+                        self.reread.wanted = true;
+                    }
+                }
+                Ok(None) => {}
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        if moved {
+            self.probed_at = f64::NEG_INFINITY;
+        }
+        if gone {
+            // The listener stopped: back to polling.
+            self.heard = None;
+        }
+        // A re-read that came back.
+        let done = self.reread.running.as_ref().map(|r| r.try_recv());
+        match done {
+            Some(Ok(read)) => {
+                self.reread.running = None;
+                if let Some((tx, cells, token)) = read {
+                    if !self.take_inputs(tx, cells, token) && self.outside.is_none() {
+                        // Not now (an edit unsaved, a save running, our own
+                        // save moved the version since): again later.
+                        self.reread.wanted = true;
+                    }
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => self.reread.running = None,
+            _ => {}
+        }
+        // One due: once a REREAD_SECS, never with a Reload panel up.
+        let due = self.reread.wanted
+            && self.reread.running.is_none()
+            && self.outside.is_none()
+            && now - self.reread.last >= REREAD_SECS;
+        if due {
+            self.reread.wanted = false;
+            self.reread.last = now;
+            let (tx, rx) = mpsc::channel();
+            let db = self.db.clone();
+            let wake = self.reread.wake.clone();
+            let spawned = std::thread::Builder::new()
+                .name("improv-gui-reread".into())
+                .stack_size(improv_engine::dataflow::ENGINE_STACK)
+                .spawn(move || {
+                    let read = Store::open(&db).and_then(|mut s| {
+                        let m = s.load_model()?;
+                        Ok((s.loaded_tx(), m.inputs, s.take_save_token()))
+                    });
+                    let _ = tx.send(match read {
+                        Ok((Some(t), cells, token)) => Some((t, cells, token)),
+                        _ => None,
+                    });
+                    if let Some(w) = wake {
+                        w();
+                    }
+                });
+            if spawned.is_ok() {
+                self.reread.running = Some(rx);
+            }
+        }
+    }
+
+    /// Another program changed this model's input cells (SQL on a bound
+    /// table, through the sync worker or a trigger): `cells` are its
+    /// inputs as re-read at version `tx`, with that read's save `token`.
+    /// When the structure is this window's (`tx` is its save token's) and
+    /// nothing here is unsaved, apply the cells that differ (through the
+    /// engine, as an edit: no undo step, no save), take the read's token
+    /// (it knows those cells), and say so; this window's own save diffs to
+    /// nothing. Else nothing changes, and `false` says so: an unsaved edit
+    /// is never overwritten.
+    fn take_inputs(&mut self, tx: i64, cells: Inputs, token: improv_store::SaveToken) -> bool {
+        let busy = self.saving.is_some()
+            || self.dirty
+            || !self.unsaved.is_empty()
+            || self.loading.is_some()
+            || self.building.is_some()
+            || self.outside.is_some();
+        if busy || Some(tx) != self.save_token.tx() {
+            return false;
+        }
+        let mut diff: Vec<(MeasureId, improv_core_model::Coordinate, Option<Value>)> = cells
+            .iter()
+            .filter(|(k, v)| self.model.inputs.get(*k) != Some(*v))
+            .map(|((m, at), v)| (*m, at.clone(), Some(v.clone())))
+            .collect();
+        diff.extend(
+            (self.model.inputs.keys())
+                .filter(|k| !cells.contains_key(*k))
+                .map(|(m, at)| (*m, at.clone(), None)),
+        );
+        self.save_token = token;
+        if diff.is_empty() {
+            return true;
+        }
+        let n = diff.len();
+        let edits: Vec<improv_engine::session::Edit> = diff
+            .iter()
+            .map(|(m, at, v)| improv_engine::session::Edit {
+                measure: *m,
+                coord: encode_coord(at),
+                value: self
+                    .model
+                    .measures
+                    .get(m)
+                    .zip(v.as_ref())
+                    .and_then(|(x, v)| improv_engine::session::input_cell(x.value_type, v)),
+            })
+            .collect();
+        for (m, at, v) in diff {
+            self.write_input(m, at, v);
+        }
+        let applied = match &mut self.engine {
+            Some(engine) => {
+                self.snapshot = Snapshot::default();
+                engine.apply(edits).map(|s| self.snapshot = s).is_ok()
+            }
+            None => true,
+        };
+        if !applied {
+            // A fresh engine agrees with the model.
+            self.rebuild_engine();
+        }
+        self.status = format!("{} changed by another program", plural(n, "cell"));
+        true
+    }
+
+    /// For a Postgres model, follow its notifications on a thread of its
+    /// own (a second connection), waking `ctx` for each; the probe then
+    /// runs only when the version moves. Nothing for a Mentat file, or
+    /// when the listening connection cannot be made (the probe polls, as
+    /// before).
+    fn listen(&mut self, ctx: &egui::Context) {
+        if self.listened || !improv_store::is_postgres(&self.db) {
+            return;
+        }
+        self.listened = true;
+        let c = ctx.clone();
+        self.reread.wake = Some(Arc::new(move || c.request_repaint()));
+        let listener = Store::open(&self.db).and_then(|mut s| s.listen(&self.db));
+        let Ok(Some(mut l)) = listener else {
+            // This model is polled.
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("improv-gui-listen".into())
+            .spawn(move || {
+                // Ends when the window goes (the receiver: a `None` every
+                // 5 s at the latest) or the connection does.
+                while let Ok(heard) = l.wait(std::time::Duration::from_secs(5)) {
+                    let any = !heard.is_empty();
+                    for h in heard.into_iter().map(Some).chain([None]) {
+                        if tx.send(h).is_err() {
+                            return;
+                        }
+                    }
+                    if any {
+                        ctx.request_repaint();
+                    }
+                }
+                ctx.request_repaint();
+            });
+        if spawned.is_ok() {
+            self.heard = Some(rx);
+        }
+    }
+
+    /// The Reload panel (H9): another program saved this model. Reload is
+    /// File ▸ Revert to Saved; Not Now hides it until they save again.
+    /// Nothing is overwritten either way: a save from this window would be
+    /// refused as a conflict.
+    fn reload_panel(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let now = ctx.input(|i| i.time);
+        self.listen(ctx);
+        self.probe_store(now);
+        if !self.db.is_empty() && self.heard.is_none() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(PROBE_SECS));
+        } else if self.reread.wanted {
+            // A re-read waits out its REREAD_SECS.
+            let left = (self.reread.last + REREAD_SECS - now).max(0.05);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+        }
+        let Some((hw, true)) = self.outside else {
+            return;
+        };
+        let mut open = true;
+        let (mut reload, mut later) = (false, false);
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(ws.center().x, ws.top() + 60.0),
+            egui::vec2(380.0, 104.0),
+        );
+        let win = crate::nxwin::NxWindow::new("reload_panel", "Changed");
+        let rect = anchored_rect(ctx, win.id(), rect);
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Another program saved this model.");
+                ui.label(if self.can_undo() {
+                    "Reload shows their changes and drops this window's undo history."
+                } else {
+                    "Reload shows their changes."
+                });
+                ui.horizontal(|ui| {
+                    reload = ui.button("Reload").clicked();
+                    later = ui.button("Not Now").clicked();
+                });
+            });
+        if reload {
+            self.status = match self.revert_to_saved() {
+                Ok(()) => "reloaded: another program had saved this model".into(),
+                Err(e) => e,
+            };
+            self.outside = None;
+        } else if later || !open {
+            self.outside = Some((hw, false));
+            self.status = "not reloaded: edits here will be refused until you reload".into();
+        }
+    }
+
+    /// Read-only inspector facts for `measure` (see `inspector` panel).
+    fn inspector_data(&self, measure: MeasureId) -> Option<InspectorData> {
+        let m = self.model.measures.get(&measure)?;
+        let dimensions = m
+            .categories
+            .iter()
+            .map(|c| {
+                self.model
+                    .categories
+                    .get(c)
+                    .map(|cat| cat.name.0.clone())
+                    .unwrap_or_else(|| format!("category {}", c.0))
+            })
+            .collect();
+        let (dependencies, formula_english) = match &m.kind {
+            MeasureKind::Derived(f) => {
+                let mut deps: Vec<String> = f
+                    .referenced_measures()
+                    .into_iter()
+                    .map(|id| {
+                        self.model
+                            .measures
+                            .get(&id)
+                            .map(|dm| dm.name.0.clone())
+                            .unwrap_or_else(|| format!("measure {}", id.0))
+                    })
+                    .collect();
+                deps.dedup();
+                (
+                    deps,
+                    Some(describe_formula(&NlContext::new(&self.model), f)),
+                )
+            }
+            MeasureKind::Input => (Vec::new(), None),
+        };
+        let error_cells = self
+            .snapshot
+            .get(&measure)
+            .map(|m| {
+                m.values()
+                    .filter(|v| matches!(v, CellValue::Err(_)))
+                    .count()
+            })
+            .unwrap_or(0);
+        Some(InspectorData {
+            id: measure,
+            name: m.name.0.clone(),
+            is_derived: m.is_derived(),
+            value_type: m.value_type,
+            format: m.format,
+            dimensions,
+            dependencies,
+            formula_english,
+            error_cells,
+        })
+    }
+}
+
+/// Push `state` onto a bounded history stack, evicting the oldest entry once
+/// [`UNDO_DEPTH`] is reached.
+fn push_bounded(stack: &mut Vec<Step>, state: Step) {
+    if stack.len() >= UNDO_DEPTH {
+        stack.remove(0);
+    }
+    stack.push(state);
+}
+
+/// Whether the grid's single-key bindings (cursor motion, paging, measure
+/// cycling, undo/redo) should act this frame.
+///
+/// * `editing` — a GRID CELL editor is open: the cell's own text field owns the
+///   keyboard (its Enter/Esc are handled where it is rendered).
+/// * `other_focus` — some egui widget owns keyboard focus. While a cell is
+///   being edited that widget IS the cell editor, so the two flags overlap;
+///   either one suppresses the bindings. Any *other* focused widget (the
+///   formula editor, the new-measure name/formula fields, the CSV wizard's text
+///   fields, the view-name box) must get the keystroke instead of the grid —
+///   otherwise typing `n` cycles measures and `h`/`j`/`k`/`l` moves the cursor
+///   mid-word.
+///
+/// A pure predicate so the decision is unit-testable without a window; the
+/// focus flag itself comes from `egui::Memory::focused()`, which is `None`
+/// again as soon as focus is released (so the gate is never sticky).
+fn grid_keys_enabled(editing: bool, other_focus: bool) -> bool {
+    !editing && !other_focus
+}
+
+/// Improv's formula status indicator, between a formula's checkbox and its
+/// number: a check when the formula checks with no errors, a cross when it
+/// has one (the error is spelled out under the row). Improv 1.0 also had
+/// Overlap and Mismatch indicators; this engine reports neither (an
+/// overlap is refused when the formula is entered), so they are not drawn.
+fn formula_status(ui: &mut egui::Ui, name: &str, error: Option<&str>) {
+    let checked = error.is_none();
+    use crate::theme::BLACK;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    let p = ui.painter();
+    let s = egui::Stroke::new(1.5_f32, BLACK);
+    let r = rect.shrink(2.0);
+    if checked {
+        p.line_segment(
+            [r.left_center(), egui::pos2(r.center().x - 1.0, r.bottom())],
+            s,
+        );
+        p.line_segment(
+            [egui::pos2(r.center().x - 1.0, r.bottom()), r.right_top()],
+            s,
+        );
+    } else {
+        p.line_segment([r.left_top(), r.right_bottom()], s);
+        p.line_segment([r.right_top(), r.left_bottom()], s);
+    }
+    let state = if checked { "checks" } else { "has an error" };
+    resp.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Image, true, format!("Formula {name} {state}"))
+    });
+    resp.on_hover_text(match error {
+        None => "Checked: the formula checks, with no errors.".to_owned(),
+        Some(e) => format!("Error: {e}"),
+    });
+}
+
+/// A NeXT pop-up list picking a multiform panel's page (the Inspector's,
+/// the Format panel's); the page names are the variants'.
+fn page_popup<P: PartialEq + Copy + std::fmt::Debug>(
+    ui: &mut egui::Ui,
+    id: &str,
+    page: &mut P,
+    pages: &[P],
+) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(format!("{page:?}"))
+        .show_ui(ui, |ui| {
+            for &p in pages {
+                ui.selectable_value(page, p, format!("{p:?}"));
+            }
+        });
+}
+
+/// Give `ui`'s selected rows a white face. The palette makes egui's selection
+/// fill and hover fill the same gray as the panel, so a selected
+/// `selectable_label` would look merely hovered. Call inside a `ui.scope` (or a
+/// child ui) so text-edit selection keeps the theme's color.
+fn white_selection(ui: &mut egui::Ui) {
+    ui.visuals_mut().selection.bg_fill = crate::theme::WHITE;
+}
+
+/// Read-only facts about a measure, assembled for the Info panel.
+#[derive(Debug, PartialEq)]
+struct InspectorData {
+    id: MeasureId,
+    name: String,
+    is_derived: bool,
+    value_type: ValueType,
+    format: Option<NumberFormat>,
+    dimensions: Vec<String>,
+    dependencies: Vec<String>,
+    formula_english: Option<String>,
+    error_cells: usize,
+}
+
+/// One row of the formula pane: a single derived measure's formula as the
+/// reference's numbered, checkable list shows it (`✓ 1. Gross Margin = Sum of
+/// Revenue - Sum of Cost of Sales`).
+///
+/// Built by [`ImprovApp::formula_rows`] in measure-id order; the display number
+/// is the row's 1-based position, not an identity, so inserting a formula
+/// renumbers the list exactly as the reference does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormulaRow {
+    /// The measure this formula defines (clicking the row selects it).
+    pub measure: MeasureId,
+    /// The target measure's name — the left side of the displayed `Target = …`.
+    pub target: String,
+    /// The formula's source text: the editable spelling when one exists, else
+    /// the controlled-English description (`error` then says so).
+    pub text: String,
+    /// Whether the formula is enabled (the reference's `✓`). See
+    /// [`DISABLED_MARKER`].
+    pub enabled: bool,
+    /// Why this row is not sound, shown inline beneath it. `None` when the
+    /// formula compiles and has an editable spelling.
+    pub error: Option<String>,
+}
+
+/// Give a formula edit whose commit failed the keyboard back, the caret at
+/// the start of the error's `span` in `text` (its end when the error has no
+/// place), so the next keys correct the formula instead of driving the grid
+/// (H1-8).
+fn refocus_at_error(resp: &egui::Response, text: &str, span: Option<std::ops::Range<usize>>) {
+    resp.request_focus();
+    let at = span.map_or(text.len(), |r| r.start);
+    set_caret(&resp.ctx, resp.id, text, at);
+}
+
+/// Swallow this frame's Enter once a text field has acted on it, so the
+/// grid (drawn later, and now seeing no focus) doesn't start a cell edit.
+fn consume_enter(ui: &egui::Ui) {
+    ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+}
+
+/// An engine-build failure for formula `text`, located in it; `None` for a
+/// failed save, which is no fault of the text.
+fn formula_fault(model: &Model, text: &str, err: &str) -> Option<diagnostics::Diagnostic> {
+    (!err.starts_with("save failed")).then(|| diagnostics::compile_error(model, text, err))
+}
+
+/// A formula editor with autocomplete ([`crate::completion`]): while a
+/// name is typed (at or after byte `from`), a list of what may complete it
+/// drops under the edit (Up/Down select, Tab or Enter accept, Esc closes;
+/// a click accepts too), the rest of the selected name and its
+/// parameters trail the caret in light gray, and a tooltip shows the
+/// signature of the function being completed or called, the current
+/// argument in bold. With the list closed every key reaches the edit, so
+/// Enter still commits.
+fn assisted_formula_edit(
+    ui: &mut egui::Ui,
+    model: &Model,
+    text: &mut String,
+    id: egui::Id,
+    hint: &str,
+    span: Option<std::ops::Range<usize>>,
+    from: usize,
+) -> egui::Response {
+    use crate::completion::{self, Popup};
+    use egui::{Key, Modifiers};
+    let ctx = ui.ctx().clone();
+    let (pid, rid) = (id.with("completion"), id.with("completion_rect"));
+    let mut popup: Popup = ctx.data_mut(|d| d.get_temp(pid)).unwrap_or_default();
+    let offer = |text: &str, caret: usize| {
+        if caret >= from {
+            completion::offer(model, text, caret)
+        } else {
+            Vec::new()
+        }
+    };
+    let word = |text: &str, caret: usize| {
+        completion::prefix(text, caret).map_or(String::new(), |(_, w)| w.to_string())
+    };
+    // Keys first, on what the user saw last frame, before the edit can.
+    let mut refocus = false;
+    let mut accepted = false;
+    if ctx.memory(|m| m.has_focus(id) || m.had_focus_last_frame(id)) {
+        let caret = caret_byte(&ctx, id, text);
+        let cands = offer(text, caret);
+        if popup.sync(text, &word(text, caret), cands.len()) {
+            let n = cands.len();
+            let (up, down, tab, enter, esc) = ui.input_mut(|i| {
+                let mut k = |key| i.consume_key(Modifiers::NONE, key);
+                (
+                    k(Key::ArrowUp),
+                    k(Key::ArrowDown),
+                    k(Key::Tab),
+                    k(Key::Enter),
+                    k(Key::Escape),
+                )
+            });
+            // A press on the list picks that row (it took the focus away).
+            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+            let clicked = ui
+                .input(|i| i.pointer.press_origin().filter(|_| i.pointer.any_pressed()))
+                .zip(ctx.data(|d| d.get_temp::<egui::Rect>(rid)))
+                .filter(|(p, r)| r.contains(*p))
+                .map(|(p, r)| (((p.y - r.top() - 2.0) / row_h).max(0.0) as usize).min(n - 1));
+            if let Some(i) = clicked {
+                popup.sel = i;
+            }
+            popup.step(isize::from(down) - isize::from(up), n);
+            if tab || enter || clicked.is_some() {
+                let (t, at) = completion::accept(text, caret, &cands[popup.sel]);
+                *text = t;
+                set_caret(&ctx, id, text, at);
+                accepted = true;
+            } else if esc {
+                popup.dismiss(text);
+            }
+            refocus = tab || esc || clicked.is_some();
+        }
+    }
+    // While the list is up the edit keeps Tab and Esc (egui reads the
+    // filter at the start of the next frame, so set it every frame).
+    let caret = caret_byte(&ctx, id, text);
+    let listing = popup
+        .clone()
+        .sync(text, &word(text, caret), offer(text, caret).len());
+    let out = formula_text_edit(ui, text, id, hint, span, listing);
+    let mut resp = out.response.response;
+    if refocus {
+        resp.request_focus();
+    }
+    if accepted {
+        resp.mark_changed();
+    }
+    ctx.data_mut(|d| d.remove::<egui::Rect>(rid));
+    if resp.has_focus() {
+        let caret = caret_byte(&ctx, id, text);
+        let cands = offer(text, caret);
+        let shown = popup.sync(text, &word(text, caret), cands.len());
+        let sel = shown.then(|| &cands[popup.sel]);
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        if let Some(g) = completion::ghost(text, caret, sel) {
+            // After the last glyph; the ghost is never part of the galley.
+            let at = out.galley_pos + egui::vec2(out.galley.rect.right(), 0.0);
+            ui.painter().with_clip_rect(out.text_clip_rect).text(
+                at,
+                egui::Align2::LEFT_TOP,
+                g,
+                font,
+                crate::theme::LIGHT_GRAY,
+            );
+        }
+        let below = shown && completion_list(ui, &resp, &cands, popup.sel, rid);
+        if shown {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                )
+            });
+        }
+        let signature = match sel.map(|c| (c.kind, c.name.clone())) {
+            Some((completion::Kind::Function(d), name)) => Some((name, d, None)),
+            _ => (caret >= from)
+                .then(|| improv_core_model::functions::call_at(text, caret))
+                .flatten()
+                .map(|(d, a)| (d.name.to_string(), d, Some(a))),
+        };
+        if let Some((name, d, arg)) = signature {
+            // Over the edit while the list is under it.
+            signature_tooltip(ui, &resp, &name, d, arg, below || !shown);
+        }
+    }
+    ctx.data_mut(|d| d.insert_temp(pid, popup));
+    resp
+}
+
+/// The completion list under (or, without room, over) the edit `resp`,
+/// `sel` highlighted; its rect is kept under `rid` so a press on it can
+/// pick a row. Returns whether it went below.
+fn completion_list(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    cands: &[crate::completion::Candidate],
+    sel: usize,
+    rid: egui::Id,
+) -> bool {
+    use crate::theme::{BLACK, DARK_GRAY, LIGHT_GRAY, WHITE};
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+    // Wide enough for the longest hint and its description, on screen.
+    let text_w =
+        |s: &str| ui.fonts_mut(|f| f.layout_no_wrap(s.to_owned(), font.clone(), BLACK).size().x);
+    let widest = cands
+        .iter()
+        .map(|c| text_w(&c.hint()) + 12.0 + text_w(c.doc()))
+        .fold(0.0, f32::max);
+    let screen = ui.ctx().content_rect();
+    let size = egui::vec2(
+        (widest + 12.0)
+            .max(resp.rect.width())
+            .min(screen.right() - resp.rect.left() - 2.0),
+        cands.len() as f32 * row_h + 4.0,
+    );
+    let below = resp.rect.bottom() + 1.0 + size.y <= screen.bottom();
+    let at = if below {
+        resp.rect.left_bottom() + egui::vec2(0.0, 1.0)
+    } else {
+        resp.rect.left_top() - egui::vec2(0.0, size.y + 1.0)
+    };
+    let rect = egui::Rect::from_min_size(at, size);
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        rid.with("list"),
+    ));
+    let p = painter.with_clip_rect(rect);
+    p.rect_filled(rect, 0.0, WHITE);
+    p.rect_stroke(
+        rect.shrink(0.5),
+        0.0,
+        egui::Stroke::new(1.0_f32, BLACK),
+        egui::StrokeKind::Middle,
+    );
+    for (i, c) in cands.iter().enumerate() {
+        let row = egui::Rect::from_min_size(
+            rect.min + egui::vec2(2.0, 2.0 + i as f32 * row_h),
+            egui::vec2(size.x - 4.0, row_h),
+        );
+        if i == sel {
+            p.rect_filled(row, 0.0, LIGHT_GRAY);
+        }
+        let hint = p.text(
+            row.left_center() + egui::vec2(4.0, 0.0),
+            egui::Align2::LEFT_CENTER,
+            c.hint(),
+            font.clone(),
+            BLACK,
+        );
+        p.text(
+            egui::pos2(hint.right() + 12.0, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            c.doc(),
+            font.clone(),
+            DARK_GRAY,
+        );
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(rid, rect));
+    below
+}
+
+/// The signature tooltip over (`above`) or under the edit `resp`: `name`'s
+/// parameters with argument `arg` bold and underlined, then `d`'s
+/// description and category.
+fn signature_tooltip(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    name: &str,
+    d: &improv_core_model::functions::FnDef,
+    arg: Option<usize>,
+    above: bool,
+) {
+    use crate::theme::{BLACK, BOLD, DARK_GRAY, WHITE};
+    use egui::text::{LayoutJob, TextFormat};
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let bold = egui::FontId::new(font.size, egui::FontFamily::Name(BOLD.into()));
+    let (before, current, after) = crate::completion::hint_parts(name, d, arg);
+    let mut job = LayoutJob::default();
+    job.append(&before, 0.0, TextFormat::simple(font.clone(), BLACK));
+    job.append(
+        &current,
+        0.0,
+        TextFormat {
+            font_id: bold,
+            color: BLACK,
+            underline: egui::Stroke::new(1.0_f32, BLACK),
+            ..Default::default()
+        },
+    );
+    job.append(&after, 0.0, TextFormat::simple(font, BLACK));
+    let (pivot, at) = if above {
+        (
+            egui::Align2::LEFT_BOTTOM,
+            resp.rect.left_top() - egui::vec2(0.0, 2.0),
+        )
+    } else {
+        (
+            egui::Align2::LEFT_TOP,
+            resp.rect.left_bottom() + egui::vec2(0.0, 2.0),
+        )
+    };
+    egui::Area::new(resp.id.with("signature"))
+        .order(egui::Order::Tooltip)
+        .interactable(false)
+        .pivot(pivot)
+        .fixed_pos(at)
+        .show(ui.ctx(), |ui| {
+            // A NeXT help balloon: white, ruled in black.
+            egui::Frame::popup(ui.style()).fill(WHITE).show(ui, |ui| {
+                ui.set_max_width(460.0);
+                ui.label(job);
+                ui.label(crate::completion::short_doc(d));
+                ui.label(
+                    egui::RichText::new(crate::function_help::category_title(d.category))
+                        .color(DARK_GRAY),
+                );
+            });
+        });
+}
+
+/// A formula editor: a single-line edit of `text` with id `id`, highlighted,
+/// the error `span` underlined, filling the row. `keep_tab`: Tab stays in
+/// the edit rather than moving the focus.
+fn formula_text_edit(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    id: egui::Id,
+    hint: &str,
+    span: Option<std::ops::Range<usize>>,
+    keep_tab: bool,
+) -> egui::text_edit::TextEditOutput {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+        let mut job =
+            crate::formula_highlight::highlight_formula(text.as_str(), font.clone(), span.clone());
+        job.wrap.max_width = wrap_width;
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    let out = egui::TextEdit::singleline(text)
+        .id(id)
+        .lock_focus(keep_tab)
+        .hint_text(hint)
+        .desired_width(f32::INFINITY)
+        .layouter(&mut layouter)
+        .show(ui);
+    a11y_name(
+        &out.response,
+        if hint.is_empty() { "Formula" } else { hint },
+    );
+    out
+}
+
+/// A formula error under its row, indented past the checkbox and number:
+/// the message, and under it the hint, dimmed.
+fn formula_error_lines(ui: &mut egui::Ui, d: &diagnostics::Diagnostic) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.add_space(44.0);
+        ui.vertical(|ui| {
+            ui.colored_label(
+                crate::formula_highlight::ERROR_COLOR,
+                format!("⚠ {}", d.message),
+            );
+            if let Some(h) = &d.hint {
+                ui.label(egui::RichText::new(h).color(crate::theme::DARK_GRAY));
+            }
+        });
+    })
+    .response
+}
+
+/// Build a live engine over all derived measures in `model`, plus its initial
+/// snapshot. Falls back to no engine (inputs still render) on build failure.
+/// Test-only: the app builds in the background ([`ImprovApp::rebuild_engine`]).
+#[cfg(test)]
+fn build_engine(model: &Model) -> (Option<Engine>, Snapshot) {
+    match try_build_engine(model) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("improv-gui: engine build failed: {e}");
+            (None, Snapshot::default())
+        }
+    }
+}
+
+/// The reserved leading marker in [`Measure::description`] that flags a derived
+/// measure's formula as **disabled** — the reference's cleared `✓` (see
+/// `docs/reviews/2026-09-22-gui-reconstruction-plan.md` Step 2).
+///
+/// Disabling is a *model-level* fact, not GUI state: it must survive save and
+/// reload, and the engine must honor it. Two properties chose this
+/// representation over the alternative (flipping the measure to `Input` and
+/// stashing its formula somewhere):
+///
+/// * **The formula is never moved or re-encoded.** A disabled measure stays
+///   `MeasureKind::Derived(f)`, so its formula persists through the store's
+///   existing `:measure/formula` attribute, and re-enabling is exact. Stashing
+///   it as *text* instead would have to survive [`formula_dsl`] returning
+///   `None` for shapes the v1 grammar cannot spell — those formulas would be
+///   destroyed by a disable/enable cycle.
+/// * **One bit, on the measure it describes.** The marker rides
+///   `:measure/description`, which the store already reads and writes, so it
+///   round-trips with no schema change; and because it lives *on the measure*,
+///   deleting or renaming that measure carries the flag with it (a side table
+///   keyed by `MeasureId` would need garbage collection).
+///
+/// A user-written description is preserved verbatim after the marker; see
+/// [`split_marker`] / [`join_marker`].
+///
+/// The engine honors it via [`engine_model`], which flattens disabled measures
+/// to `Input` in the model handed to `Engine::new`, so `derived_build_order`
+/// stops traversing them and every dependent recomputes *without* them — which
+/// is exactly what clearing the checkmark means.
+///
+/// ponytail: a reserved prefix in `description` is a sidecar in a user-visible
+/// field (the CLI prints descriptions), and it is what a GUI-only change can
+/// persist. Promote it to a real `Measure.enabled: bool` plus a
+/// `:measure/enabled` store attribute (serde/schema default true, so existing
+/// databases keep loading) as soon as `core_model`/`storage_mentat` can be
+/// touched in the same change; [`split_marker`], [`join_marker`] and
+/// [`formula_disabled`] are the only three places that would move.
+const DISABLED_MARKER: &str = "[improv:formula-disabled]";
+
+/// Separator between the marker and the user's own description text.
+///
+/// A single space, not a newline: `storage_mentat`'s EDN writer emits `\n` as a
+/// two-character escape that Mentat's reader does not interpret, so a newline
+/// does not survive a save/reload at all (it comes back as a bare `n`, silently
+/// corrupting the text). A space round-trips exactly. The marker is
+/// bracket-delimited so the boundary is unambiguous without needing a character
+/// the store cannot carry.
+const MARKER_SEP: char = ' ';
+
+/// Split a measure description into `(formula disabled, the user's own text)`.
+///
+/// The marker counts only when the description IS it, or begins with it
+/// followed by [`MARKER_SEP`] — so a user description that merely starts with
+/// the same characters (`"[improv:formula-disabled]ish"`) is left strictly
+/// alone.
+fn split_marker(description: Option<&str>) -> (bool, Option<&str>) {
+    let Some(d) = description else {
+        return (false, None);
+    };
+    match d.strip_prefix(DISABLED_MARKER) {
+        Some("") => (true, None),
+        Some(rest) if rest.starts_with(MARKER_SEP) => (true, Some(&rest[MARKER_SEP.len_utf8()..])),
+        _ => (false, Some(d)),
+    }
+}
+
+/// Rebuild a description from the two parts [`split_marker`] takes apart — its
+/// inverse for every input `split_marker` can produce.
+fn join_marker(disabled: bool, user: Option<&str>) -> Option<String> {
+    match (disabled, user) {
+        (false, user) => user.map(str::to_string),
+        (true, None) => Some(DISABLED_MARKER.to_string()),
+        (true, Some(user)) => Some(format!("{DISABLED_MARKER}{MARKER_SEP}{user}")),
+    }
+}
+
+/// Whether `m`'s formula is disabled (see [`DISABLED_MARKER`]). Always false
+/// for an input measure, which has no formula to disable.
+fn formula_disabled(m: &Measure) -> bool {
+    m.is_derived() && split_marker(m.description.as_deref()).0
+}
+
+/// `model` as the ENGINE must see it: every measure whose formula is disabled
+/// flattened to `MeasureKind::Input`, keeping its (still-stored) formula out of
+/// the dataflow entirely.
+///
+/// This is the single point that makes disabling real rather than cosmetic. A
+/// flattened measure leaves `derived_build_order`, so it computes nothing (its
+/// cells go blank) *and* every dependent recomputes against its absence instead
+/// of through it.
+///
+/// Borrows when nothing is disabled — the overwhelmingly common case — so the
+/// projection costs nothing on models that never touch the feature.
+fn engine_model(model: &Model) -> Cow<'_, Model> {
+    if !model.measures.values().any(formula_disabled) {
+        return Cow::Borrowed(model);
+    }
+    let mut out = model.clone();
+    for m in out.measures.values_mut() {
+        if formula_disabled(m) {
+            m.kind = MeasureKind::Input;
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Build a live engine over every *enabled* derived measure in `model`,
+/// propagating a build failure (cycle, type/dimension error) instead of
+/// swallowing it. A measure whose formula is disabled ([`DISABLED_MARKER`]) is
+/// excluded, via [`engine_model`].
+///
+/// `Ok(None)` (no engine, successfully) when nothing is left to compute — a
+/// model with no derived measures, or one whose formulas are all disabled.
+/// Whether `model`'s formulas build an engine, checked over its structure
+/// alone: the full build's compile, cycle and FIXPOINT checks, in
+/// milliseconds where the cells take seconds (H3).
+fn check_engine(model: &mut Model) -> Result<(), String> {
+    try_build_engine(&structure_of(model)).map(drop)
+}
+
+/// Give each formula that reads `changed` (directly or not) the categories
+/// it now ranges over, as [`ImprovApp::add_derived_measure`] gave them, after
+/// `changed`'s categories did. A formula that no longer compiles is the
+/// error, named.
+fn reshape_dependents(model: &mut Model, changed: MeasureId) -> Result<(), String> {
+    let mut ids: Vec<MeasureId> = model
+        .measures
+        .values()
+        .filter(|m| m.is_derived() && m.id != changed)
+        .filter(|m| model.measure_dependency_closure(&[m.id]).contains(&changed))
+        .map(|m| m.id)
+        .collect();
+    ids.sort_by_key(|m| m.0);
+    // A formula reads the shapes of others: as many passes as formulas settle it.
+    for _ in 0..=ids.len() {
+        let mut moved = Vec::new();
+        for &id in &ids {
+            let m = &model.measures[&id];
+            let MeasureKind::Derived(f) = &m.kind else {
+                continue;
+            };
+            let (_, cats) = improv_engine::compiler::derived_shape(model, id, &m.name.0, f)
+                .map_err(|e| format!("{}: {e}", m.name.0))?;
+            let same =
+                cats.len() == m.categories.len() && cats.iter().all(|c| m.categories.contains(c));
+            if !same {
+                moved.push((id, cats));
+            }
+        }
+        if moved.is_empty() {
+            break;
+        }
+        for (id, cats) in moved {
+            if let Some(m) = model.measures.get_mut(&id) {
+                m.categories = cats;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `model` without its input cells: what a structural change edits, and
+/// a copy in microseconds where the cells take 140 ms at 1M (H3). The
+/// cells are lent out for the copy, so a field `Model` gains is copied too.
+fn structure_of(model: &mut Model) -> Model {
+    let inputs = std::mem::take(&mut model.inputs);
+    let s = model.clone();
+    model.inputs = inputs;
+    s
+}
+
+/// [`structure_of`] for a model that cannot lend its cells out (a build
+/// shares it): every field but `inputs`, as [`improv_store::ChangeSet::between`]
+/// lists them. A new `Model` field goes in both.
+fn structure_copy(model: &Model) -> Model {
+    let mut s = Model::new();
+    s.categories.clone_from(&model.categories);
+    s.items.clone_from(&model.items);
+    s.measures.clone_from(&model.measures);
+    s.sql_sources.clone_from(&model.sql_sources);
+    s.views.clone_from(&model.views);
+    s.external_fns.clone_from(&model.external_fns);
+    s.external_calls.clone_from(&model.external_calls);
+    s.scenarios.clone_from(&model.scenarios);
+    s.lambdas.clone_from(&model.lambdas);
+    s
+}
+
+/// Whether the grid's sizing pass lays every cell out whole, as it did
+/// before it measured just their values: tests compare the two.
+#[cfg(test)]
+fn full_sizing() -> bool {
+    tests::FULL_SIZING.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn full_sizing() -> bool {
+    false
+}
+
+/// Set (`Some`) or clear the input cell `measure` at `at` in `model`.
+/// A model's input cells.
+type Inputs = HashMap<(MeasureId, improv_core_model::Coordinate), Value>;
+
+/// A re-read of a Postgres model's inputs after its data moved
+/// ([`ImprovApp::follow_notifications`]).
+#[derive(Default)]
+struct Reread {
+    /// One is asked for.
+    wanted: bool,
+    /// When (egui time) the last one started.
+    last: f64,
+    /// The one running: its version, inputs and save token (`None`: the
+    /// read failed).
+    running: Option<mpsc::Receiver<Option<(i64, Inputs, improv_store::SaveToken)>>>,
+    /// Wakes the window when one lands.
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Seconds between re-reads of a Postgres model's inputs: notifications
+/// in between are coalesced into the next.
+const REREAD_SECS: f64 = 1.0;
+
+fn put_input(
+    model: &mut Model,
+    measure: MeasureId,
+    at: improv_core_model::Coordinate,
+    value: Option<Value>,
+) {
+    match value {
+        Some(v) => model.set_input(measure, at, v),
+        None => drop(model.inputs.remove(&(measure, at))),
+    }
+}
+
+/// The model in `m`, copied only when a build still holds it.
+fn into_model(m: Arc<Model>) -> Model {
+    Arc::unwrap_or_clone(m)
+}
+
+/// Drop `x` on a thread of its own: an engine or a snapshot of 1M cells
+/// takes longer to free than a frame lasts.
+fn drop_off_thread<T: Send + 'static>(x: T) {
+    let _ = std::thread::Builder::new()
+        .name("improv-gui-free".into())
+        .spawn(move || drop(x));
+}
+
+fn try_build_engine(model: &Model) -> Result<(Option<Engine>, Snapshot), String> {
+    let model = engine_model(model);
+    let derived: Vec<MeasureId> = model
+        .measures
+        .values()
+        .filter(|m| m.is_derived())
+        .map(|m| m.id)
+        .collect();
+    if derived.is_empty() {
+        return Ok((None, Snapshot::default()));
+    }
+    let (e, snap) = Engine::new(&model, &derived).map_err(|e| e.to_string())?;
+    Ok((Some(e), snap))
+}
+
+/// Render `formula` as symbolic-DSL source text that `parser::parse_expr` parses
+/// back to the *identical* AST, or `None` when the v1 grammar has no exact
+/// spelling for the shape (a bare ref carrying `over`/`except`, a
+/// multi-category `OVER`, an empty measure/category name, an
+/// enum/error/negative/non-finite literal, an unknown function id). Callers fall
+/// back to the controlled-English description for those, which
+/// `commit_formula` also accepts.
+///
+/// Awkward *names* are no longer a refusal reason: [`ident`] quotes them
+/// (`'Unit Price'`, `'Price/Unit'`, `'Over'`) per plan Step 4b.
+fn formula_dsl(model: &Model, formula: &improv_core_model::Formula) -> Option<String> {
+    expr_dsl(model, &formula.expr)
+}
+
+/// Binding tightness, mirroring `parser`'s grammar levels (higher binds
+/// tighter). Used to emit exactly the parentheses needed to round-trip.
+fn prec(e: &Expr) -> u8 {
+    match e {
+        Expr::BinaryOp(op, _, _) => match op {
+            BinaryOp::Or => 1,
+            BinaryOp::And => 2,
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => 4,
+            BinaryOp::Concat => 5,
+            BinaryOp::Add | BinaryOp::Sub => 6,
+            BinaryOp::Mul | BinaryOp::Div => 7,
+            BinaryOp::Pow => 9,
+        },
+        // NOT sits between AND and the comparisons; unary minus between
+        // `* /` and `^` (so `-2^2` is `-(2^2)`).
+        Expr::UnaryOp(UnaryOp::Not, _) => 3,
+        Expr::UnaryOp(UnaryOp::Neg, _) => 8,
+        _ => 10,
+    }
+}
+
+/// `expr_dsl`, parenthesized when `e` binds more loosely than its context.
+fn child_dsl(model: &Model, e: &Expr, min_prec: u8) -> Option<String> {
+    let s = expr_dsl(model, e)?;
+    Some(if prec(e) < min_prec {
+        format!("({s})")
+    } else {
+        s
+    })
+}
+
+fn expr_dsl(model: &Model, e: &Expr) -> Option<String> {
+    // 1.4 MiB at depth 256 in a debug build: past Windows' 1 MiB main thread.
+    improv_core_model::grow_stack(|| expr_dsl_here(model, e))
+}
+
+fn expr_dsl_here(model: &Model, e: &Expr) -> Option<String> {
+    match e {
+        Expr::Literal(v) => literal_dsl(v),
+        // A fold's LAMBDA parameters (see `call_dsl`).
+        Expr::Ref(id, _) if improv_core_model::functions::lambda_slot_of(*id).is_some() => {
+            let (k, i) = improv_core_model::functions::lambda_slot_of(*id)?;
+            Some(format!("{}{k}", if i == 0 { "acc" } else { "val" }))
+        }
+        Expr::Ref(id, spec) => {
+            // `over`/`except` have no bare-ref spelling: `OVER` exists only
+            // inside an aggregation (handled below) and `except` not at all.
+            if !spec.over.is_empty() || !spec.except.is_empty() {
+                return None;
+            }
+            ref_dsl(model, *id, &spec.by)
+        }
+        Expr::UnaryOp(op, inner) => {
+            // NOT takes a NotExpr (a comparison or looser-binding NOT); unary
+            // minus takes a Primary.
+            let s = child_dsl(model, inner, prec(e))?;
+            Some(match op {
+                UnaryOp::Neg => format!("-{s}"),
+                UnaryOp::Not => format!("NOT {s}"),
+            })
+        }
+        Expr::BinaryOp(op, l, r) => {
+            let p = prec(e);
+            let sym = match op {
+                BinaryOp::Add => "+",
+                BinaryOp::Sub => "-",
+                BinaryOp::Mul => "*",
+                BinaryOp::Div => "/",
+                BinaryOp::And => "AND",
+                BinaryOp::Or => "OR",
+                BinaryOp::Eq => "==",
+                BinaryOp::Ne => "<>",
+                BinaryOp::Lt => "<",
+                BinaryOp::Le => "<=",
+                BinaryOp::Gt => ">",
+                BinaryOp::Ge => ">=",
+                BinaryOp::Pow => "^",
+                BinaryOp::Concat => "&",
+            };
+            // Left-associative levels keep a same-level LEFT child bare and
+            // parenthesize a same-level RIGHT child; comparisons are
+            // non-associative, so a same-level child needs parens on either
+            // side (`a < b < c` does not parse).
+            // `^` is right-associative: its base must bind tighter than `^`
+            // (a Postfix), its exponent may be any Unary.
+            let (lmin, rmin) = match op {
+                BinaryOp::Pow => (p + 1, 8),
+                _ if p == 4 => (5, 5),
+                _ => (p, p + 1),
+            };
+            Some(format!(
+                "{} {sym} {}",
+                child_dsl(model, l, lmin)?,
+                child_dsl(model, r, rmin)?
+            ))
+        }
+        Expr::Call(func, args) => call_dsl(model, *func, args),
+        Expr::Category(c) => ident(category_name(model, *c)?),
+    }
+}
+
+fn call_dsl(model: &Model, func: FuncId, args: &[Expr]) -> Option<String> {
+    // A named LAMBDA prints as its name and its arguments (a category
+    // parameter's argument is an `Expr::Category`, printed as its name).
+    if let Some(l) =
+        improv_core_model::functions::named_lambda_of(func).and_then(|id| model.lambdas.get(&id))
+    {
+        let parts: Option<Vec<String>> = args.iter().map(|a| expr_dsl(model, a)).collect();
+        return Some(format!("{}({})", ident(&l.name.0)?, parts?.join(", ")));
+    }
+    let name = func_name(func)?;
+    // SCAN/REDUCE(init, x OVER T, body): the body's placeholders print as
+    // the LAMBDA's parameters.
+    if name == "SCAN" || name == "REDUCE" {
+        let [init, Expr::Ref(x, spec), body] = args else {
+            return None;
+        };
+        let [cat] = spec.over.as_slice() else {
+            return None;
+        };
+        return Some(format!(
+            "{name}({}, {} OVER {}, LAMBDA(acc0, val0, {}))",
+            expr_dsl(model, init)?,
+            ref_dsl(model, *x, &spec.by)?,
+            ident(category_name(model, *cat)?)?,
+            expr_dsl(model, body)?
+        ));
+    }
+    // FIXPOINT(init, body, [max_iter], [tolerance]): r is placeholder (0, 0),
+    // printed as the LAMBDA's parameter.
+    if name == "FIXPOINT" {
+        let (init, body, opts) = match args {
+            [i, b, o @ ..] => (i, b, o),
+            _ => return None,
+        };
+        let mut parts = vec![
+            expr_dsl(model, init)?,
+            format!("LAMBDA(acc0, {})", expr_dsl(model, body)?),
+        ];
+        for o in opts {
+            parts.push(expr_dsl(model, o)?);
+        }
+        return Some(format!("FIXPOINT({})", parts.join(", ")));
+    }
+    // Aggregation: `FUNC(MeasureRef OVER Category)` is the ONLY spelling the v1
+    // grammar has for an aggregating func id, and `parse_aggregation` demands
+    // it (a ref arg, exactly one OVER category, no `except`). Anything else
+    // must NOT fall through to the generic call printer: `SUM(Quantity)` and
+    // `SUM(Price * Quantity)` are rejected by `parse_expr`. Return `None` so
+    // the caller falls back to the controlled-English description.
+    if is_aggregation(func) {
+        return aggregation_dsl(model, func, name, args);
+    }
+    let rendered: Option<Vec<String>> = args.iter().map(|a| expr_dsl(model, a)).collect();
+    Some(format!("{name}({})", rendered?.join(", ")))
+}
+
+/// `AGG(args…)` with its `OVER` clause after the first reduced argument (the
+/// parser accepts it after any), the window or `WHERE` there too. `None`
+/// when the shape has no spelling (a reduced argument that is not a plain
+/// reference, reduced arguments with different `OVER` lists, `EXCEPT`).
+fn aggregation_dsl(model: &Model, func: FuncId, name: &str, args: &[Expr]) -> Option<String> {
+    let def = improv_core_model::functions::by_id(func)?;
+    let mut pred = None;
+    let mut window = None;
+    let mut into = None;
+    let mut rest = Vec::new();
+    for a in args {
+        match a {
+            Expr::Call(id, k) if *id == improv_core_model::functions::INTO => into = Some(k),
+            Expr::Call(id, p) if *id == improv_core_model::functions::WHERE => pred = p.first(),
+            Expr::Call(id, b) if *id == improv_core_model::functions::WINDOW => window = Some(b),
+            other => rest.push(other),
+        }
+    }
+    let mut over: Option<&Vec<CategoryId>> = None;
+    let mut parts = Vec::new();
+    // OVER follows the first reduced argument, except for Over::Leading,
+    // where it must follow the last leading measure (the parser reduces the
+    // references before it).
+    let over_at = match def.over {
+        improv_core_model::functions::Over::Leading(_) => {
+            (0..rest.len()).rev().find(|i| def.reduced(*i, rest[*i]))
+        }
+        _ => (0..rest.len()).find(|i| def.reduced(*i, rest[*i])),
+    };
+    for (i, a) in rest.iter().enumerate() {
+        if !def.reduced(i, a) {
+            parts.push(expr_dsl(model, a)?);
+            continue;
+        }
+        let Expr::Ref(id, spec) = a else {
+            return None;
+        };
+        if !spec.except.is_empty() || spec.over.is_empty() {
+            return None;
+        }
+        let mut part = ref_dsl(model, *id, &spec.by)?;
+        if over.is_some_and(|o| *o != spec.over) {
+            return None;
+        }
+        if Some(i) == over_at {
+            let cats: Option<Vec<String>> = spec
+                .over
+                .iter()
+                .map(|c| ident(category_name(model, *c)?))
+                .collect();
+            part.push_str(" OVER ");
+            part.push_str(&cats?.join(", "));
+            if let Some(b) = window {
+                if spec.over.len() != 1 || b.len() != 2 {
+                    return None;
+                }
+                part.push_str(&format!("[{}..{}]", bound_dsl(&b[0])?, bound_dsl(&b[1])?));
+            }
+            if let Some(p) = pred {
+                part.push_str(" WHERE ");
+                part.push_str(&expr_dsl(model, p)?);
+            }
+        }
+        over = Some(&spec.over);
+        parts.push(part);
+    }
+    over?;
+    if let Some(ks) = into {
+        let names: Option<Vec<String>> = ks.iter().map(|k| expr_dsl(model, k)).collect();
+        let last = parts.last_mut()?;
+        last.push_str(" INTO ");
+        last.push_str(&names?.join(", "));
+    }
+    Some(format!("{name}({})", parts.join(", ")))
+}
+
+/// A window bound literal as written: `FIRST`, `LAST`, `THIS`, `THIS-2`.
+fn bound_dsl(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Literal(Value::Text(t)) if t == "FIRST" || t == "LAST" => Some(t.clone()),
+        Expr::Literal(Value::Number(n)) if *n == 0.0 => Some("THIS".into()),
+        Expr::Literal(Value::Number(n)) if n.fract() == 0.0 && *n > 0.0 => {
+            Some(format!("THIS+{n}"))
+        }
+        Expr::Literal(Value::Number(n)) if n.fract() == 0.0 => Some(format!("THIS-{}", -n)),
+        _ => None,
+    }
+}
+
+/// Whether `func` aggregates (`SUM(x OVER T)`), per the function registry.
+fn is_aggregation(func: FuncId) -> bool {
+    improv_core_model::functions::is_aggregation(func)
+}
+
+/// The DSL name of a built-in function id, from the function registry.
+fn func_name(func: FuncId) -> Option<&'static str> {
+    improv_core_model::functions::by_id(func).map(|d| d.name)
+}
+
+fn ref_dsl(model: &Model, id: MeasureId, by: &[CategoryId]) -> Option<String> {
+    let name = ident(model.measures.get(&id).map(|m| m.name.0.as_str())?)?;
+    if by.is_empty() {
+        return Some(name);
+    }
+    let cats: Option<Vec<String>> = by
+        .iter()
+        .map(|c| category_name(model, *c).and_then(ident))
+        .collect();
+    Some(format!("{name}[{}]", cats?.join(", ")))
+}
+
+fn category_name(model: &Model, c: CategoryId) -> Option<&str> {
+    model.categories.get(&c).map(|cat| cat.name.0.as_str())
+}
+
+/// The DSL spelling of `name` as an identifier: the **bare** form when the
+/// tokenizer reads it back as a single non-keyword identifier, else the
+/// **quoted** form (`'Unit Price'`) the grammar gained in plan Step 4a.
+///
+/// Bare is preferred whenever it works, so ordinary formulas keep printing as
+/// `Price * Quantity` rather than `'Price' * 'Quantity'`.
+///
+/// `None` only for the **empty** name: `''` is an explicit parse error ("empty
+/// quoted name: '' names nothing"), so an unnamed measure/category is the one
+/// name this grammar genuinely cannot spell. Everything else — spaces,
+/// slashes, hyphens, parentheses, digits-first, non-ASCII, and the keywords
+/// (`Over`, `AND`) — is spellable quoted, which is what makes a CSV-derived
+/// measure like `Unit Price` editable instead of read-only.
+///
+/// A literal `'` inside the name is escaped by **doubling** it (`Bob''s Rate`),
+/// matching `parser`'s tokenizer exactly. There is no other escape to get
+/// wrong: the quoted form takes every other character verbatim.
+pub(crate) fn ident(name: &str) -> Option<String> {
+    if is_bare_ident(name) {
+        return Some(name.to_string());
+    }
+    // `''` names nothing (a parse error), so an empty name stays unspellable.
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("'{}'", name.replace('\'', "''")))
+}
+
+/// Whether `name` survives a round trip through the tokenizer as one *bare*
+/// identifier that the grammar will not mistake for a keyword.
+fn is_bare_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    let head_ok = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_');
+    if !head_ok || !chars.all(|c| c.is_alphanumeric() || c == '_') {
+        return false;
+    }
+    // A bare keyword is consumed as grammar, never as a name. (`SUM`/`AVG` and
+    // the scalar-function names are NOT keywords here: the parser only treats
+    // them as functions when directly followed by `(`, which a printed
+    // measure reference never is.)
+    const KEYWORDS: &[&str] = &["NOT", "AND", "OR", "OVER", "TRUE", "FALSE"];
+    !KEYWORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
+}
+
+fn literal_dsl(v: &Value) -> Option<String> {
+    match v {
+        // No sign (`-5` is a negation) and no infinity in a literal.
+        Value::Number(n) => parser::number_literal(*n),
+        Value::Boolean(b) => Some(if *b { "TRUE".into() } else { "FALSE".into() }),
+        // `""` is the string literal's one escape (a `"`); a control
+        // character has none.
+        Value::Text(t) => (!t.contains('\\') && !t.contains(char::is_control))
+            .then(|| format!("\"{}\"", t.replace('"', "\"\""))),
+        Value::DateTime(dt) => Some(format!("#{}#", dt.to_rfc3339())),
+        Value::Enum(_) | Value::Error(_) => None,
+    }
+}
+
+/// Parse cell text as `declared`, the measure's declared type. The declared
+/// type WINS over the text's shape: `"42"` for a Text measure is text, not a
+/// number. Unparsable text is an error (never a coerced value), so a bad edit
+/// leaves the prior typed cell untouched.
+///
+/// Dates and booleans reuse the formula grammar's own literal forms (via
+/// `parser::parse_expr` on `#...#` / `TRUE`|`FALSE`), so a date a formula
+/// accepts is a date a cell accepts. Numbers are
+/// [`improv_core_model::Locale::parse_number`]'s: a cell must accept `-3.5`,
+/// which a formula reads as a negation, and `$1,500`.
+fn parse_typed(
+    model: &Model,
+    locale: &improv_core_model::Locale,
+    declared: ValueType,
+    text: &str,
+) -> Result<Value, String> {
+    let literal = |src: String| match parser::parse_expr(model, &src) {
+        Ok(f) => match f.expr {
+            Expr::Literal(v) if v.type_of() == Some(declared) => Some(v),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    match declared {
+        ValueType::Number => locale
+            .parse_number(text)
+            .map(Value::Number)
+            .ok_or_else(|| format!("not a number: {text:?} ({})", locale.number_hint())),
+        // Text takes the buffer verbatim (trimmed by the caller) — no parsing,
+        // so nothing a user can type is rejected.
+        ValueType::Text => Ok(Value::Text(text.to_string())),
+        ValueType::Boolean => literal(text.to_ascii_uppercase())
+            .ok_or_else(|| format!("not a boolean (use true/false): {text:?}")),
+        ValueType::DateTime => literal(format!("#{text}#"))
+            .ok_or_else(|| format!("not a date (use YYYY-MM-DD or RFC3339): {text:?}")),
+        ValueType::Enum => text
+            .parse::<u32>()
+            .map(Value::Enum)
+            .map_err(|_| format!("not an enum index: {text:?}")),
+    }
+}
+
+fn decode(k: &CoordKey) -> improv_core_model::Coordinate {
+    improv_core_model::Coordinate::from_pairs(k.iter().map(|(c, i)| (CategoryId(*c), ItemId(*i))))
+}
+
+/// The measure a window shows by default: the first in id order, input or
+/// derived (H1-34), as the model was built.
+fn pick_default_measure(model: &Model) -> Option<MeasureId> {
+    model.measures.keys().min_by_key(|m| m.0).copied()
+}
+
+/// The measure's categories in natural (declared) order (empty if none/absent).
+fn natural_axis_order(model: &Model, measure: Option<MeasureId>) -> Vec<CategoryId> {
+    measure
+        .and_then(|m| model.measures.get(&m))
+        .map(|m| m.categories.clone())
+        .unwrap_or_default()
+}
+
+impl eframe::App for ImprovApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame(ui);
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.take_help_click(raw);
+    }
+
+    /// Never exit with a save still running (H3).
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Err(e) = self.finish_saves() {
+            eprintln!("improv-gui: {e}");
+        }
+    }
+}
+
+impl ImprovApp {
+    /// One frame of the whole window, in the root `ui`: its panels, then the
+    /// windows (which float on the context).
+    fn frame(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
+        self.front = ctx.top_layer_id();
+        self.poll_load(ctx);
+        if self.loading.is_some() {
+            // The menu (Quit, Hide), the status bar and a placeholder desk.
+            self.sync_native_title(ctx);
+            self.handle_command_keys(ctx);
+            self.status_bar(ui);
+            let ws = self.canvas_panel(ui);
+            self.menu_bar(ctx, ws);
+            return;
+        }
+        self.run_queued_import(ctx);
+        self.point_for_help(ctx);
+        self.poll_saves(ctx);
+        // The close box waits for the running save, and warns once if a
+        // change was not saved.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.close_allowed() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        self.poll_build(ctx);
+        self.sync_axis_state();
+        self.sync_native_title(ctx);
+        self.handle_command_keys(ctx);
+        // Panel order IS layout order: a top/bottom panel claims its strip from
+        // the outside in. The status bar goes below everything and the canvas
+        // takes what is left.
+
+        self.status_bar(ui);
+        self.csv_wizard_panel(ctx);
+        let ws = self.canvas_panel(ui);
+        // After the worksheets, so they start on top of them.
+        self.model_browser(ctx, ws);
+        self.info_panel(ctx, ws);
+        self.inspector_panel(ctx, ws);
+        self.format_window(ctx, ws);
+        self.page_layout_panel(ctx, ws);
+        self.report_layout_panel(ctx, ws);
+        self.print_window(ctx, ws);
+        self.help_window(ctx, ws);
+        self.graph_window(ctx, ws);
+        self.function_help(ctx, ws);
+        self.keys_panel(ctx, ws);
+        self.file_panel(ctx, ws);
+        self.delete_panel(ctx, ws);
+        self.reload_panel(ctx, ws);
+        // Last, so it floats over every panel.
+        self.menu_bar(ctx, ws);
+    }
+}
+
+impl ImprovApp {
+    /// App-wide key equivalents ([`menu::key_command`]): Ctrl/Cmd+S saves,
+    /// Ctrl/Cmd+Z undoes, Ctrl/Cmd+Shift+Z and Ctrl/Cmd+Y redo, Ctrl/Cmd+H
+    /// hides, Ctrl/Cmd+Q quits. Gated by the same [`grid_keys_enabled`]
+    /// predicate the grid uses, so the chords never fire while a cell editor or
+    /// any other text field owns the keyboard. Handled here (not in
+    /// `handle_grid_keys`) because the grid isn't rendered when no measure is
+    /// selected — which is exactly the state an undone import can leave behind.
+    fn handle_command_keys(&mut self, ctx: &egui::Context) {
+        let other_focus = ctx.memory(|m| m.focused()).is_some();
+        if !grid_keys_enabled(self.focused().editing.is_some(), other_focus) {
+            return;
+        }
+        // Auto-repeat is ignored: holding Ctrl+S saves once, and a held
+        // Ctrl+Q can't run straight through the quit confirmation.
+        let commands: Vec<Command> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                        ..
+                    } if modifiers.command => menu::key_command(*key, modifiers.shift),
+                    _ => None,
+                })
+                .collect()
+        });
+        for c in commands {
+            if self.command_enabled(c) {
+                self.run_command(ctx, c);
+            }
+        }
+    }
+
+    /// Draw the application menu ([`menu::show`]) and run what it returns.
+    /// It starts at the top-left of the workspace `ws`, clear of the panels.
+    fn menu_bar(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let views: Vec<(String, bool)> = self
+            .document_tabs()
+            .into_iter()
+            .map(|(_, name, current)| (name, current))
+            .collect();
+        let mut state = self.menu;
+        let home = ws.min + egui::vec2(4.0, 4.0);
+        let picked = menu::show(
+            ctx,
+            &mut state,
+            home,
+            &views,
+            |c| self.command_enabled(c),
+            |c| self.command_checked(c),
+        );
+        self.menu = state;
+        if let Some(c) = picked {
+            self.run_command(ctx, c);
+        }
+    }
+
+    /// Whether `c` can run now: the menu draws the rest disabled.
+    fn command_enabled(&self, c: Command) -> bool {
+        if self.loading.is_some() {
+            return matches!(c, Command::Quit | Command::Hide | Command::UserGuide);
+        }
+        match c {
+            Command::Undo => self.can_undo(),
+            Command::Redo => self.can_redo(),
+            Command::RemoveMatrix => self.matrix_count() > 1,
+            // In-memory models have no store to revert to (Save asks for one).
+            Command::RevertToSaved => !self.db.is_empty(),
+            Command::AddItem => self.add_item_target().is_some(),
+            Command::Rename | Command::Delete => self.edit_target().is_some(),
+            Command::Decimals(_) | Command::Grouping => self
+                .selected()
+                .and_then(|m| self.model.measures.get(&m))
+                .is_some_and(|m| m.value_type == ValueType::Number),
+            _ => true,
+        }
+    }
+
+    /// Whether `c` is in effect, for the menu's check marks: the selected
+    /// measure's decimals and grouping.
+    fn command_checked(&self, c: Command) -> bool {
+        let f = self.selected().and_then(|m| self.number_format(m));
+        match c {
+            Command::Decimals(d) => self.command_enabled(c) && f.and_then(|f| f.decimals) == d,
+            Command::Grouping => f.is_some_and(|f| f.grouping),
+            _ => false,
+        }
+    }
+
+    /// Run a menu command or key equivalent.
+    fn run_command(&mut self, ctx: &egui::Context, c: Command) {
+        // A second Quit or Close drops what the first warned about.
+        if !matches!(c, Command::Quit | Command::CloseModel) {
+            self.quit_armed = false;
+        }
+        match c {
+            Command::InfoPanel => self.show_inspector = !self.show_inspector,
+            Command::ContextHelp => self.help = Some(self.context_topic()),
+            Command::PointForHelp => {
+                self.pointing = true;
+                self.status = "Point for Help: click what you want help on (Esc cancels)".into();
+            }
+            // Brought up, not toggled, as NeXT panels are; the close box
+            // puts them away.
+            Command::Inspector => {
+                let read = self.panel_read();
+                self.inspector
+                    .get_or_insert(Panel::new(InspectorPage::Grid, read));
+            }
+            Command::FormatPanel => {
+                let read = self.panel_read();
+                self.format_panel
+                    .get_or_insert(Panel::new(FormatPage::Number, read));
+            }
+            Command::PageLayout => self.show_page_layout = true,
+            Command::ReportLayout => self.show_report_layout = true,
+            Command::Print => {
+                let path = std::path::Path::new(&self.db).with_extension("pdf");
+                let path = if self.db.is_empty() || improv_store::is_postgres(&self.db) {
+                    format!("{}.pdf", self.file_name())
+                } else {
+                    path.display().to_string()
+                };
+                self.print_panel.get_or_insert(PrintPanel {
+                    copies: 1,
+                    pages: None,
+                    selection: false,
+                    printer: String::new(),
+                    path,
+                });
+            }
+            // In memory there is no store yet: Save asks for one (H1-7).
+            Command::SaveModel if self.db.is_empty() => self.run_command(ctx, Command::SaveAs),
+            Command::NewModel | Command::OpenModel | Command::SaveAs => {
+                self.file_panel = Some(c);
+                self.file_focus = true;
+            }
+            Command::AddCategory => self.reveal_new(NewThing::Category),
+            Command::AddItem => {
+                if let Some(cat) = self.add_item_target() {
+                    self.reveal_new(NewThing::Item(cat));
+                }
+            }
+            Command::AddInputMeasure => self.reveal_new(NewThing::Input),
+            Command::Rename => {
+                if let Some(t) = self.edit_target() {
+                    self.start_rename(t);
+                }
+            }
+            Command::Delete => {
+                if let Some(t) = self.edit_target() {
+                    match self.delete_question(t) {
+                        Ok(q) => self.confirm_delete = Some((t, q)),
+                        Err(e) => self.status = e,
+                    }
+                }
+            }
+            Command::ModelBrowser => self.show_browser = !self.show_browser,
+            Command::SaveModel => {
+                // Every category, item, measure, view and the meta, plus
+                // what a failed autosave left: not a pass over every cell.
+                let structure = improv_store::ChangeSet {
+                    structure: true,
+                    ..Default::default()
+                };
+                self.status = match self.save_changes(&structure) {
+                    Ok(()) if self.saving.is_none() => "saved model".into(),
+                    Ok(()) => SAVING.into(),
+                    Err(e) => e,
+                };
+            }
+            Command::RevertToSaved => {
+                self.status = match self.revert_to_saved() {
+                    Ok(()) => "reverted to the saved model".into(),
+                    Err(e) => e,
+                };
+            }
+            // The worksheet takes egui's clipboard events (handle_grid_keys);
+            // the menu rows ask the platform for the same ones.
+            Command::Copy => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy),
+            Command::Cut => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut),
+            Command::CloseModel => self.status = self.close_model(),
+            Command::Paste => ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste),
+            Command::SelectAll => {
+                let (rows, cols) = self.focused().grid_dims(&self.model);
+                let m = self.focused_mut();
+                m.anchor = Some((0, 0));
+                m.cursor_row = rows.saturating_sub(1);
+                m.cursor_col = cols.saturating_sub(1);
+                m.part = SelPart::Both { rows: true };
+            }
+            // A cell selection's items are its rows' (Improv: the items
+            // adjacent to it); Cells Only drops the items.
+            Command::SelectItems => {
+                let m = self.focused_mut();
+                let rows = match m.part {
+                    SelPart::Both { rows } | SelPart::Items { rows } => rows,
+                    SelPart::Cells => true,
+                };
+                m.part = SelPart::Items { rows };
+                self.status = "items only selected".into();
+            }
+            Command::SelectCells => {
+                self.focused_mut().part = SelPart::Cells;
+                self.status = "cells only selected".into();
+            }
+            Command::Undo => self.undo_with_status(),
+            Command::Redo => self.redo_with_status(),
+            Command::PivotRotate => self.pivot_rotate(),
+            Command::AddMatrix => {
+                let m = self
+                    .selected()
+                    .or_else(|| pick_default_measure(&self.model));
+                self.add_matrix(m);
+            }
+            Command::RemoveMatrix => {
+                let i = self.focus_index();
+                self.remove_matrix(i);
+            }
+            Command::SaveView => {
+                // Save under the browser's name box, or a generated name
+                // whose rename line opens, so typing names it (H1-15).
+                let typed = !self.view_name.trim().is_empty();
+                let name = if typed {
+                    self.view_name.clone()
+                } else {
+                    format!("view {}", self.model.views.len() + 1)
+                };
+                if let Some(id) = self.save_view(&name) {
+                    self.view_name.clear();
+                    if !typed {
+                        self.start_rename(Thing::View(id));
+                    }
+                }
+            }
+            Command::OpenView(i) => {
+                if let Some(&(id, _, _)) = self.document_tabs().get(i) {
+                    self.open_view(id);
+                }
+            }
+            Command::Decimals(d) => {
+                self.status = self.set_number_format(Some(d)).unwrap_or_else(|e| e);
+            }
+            Command::Grouping => self.status = self.set_number_format(None).unwrap_or_else(|e| e),
+            Command::NewGraph => self.show_chart = true,
+            Command::Recalculate => self.recalculate(),
+            Command::ToggleCsv => self.toggle_csv_wizard(),
+            Command::FunctionHelp => self.fn_help.toggle(),
+            Command::Keys => self.show_keys = !self.show_keys,
+            Command::UserGuide => {
+                ctx.open_url(egui::OpenUrl::new_tab(USER_GUIDE));
+                self.status = format!("opening the user guide, {USER_GUIDE}");
+            }
+            Command::Hide => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            Command::Quit => {
+                if self.quit_allowed() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// Recompute every formula: the formula pane's Calc and Worksheet ▸
+    /// Recalculate. In the background, "Recalculating…" shows until it lands.
+    fn recalculate(&mut self) {
+        self.rebuild_engine();
+        if self.building.is_none() {
+            self.status = "recalculated".into();
+        }
+    }
+
+    /// Show the model browser at `what`'s "new …" line, focused.
+    fn reveal_new(&mut self, what: NewThing) {
+        self.show_browser = true;
+        self.reveal = Some(what);
+    }
+
+    /// The category Edit ▸ Add Item adds to: the focused worksheet's
+    /// first row category, else the model's first.
+    fn add_item_target(&self) -> Option<CategoryId> {
+        self.focused()
+            .row_cats(&self.model)
+            .first()
+            .copied()
+            .or_else(|| self.model.categories.keys().min_by_key(|c| c.0).copied())
+    }
+
+    /// Run a "new …" line's add. On success clear the line and keep it
+    /// focused for the next name, so a list of items is typed in a row.
+    fn run_add(&mut self, ctx: &egui::Context, field: egui::Id, what: NewThing, name: &str) {
+        self.status = match self.add_named(what, name) {
+            Ok(msg) => {
+                ctx.data_mut(|d| d.remove::<String>(field));
+                ctx.memory_mut(|m| m.request_focus(field));
+                msg
+            }
+            Err(e) => e,
+        };
+    }
+
+    /// File ▸ New, Open… and Save As…: a NeXT panel asking for a store file
+    /// or a `postgres://` URL. Enter or the button switches models (or saves
+    /// this one there); an error stays in the status line and the panel
+    /// stays open.
+    fn file_panel(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let Some(mode) = self.file_panel else {
+            return;
+        };
+        let new = mode == Command::NewModel;
+        let save = mode == Command::SaveAs;
+        let (title, prompt, button) = match mode {
+            Command::NewModel => (
+                "New",
+                "New model file or postgres:// URL (empty: in memory):",
+                "Create",
+            ),
+            Command::SaveAs => (
+                "Save As",
+                "Save the model to a new file or postgres:// URL:",
+                "Save",
+            ),
+            _ => ("Open", "Model file or postgres:// URL:", "Open"),
+        };
+        let mut open = true;
+        let mut go = false;
+        let mut escape = false;
+        let rect = egui::Rect::from_center_size(ws.center(), egui::vec2(380.0, 112.0));
+        let win = crate::nxwin::NxWindow::new("file_panel", title);
+        let rect = anchored_rect(ctx, win.id(), rect);
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(prompt);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.file_path)
+                        .id(egui::Id::unique("file_path"))
+                        .desired_width(f32::INFINITY),
+                );
+                a11y_name(&resp, "Model file or postgres URL");
+                go = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                // Asked for until it has it: the window's first frame is a
+                // sizing pass, whose widgets give the keyboard up.
+                if self.file_focus {
+                    self.file_focus = !resp.has_focus();
+                    resp.request_focus();
+                }
+                // Escape closes it, from the field too (H1-12).
+                escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                ui.horizontal(|ui| {
+                    go |= ui.button(button).clicked();
+                    if !save && self.db.is_empty() && self.can_undo() {
+                        ui.label("The in-memory model's edits will be lost.");
+                    }
+                });
+            });
+        if go {
+            let path = self.file_path.trim().to_owned();
+            let done = if save {
+                self.save_as(&path).map(|()| {
+                    self.file_panel = None;
+                    format!("saved to {path}")
+                })
+            } else {
+                // A new app: its panel is closed.
+                self.switch_model(&path, new).map(|()| {
+                    if path.is_empty() {
+                        "new in-memory model".into()
+                    } else {
+                        format!("opened {path}")
+                    }
+                })
+            };
+            self.status = done.unwrap_or_else(|e| e);
+        } else if !open || escape {
+            self.file_panel = None;
+        }
+    }
+
+    /// Replace this window's model with the one at `path` (File ▸ Open…), or
+    /// with an empty one there (File ▸ New; `""` is in memory). Open refuses
+    /// a missing file rather than creating it; New refuses a store that
+    /// already holds a model. On failure nothing changes.
+    pub fn switch_model(&mut self, path: &str, new: bool) -> Result<(), String> {
+        let is_file = !path.is_empty() && !improv_store::is_postgres(path);
+        if !new && path.is_empty() {
+            return Err("type a model file or postgres:// URL".into());
+        }
+        if !new && is_file && !std::path::Path::new(path).exists() {
+            return Err(format!("no model at {path}"));
+        }
+        // The running save lands first; a change no save wrote is not
+        // dropped by opening another model.
+        if self.finish_saves().is_err() || (!self.db.is_empty() && !self.unsaved.is_empty()) {
+            return Err(
+                "this model has changes that are not saved: File ▸ Save them, or \
+                File ▸ Revert to Saved to drop them, first"
+                    .into(),
+            );
+        }
+        let mut next = ImprovApp::open(path)?;
+        if new || !self.background {
+            next.finish_load()?;
+        }
+        if new && !(next.model.categories.is_empty() && next.model.measures.is_empty()) {
+            return Err(format!("{path} already holds a model; use File ▸ Open…"));
+        }
+        next.locale = self.locale.clone();
+        next.menu = self.menu;
+        *self = next;
+        Ok(())
+    }
+
+    /// File ▸ Save As… (and Save on an in-memory model): write the whole
+    /// model to `path`, a store file or `postgres://` URL, and make it this
+    /// window's store; the undo history stays, and later edits autosave
+    /// there. Refuses a store that already holds a model; `path` naming the
+    /// current store saves it. On failure nothing changes.
+    pub fn save_as(&mut self, path: &str) -> Result<(), String> {
+        if path.is_empty() {
+            return Err("type a model file or postgres:// URL".into());
+        }
+        if path == self.db {
+            let all = improv_store::ChangeSet {
+                structure: true,
+                ..Default::default()
+            };
+            return self.save_changes(&all);
+        }
+        // shortcut: Save As writes the whole model on the UI thread (seconds
+        // at 1M cells); queue it too if that shows.
+        let _ = self.finish_saves();
+        let _ = self.model_mut();
+        let mut store = Store::open(path).map_err(save_error)?;
+        let there = store.load_model().map_err(save_error)?;
+        if !(there.categories.is_empty() && there.measures.is_empty()) {
+            return Err(format!("{path} already holds a model; choose another path"));
+        }
+        store.save_model(&self.model).map_err(save_error)?;
+        self.db = path.to_owned();
+        // Another store: listen to it (if it notifies) from the next frame.
+        (self.heard, self.listened, self.data_seen) = (None, false, None);
+        self.save_token = store.take_save_token();
+        self.unsaved = Default::default();
+        // The new store has everything; what the old one refused is moot.
+        (self.save_failed, self.save_lost, self.save_wanted) = (false, false, false);
+        self.outside = None;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Add a category, an item of one, or an input measure named `name`, as
+    /// one undoable, autosaved step. A new input measure ranges over every
+    /// category, or over the ones listed as `Name: Category, Category` (the
+    /// TUI's form, H1-6), and is shown if the focused worksheet shows
+    /// nothing. Returns the status line; refused, nothing changes (a failed
+    /// save keeps it, see [`Self::save_changes`]).
+    pub fn add_named(&mut self, what: NewThing, name: &str) -> Result<String, String> {
+        let (name, listed) = match what {
+            NewThing::Input => match name.split_once(':') {
+                Some((n, list)) => (n.trim(), Some(list)),
+                None => (name.trim(), None),
+            },
+            _ => (name.trim(), None),
+        };
+        if name.is_empty() {
+            return Err(match what {
+                NewThing::Input => "type Name, or Name: Category, Category".into(),
+                _ => "type a name".into(),
+            });
+        }
+        if what == NewThing::Input && name.contains(',') {
+            return Err(format!(
+                "{name:?}: a measure's name cannot hold a comma (type Name: Category, \
+                 Category to choose its categories)"
+            ));
+        }
+        // Formulas name categories and measures alike, so neither may clash.
+        let taken = self.model.category_by_name(name).is_some()
+            || self.model.measure_by_name(name).is_some()
+            || self.model.lambda_by_name(name).is_some();
+        let mut candidate = structure_of(self.model_mut());
+        let mut shown = None;
+        let msg = match what {
+            NewThing::Category | NewThing::Input if taken => {
+                return Err(format!("{name:?} is already a category, measure or LAMBDA"));
+            }
+            NewThing::Category => {
+                let id = CategoryId(next_id(self.model.categories.keys().map(|c| c.0)));
+                candidate.add_category(id, name);
+                format!("added category {name}")
+            }
+            NewThing::Item(c) => {
+                let cat = self
+                    .model
+                    .categories
+                    .get(&c)
+                    .ok_or_else(|| format!("no category with id {}", c.0))?;
+                let model = &self.model;
+                if cat
+                    .items
+                    .iter()
+                    .any(|i| model.items.get(i).is_some_and(|it| it.name.0 == name))
+                {
+                    return Err(format!("{} already has an item {name:?}", cat.name.0));
+                }
+                let id = ItemId(next_id(self.model.items.keys().map(|i| i.0)));
+                candidate.add_item(id, c, name);
+                format!("added {name} to {}", cat.name.0)
+            }
+            NewThing::Input => {
+                let categories = match listed {
+                    Some(list) => self.categories_named(list)?,
+                    None => {
+                        let mut all: Vec<CategoryId> =
+                            self.model.categories.keys().copied().collect();
+                        all.sort_by_key(|c| c.0);
+                        all
+                    }
+                };
+                let id = MeasureId(self.next_measure_id());
+                candidate.add_measure(Measure {
+                    id,
+                    name: Name(name.to_owned()),
+                    value_type: ValueType::Number,
+                    categories,
+                    kind: MeasureKind::Input,
+                    description: None,
+                    format: None,
+                });
+                shown = Some(id);
+                format!("added input measure {name}")
+            }
+        };
+        self.publish_structure(candidate)?;
+        if self.selected().is_none() {
+            self.focused_mut().select(shown);
+        }
+        Ok(msg)
+    }
+
+    /// The Info panel's category boxes (H1-6): make input measure `id` range
+    /// over `cats`. A category added puts the measure's cells at its first
+    /// item; one removed keeps the cells at its first item and drops the
+    /// rest. The formulas that read the measure take their new shape, and
+    /// one that no longer compiles refuses the change. One undoable,
+    /// autosaved step; refused, nothing changes (a failed save keeps it, see
+    /// [`Self::save_changes`]).
+    pub fn set_input_categories(
+        &mut self,
+        id: MeasureId,
+        cats: Vec<CategoryId>,
+    ) -> Result<String, String> {
+        let model = &*self.model_mut();
+        let m = model
+            .measures
+            .get(&id)
+            .ok_or("the measure no longer exists")?;
+        let name = m.name.0.clone();
+        if m.is_derived() {
+            return Err(format!("{name}'s categories come from its formula"));
+        }
+        if model.sql_sources.contains_key(&id) || model.external_calls.contains_key(&id) {
+            return Err(format!("{name}'s categories come from its source"));
+        }
+        if m.categories == cats {
+            return Ok(format!("{name} is unchanged"));
+        }
+        let cat = |c: CategoryId| model.categories.get(&c);
+        // The grid lists items by id: the first is the lowest.
+        let first =
+            |c: CategoryId| cat(c).and_then(|x| x.items.iter().min_by_key(|i| i.0).copied());
+        let has_cells = model.inputs.keys().any(|(m, _)| *m == id);
+        let mut pins = Vec::new();
+        for c in cats.iter().filter(|c| !m.categories.contains(c)) {
+            let what = cat(*c).ok_or_else(|| format!("no category with id {}", c.0))?;
+            match first(*c) {
+                Some(i) => pins.push((*c, i)),
+                None if has_cells => {
+                    return Err(format!("{} has no items: add one first", what.name.0));
+                }
+                None => {}
+            }
+        }
+        let keep: Vec<(CategoryId, Option<ItemId>)> = m
+            .categories
+            .iter()
+            .filter(|c| !cats.contains(c))
+            .map(|&c| (c, first(c)))
+            .collect();
+        let moved = |at: &improv_core_model::Coordinate| {
+            let mut at = at.clone();
+            for (c, first) in &keep {
+                if at.dims.remove(c).is_some_and(|i| Some(i) != *first) {
+                    return None;
+                }
+            }
+            at.dims.extend(pins.iter().copied());
+            Some(at)
+        };
+        let mut c = model.clone();
+        let mut dropped = 0;
+        let mine: Vec<_> = c.inputs.extract_if(|(m, _), _| *m == id).collect();
+        for ((m, at), v) in mine {
+            match moved(&at) {
+                Some(at) => drop(c.inputs.insert((m, at), v)),
+                None => dropped += 1,
+            }
+        }
+        for s in c.scenarios.values_mut() {
+            let mine: Vec<_> = s.overrides.extract_if(|(m, _), _| *m == id).collect();
+            for ((m, at), v) in mine {
+                if let Some(at) = moved(&at) {
+                    s.overrides.insert((m, at), v);
+                }
+            }
+        }
+        if let Some(m) = c.measures.get_mut(&id) {
+            m.categories = cats;
+        }
+        reshape_dependents(&mut c, id)?;
+        self.publish(c)?;
+        self.after_history_restore();
+        Ok(match dropped {
+            0 => format!("{name}'s categories changed"),
+            n => format!(
+                "{name}'s categories changed; {} at other items dropped",
+                plural(n, "cell")
+            ),
+        })
+    }
+
+    /// The categories `list` names, comma-separated, in its order: an
+    /// unknown or repeated name is an error.
+    fn categories_named(&self, list: &str) -> Result<Vec<CategoryId>, String> {
+        let mut ids = Vec::new();
+        for c in list.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+            let id = self
+                .model
+                .category_by_name(c)
+                .ok_or_else(|| format!("no category {c:?} (Edit ▸ Add Category adds one)"))?
+                .id;
+            if ids.contains(&id) {
+                return Err(format!("{c} is listed twice"));
+            }
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// `t`'s kind and name; `None` when the model has no such thing.
+    fn thing_name(&self, t: Thing) -> Option<(&'static str, &str)> {
+        let m = &self.model;
+        match t {
+            Thing::Category(c) => m
+                .categories
+                .get(&c)
+                .map(|x| ("category", x.name.0.as_str())),
+            Thing::Item(i) => m.items.get(&i).map(|x| ("item", x.name.0.as_str())),
+            Thing::Measure(id) => m.measures.get(&id).map(|x| ("measure", x.name.0.as_str())),
+            Thing::View(v) => m.views.get(&v).map(|x| ("view", x.name.0.as_str())),
+        }
+    }
+
+    /// What Edit ▸ Rename and Delete… act on: the browser's pick while
+    /// it exists, else the focused worksheet's measure.
+    fn edit_target(&self) -> Option<Thing> {
+        self.browser_pick
+            .filter(|t| self.thing_name(*t).is_some())
+            .or_else(|| self.selected().map(Thing::Measure))
+    }
+
+    /// Open `t`'s rename line in the model browser.
+    fn start_rename(&mut self, t: Thing) {
+        if let Some((_, name)) = self.thing_name(t) {
+            self.renaming = Some((t, name.to_owned(), true));
+            self.browser_pick = Some(t);
+            self.show_browser = true;
+        }
+    }
+
+    /// Rename a category, item or measure, as one undoable, autosaved step.
+    /// Formulas hold ids, so they follow the new name. The clash rules are
+    /// [`Self::add_named`]'s. Returns the status line; refused, nothing
+    /// changes (a failed save keeps it, see [`Self::save_changes`]).
+    pub fn rename(&mut self, t: Thing, name: &str) -> Result<String, String> {
+        let name = name.trim();
+        let Some((kind, old)) = self.thing_name(t) else {
+            return Err("it no longer exists".into());
+        };
+        let old = old.to_owned();
+        if name.is_empty() {
+            return Err("type a name".into());
+        }
+        if name == old {
+            return Ok(format!("{old} is unchanged"));
+        }
+        let m = &self.model;
+        let taken = |me: Thing| {
+            m.category_by_name(name)
+                .is_some_and(|c| me != Thing::Category(c.id))
+                || m.measure_by_name(name)
+                    .is_some_and(|x| me != Thing::Measure(x.id))
+                || m.lambda_by_name(name).is_some()
+        };
+        if let Thing::Item(i) = t {
+            let cat = m
+                .items
+                .get(&i)
+                .and_then(|it| m.categories.get(&it.category));
+            let dup = cat.is_some_and(|cat| {
+                cat.items
+                    .iter()
+                    .any(|j| *j != i && m.items.get(j).is_some_and(|it| it.name.0 == name))
+            });
+            if let (true, Some(cat)) = (dup, cat) {
+                return Err(format!("{} already has an item {name:?}", cat.name.0));
+            }
+        } else if let Thing::View(v) = t {
+            // Views have names of their own: only another view's clashes.
+            if m.view_by_name(name).is_some_and(|x| x.id != v) {
+                return Err(format!("a view is already named {name:?}"));
+            }
+        } else if taken(t) {
+            return Err(format!("{name:?} is already a category, measure or LAMBDA"));
+        }
+        let mut candidate = structure_of(self.model_mut());
+        let slot = match t {
+            Thing::Category(c) => candidate.categories.get_mut(&c).map(|x| &mut x.name),
+            Thing::Item(i) => candidate.items.get_mut(&i).map(|x| &mut x.name),
+            Thing::Measure(id) => candidate.measures.get_mut(&id).map(|x| &mut x.name),
+            Thing::View(v) => candidate.views.get_mut(&v).map(|x| &mut x.name),
+        };
+        if let Some(n) = slot {
+            *n = Name(name.to_owned());
+        }
+        self.publish_structure(candidate)?;
+        Ok(format!("renamed {kind} {old} to {name}"))
+    }
+
+    /// Why `t` cannot be deleted, naming what still needs it: the formulas
+    /// that read a measure, the measures that range over or name a category.
+    /// `None` when nothing does (an item never blocks: its cells go with it).
+    fn delete_blockers(&self, t: Thing) -> Option<String> {
+        let m = &self.model;
+        let (_, name) = self.thing_name(t)?;
+        let reads = |x: &Measure, id: MeasureId| {
+            matches!(&x.kind, MeasureKind::Derived(f) if f.referenced_measures().contains(&id))
+                || m.external_calls
+                    .get(&x.id)
+                    .is_some_and(|c| c.arg_measures.contains(&id))
+        };
+        let uses = |x: &Measure, c: CategoryId| {
+            x.categories.contains(&c)
+                || matches!(&x.kind, MeasureKind::Derived(f) if expr_names_category(&f.expr, c))
+        };
+        let (mut users, verb): (Vec<&str>, [&str; 2]) = match t {
+            Thing::Item(_) | Thing::View(_) => return None,
+            Thing::Measure(id) => (
+                m.measures
+                    .values()
+                    .filter(|x| x.id != id && reads(x, id))
+                    .map(|x| x.name.0.as_str())
+                    .collect(),
+                ["references", "reference"],
+            ),
+            Thing::Category(c) => (
+                m.measures
+                    .values()
+                    .filter(|x| uses(x, c))
+                    .map(|x| x.name.0.as_str())
+                    .collect(),
+                ["uses", "use"],
+            ),
+        };
+        if users.is_empty() {
+            return None;
+        }
+        users.sort_unstable();
+        let one = users.len() == 1;
+        Some(format!(
+            "cannot delete {name}: {} still {} it (delete or redefine {} first)",
+            users.join(", "),
+            verb[usize::from(!one)],
+            if one { "it" } else { "them" }
+        ))
+    }
+
+    /// Edit ▸ Delete…'s question for `t`, saying what goes with it, or
+    /// why it cannot be deleted.
+    fn delete_question(&self, t: Thing) -> Result<String, String> {
+        if self.thing_name(t).is_none() {
+            return Err("it no longer exists".into());
+        }
+        if let Some(why) = self.delete_blockers(t) {
+            return Err(why);
+        }
+        let m = &self.model;
+        let cells = |hit: &dyn Fn(&(MeasureId, improv_core_model::Coordinate)) -> bool| {
+            plural(m.inputs.keys().filter(|k| hit(k)).count(), "cell")
+        };
+        Ok(match t {
+            Thing::Measure(id) if m.measures[&id].is_derived() => {
+                format!("Delete the formula {}?", m.measures[&id].name.0)
+            }
+            Thing::Measure(id) => format!(
+                "Delete the input measure {} and its {}?",
+                m.measures[&id].name.0,
+                cells(&|(k, _)| *k == id)
+            ),
+            Thing::Item(i) => format!(
+                "Delete the item {} of {} and its {}?",
+                m.items[&i].name.0,
+                m.categories
+                    .get(&m.items[&i].category)
+                    .map_or("?", |c| c.name.0.as_str()),
+                cells(&|(_, at)| at.dims.values().any(|j| *j == i))
+            ),
+            Thing::Category(c) => format!(
+                "Delete the category {} and its {}?",
+                m.categories[&c].name.0,
+                plural(m.categories[&c].items.len(), "item")
+            ),
+            Thing::View(v) => format!(
+                "Delete the view {}? Its worksheets stay open.",
+                m.views[&v].name.0
+            ),
+        })
+    }
+
+    /// Delete a category (once no measure uses it) with its items, an item
+    /// with its cells, a measure (once no formula reads it) with its
+    /// cells, or a saved view (the canvas stays as it is), as one
+    /// undoable, autosaved step. Saved views lose a deleted measure's
+    /// matrices (a view left with none goes) and a deleted item's filter
+    /// and page entries. Returns the status line; refused, nothing changes
+    /// (a failed save keeps it, see [`Self::save_changes`]).
+    pub fn delete(&mut self, t: Thing) -> Result<String, String> {
+        let Some((kind, name)) = self.thing_name(t) else {
+            return Err("it no longer exists".into());
+        };
+        let msg = format!("deleted {kind} {name}");
+        if let Some(why) = self.delete_blockers(t) {
+            return Err(why);
+        }
+        if let Thing::View(v) = t {
+            // A view holds no cells: change the structure alone.
+            let mut s = structure_of(self.model_mut());
+            s.views.remove(&v);
+            self.publish_structure(s)?;
+            self.browser_pick = None;
+            self.current_view = self.current_view.filter(|c| *c != v);
+            return Ok(msg);
+        }
+        let mut c = self.model_mut().clone();
+        match t {
+            Thing::Measure(id) => {
+                c.measures.remove(&id);
+                c.inputs.retain(|(m, _), _| *m != id);
+                c.sql_sources.remove(&id);
+                c.external_calls.remove(&id);
+                for s in c.scenarios.values_mut() {
+                    s.overrides.retain(|(m, _), _| *m != id);
+                }
+                c.views = std::mem::take(&mut c.views)
+                    .into_iter()
+                    .filter_map(|(vid, v)| {
+                        let left: Vec<MatrixPlacement> = v
+                            .matrices()
+                            .into_iter()
+                            .filter(|p| p.measure != id)
+                            .collect();
+                        let mut left = left.into_iter();
+                        let primary = left.next()?;
+                        Some((
+                            vid,
+                            View::from_matrices(vid, v.name, primary, left.collect()),
+                        ))
+                    })
+                    .collect();
+            }
+            Thing::Item(i) => {
+                let cat = c.items.remove(&i).map(|x| x.category);
+                if let Some(cat) = cat.and_then(|k| c.categories.get_mut(&k)) {
+                    cat.items.retain(|j| *j != i);
+                }
+                let gone = |at: &improv_core_model::Coordinate| at.dims.values().any(|j| *j == i);
+                c.inputs.retain(|(_, at), _| !gone(at));
+                for s in c.scenarios.values_mut() {
+                    s.overrides.retain(|(_, at), _| !gone(at));
+                }
+                for v in c.views.values_mut() {
+                    scrub_item(&mut v.filters, &mut v.page_items, i);
+                    for p in &mut v.placements {
+                        scrub_item(&mut p.filters, &mut p.page_items, i);
+                    }
+                }
+            }
+            Thing::Category(cat) => {
+                for i in c
+                    .categories
+                    .remove(&cat)
+                    .map(|x| x.items)
+                    .unwrap_or_default()
+                {
+                    c.items.remove(&i);
+                }
+            }
+            Thing::View(_) => {}
+        }
+        self.publish(c)?;
+        self.browser_pick = None;
+        for m in &mut self.matrices {
+            for f in &mut m.filters {
+                f.items.retain(|j| self.model.items.contains_key(j));
+            }
+        }
+        self.after_history_restore();
+        Ok(msg)
+    }
+
+    /// Edit ▸ Delete…'s confirmation: a NeXT panel asking the question,
+    /// with Delete (it takes the keyboard, so Enter or Space confirms) and
+    /// Cancel (also Esc or the close box).
+    fn delete_panel(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let Some((t, question)) = self.confirm_delete.clone() else {
+            return;
+        };
+        let mut open = true;
+        let (mut yes, mut no) = (false, false);
+        let rect = egui::Rect::from_center_size(ws.center(), egui::vec2(360.0, 104.0));
+        let win = crate::nxwin::NxWindow::new("delete_panel", "Delete");
+        let rect = anchored_rect(ctx, win.id(), rect);
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(&question);
+                ui.label("Edit ▸ Undo brings it back.");
+                ui.horizontal(|ui| {
+                    let del = ui.button("Delete");
+                    if ctx.memory(|m| m.focused().is_none()) {
+                        del.request_focus();
+                    }
+                    yes = del.clicked();
+                    no = ui.button("Cancel").clicked();
+                });
+            });
+        no |= !open || ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if yes {
+            self.confirm_delete = None;
+            self.status = self.delete(t).unwrap_or_else(|e| e);
+        } else if no {
+            self.confirm_delete = None;
+        }
+    }
+
+    /// Whether Quit may close now. It waits for the queued saves first
+    /// (H3). Edits that are not saved (an in-memory model's, or a store
+    /// model's whose save failed) only warn and arm the first Quit; a second
+    /// one closes.
+    fn quit_allowed(&mut self) -> bool {
+        if self.db.is_empty() && self.can_undo() && !self.quit_armed {
+            self.quit_armed = true;
+            self.status = "unsaved in-memory model: Quit again to discard".into();
+            return false;
+        }
+        self.close_allowed()
+    }
+
+    /// Whether the window may close (Quit, or its close box): once the
+    /// running save has landed, unless a store model has changes no save
+    /// wrote. Then the first close warns and arms; a second one closes.
+    fn close_allowed(&mut self) -> bool {
+        let failed = self.finish_saves().err();
+        if self.quit_armed {
+            return true;
+        }
+        if !self.db.is_empty() && !self.unsaved.is_empty() {
+            self.quit_armed = true;
+            self.status = format!(
+                "{} Quit again to discard the change.",
+                failed.unwrap_or_else(|| "some changes are not saved.".into())
+            );
+            return false;
+        }
+        true
+    }
+
+    /// The model browser (spec §4.2): a NeXT window, `<file> - Model`, at the
+    /// workspace's bottom left, listing Categories (with their items),
+    /// Measures (input vs derived; clicking one selects it) and Views.
+    /// File ▸ Model Browser… shows and hides it.
+    fn model_browser(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let mut open = self.show_browser;
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(ws.left(), ws.bottom() - 300.0),
+            egui::vec2(260.0, 300.0),
+        );
+        let win = crate::nxwin::NxWindow::new("browser", format!("{} - Model", self.file_name()));
+        let rect = anchored_rect(ctx, win.id(), rect);
+        // Kept until the line holds the keyboard: a window's first frame
+        // is a sizing pass, whose disabled widgets give focus up.
+        let reveal = self.reveal;
+        let mut rename = self.renaming.take();
+        let renaming = rename.as_ref().map(|r| r.0);
+        let rename_cat = match renaming {
+            Some(Thing::Item(i)) => self.model.items.get(&i).map(|it| it.category),
+            _ => None,
+        };
+        let pick_now = self.browser_pick;
+        // This frame's clicks: a row picked, a row double-clicked to rename,
+        // and the rename line's outcome.
+        let (mut picked, mut start, mut done) = (None, None, None);
+        let mut add: Option<NewThing> = None;
+        let mut add_name = String::new();
+        let mut pick = |what: NewThing, name: Option<String>| {
+            if let Some(n) = name {
+                add = Some(what);
+                add_name = n;
+            }
+        };
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(true)
+            .show(ctx, |ui| {
+                crate::theme::next_scroll(
+                    ui,
+                    egui::ScrollArea::vertical().auto_shrink(false),
+                    |ui| {
+                        if let Some(d) = self.views_section(ui, &mut rename) {
+                            done = Some(d);
+                        }
+
+                        egui::CollapsingHeader::new("Categories")
+                            .default_open(false)
+                            .open(
+                                (matches!(reveal, Some(NewThing::Category | NewThing::Item(_)))
+                                    || matches!(
+                                        renaming,
+                                        Some(Thing::Category(_) | Thing::Item(_))
+                                    ))
+                                .then_some(true),
+                            )
+                            .show(ui, |ui| {
+                                let mut cats: Vec<CategoryId> =
+                                    self.model.categories.keys().copied().collect();
+                                cats.sort_by_key(|c| c.0);
+                                for cid in cats {
+                                    let cat = &self.model.categories[&cid];
+                                    let me = Thing::Category(cid);
+                                    if let Some((_, buf, focus)) =
+                                        rename.as_mut().filter(|r| r.0 == me)
+                                    {
+                                        done = rename_line(ui, buf, focus).map(|r| (me, r));
+                                        continue;
+                                    }
+                                    let open = reveal == Some(NewThing::Item(cid))
+                                        || rename_cat == Some(cid);
+                                    let header = egui::CollapsingHeader::new(&cat.name.0)
+                                        .id_salt(("cat", cid.0))
+                                        .open(open.then_some(true))
+                                        .show(ui, |ui| {
+                                            let mut items = cat.items.clone();
+                                            items.sort_by_key(|i| i.0);
+                                            ui.scope(|ui| {
+                                                white_selection(ui);
+                                                for iid in items {
+                                                    let Some(it) = self.model.items.get(&iid)
+                                                    else {
+                                                        continue;
+                                                    };
+                                                    let me = Thing::Item(iid);
+                                                    if let Some((_, buf, focus)) =
+                                                        rename.as_mut().filter(|r| r.0 == me)
+                                                    {
+                                                        done = rename_line(ui, buf, focus)
+                                                            .map(|r| (me, r));
+                                                        continue;
+                                                    }
+                                                    let r = ui.selectable_label(
+                                                        pick_now == Some(me),
+                                                        &it.name.0,
+                                                    );
+                                                    // The first click picked it: two
+                                                    // quick clicks on two rows are no
+                                                    // double-click.
+                                                    if r.double_clicked() && pick_now == Some(me) {
+                                                        start = Some(me);
+                                                    } else if r.clicked() {
+                                                        picked = Some(me);
+                                                    }
+                                                }
+                                            });
+                                            let what = NewThing::Item(cid);
+                                            let f = reveal == Some(what);
+                                            pick(what, add_line(ui, what.field(), "New item", f));
+                                        })
+                                        .header_response;
+                                    // A double-click toggles a header twice, so a
+                                    // category renames through Edit ▸ Rename.
+                                    if header.clicked() {
+                                        picked = Some(me);
+                                    }
+                                }
+                                let what = NewThing::Category;
+                                let f = reveal == Some(what);
+                                pick(what, add_line(ui, what.field(), "New category", f));
+                            });
+
+                        egui::CollapsingHeader::new("Measures")
+                            .default_open(true)
+                            .open(
+                                (reveal == Some(NewThing::Input)
+                                    || matches!(renaming, Some(Thing::Measure(_))))
+                                .then_some(true),
+                            )
+                            .show(ui, |ui| {
+                                let mut ids: Vec<MeasureId> =
+                                    self.model.measures.keys().copied().collect();
+                                ids.sort_by_key(|m| m.0);
+                                ui.scope(|ui| {
+                                    white_selection(ui);
+                                    for id in ids {
+                                        let m = &self.model.measures[&id];
+                                        let kind = if m.is_derived() { "formula" } else { "input" };
+                                        let name = m.name.0.clone();
+                                        let sel = self.selected() == Some(id);
+                                        let me = Thing::Measure(id);
+                                        if let Some((_, buf, focus)) =
+                                            rename.as_mut().filter(|r| r.0 == me)
+                                        {
+                                            done = rename_line(ui, buf, focus).map(|r| (me, r));
+                                            continue;
+                                        }
+                                        ui.horizontal(|ui| {
+                                            let r = ui.selectable_label(sel, name);
+                                            if r.double_clicked() && pick_now == Some(me) {
+                                                start = Some(me);
+                                            } else if r.clicked() {
+                                                self.focused_mut().select(Some(id));
+                                                picked = Some(me);
+                                            }
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    // Clear the window border
+                                                    // and the scroll bar.
+                                                    ui.add_space(8.0);
+                                                    ui.label(
+                                                        egui::RichText::new(kind)
+                                                            .small()
+                                                            .color(crate::theme::DARK_GRAY),
+                                                    );
+                                                },
+                                            );
+                                        });
+                                    }
+                                });
+                                let what = NewThing::Input;
+                                let f = reveal == Some(what);
+                                pick(what, add_line(ui, what.field(), "New input measure", f));
+                            });
+                        if !self.model.lambdas.is_empty() {
+                            egui::CollapsingHeader::new("LAMBDAs").show(ui, |ui| {
+                                for l in self.model.lambdas.values() {
+                                    ui.label(format!("{}({})", l.name.0, l.params.join(", ")));
+                                }
+                            });
+                        }
+                    },
+                );
+            });
+        self.show_browser = open;
+        if reveal.is_some_and(|r| ctx.memory(|m| m.has_focus(r.field()))) {
+            self.reveal = None;
+        }
+        if let Some(what) = add {
+            self.run_add(ctx, what.field(), what, &add_name);
+        }
+        // A closed browser ends a rename: its line is gone.
+        self.renaming = rename.filter(|_| open);
+        if let Some(t) = picked {
+            self.browser_pick = Some(t);
+        }
+        match done {
+            Some((t, Some(name))) => match self.rename(t, &name) {
+                Ok(msg) => {
+                    self.renaming = None;
+                    self.status = msg;
+                }
+                // Refused: the line stays, with the reason in the status.
+                Err(e) => {
+                    self.renaming = Some((t, name, true));
+                    self.status = e;
+                }
+            },
+            Some((_, None)) => self.renaming = None,
+            None => {}
+        }
+        if let Some(t) = start {
+            self.start_rename(t);
+        }
+    }
+
+    /// A saved view's description for the browser: its primary measure, the
+    /// row and column categories, then any pages — `Revenue by Time ×
+    /// Product; pages: Scenario`. Computed (a view stores no description).
+    fn view_description(&self, v: &View) -> String {
+        let Some(m) = self.model.measures.get(&v.measure) else {
+            return format!("{}: measure no longer exists", v.name.0);
+        };
+        let cats = if v.axis_order.is_empty() {
+            &m.categories
+        } else {
+            &v.axis_order
+        };
+        let names: Vec<&str> = cats
+            .iter()
+            .map(|c| {
+                self.model
+                    .categories
+                    .get(c)
+                    .map_or("?", |c| c.name.0.as_str())
+            })
+            .collect();
+        let shown = (v.n_rows + v.n_cols).min(names.len());
+        let mut s = m.name.0.clone();
+        if shown > 0 {
+            s += &format!(" by {}", names[..shown].join(" \u{d7} "));
+        }
+        if shown < names.len() {
+            s += &format!("; pages: {}", names[shown..].join(", "));
+        }
+        s
+    }
+
+    /// Views section at the top of the model browser (spec §4.2): a white list
+    /// of saved views as `Name - Worksheet` rows with a worksheet icon (click
+    /// selects, double-click opens), a description of the selected view, then
+    /// a name field + "Save view" button that captures the current CANVAS.
+    /// A click also picks the view for Edit ▸ Rename and Delete… (H1-15);
+    /// the row being renamed is `rename`'s line, whose outcome it returns.
+    ///
+    /// This is the NeXTSTEP reference's model navigator
+    /// (`docs/reviews/refs/improv-next-nested-headers.jpg`: a `Model of
+    /// Divisional Report` window listing `Worksheet 1` / `Worksheet 2`), and the
+    /// same set the application menu's View submenu lists. The current view is
+    /// highlighted in both.
+    fn views_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        rename: &mut Option<(Thing, String, bool)>,
+    ) -> Option<(Thing, Option<String>)> {
+        use crate::theme::{BLACK, WHITE};
+        let mut ids: Vec<ViewId> = self.model.views.keys().copied().collect();
+        ids.sort_by_key(|v| v.0);
+        if self
+            .browser_sel
+            .is_none_or(|s| !self.model.views.contains_key(&s))
+        {
+            self.browser_sel = self.current_view.or(ids.first().copied());
+        }
+        let box_frame = || {
+            egui::Frame::NONE
+                .fill(WHITE)
+                .stroke(egui::Stroke::new(1.0_f32, BLACK))
+                .inner_margin(2.0)
+        };
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+        // Clear the window border and the scroll bar.
+        let width = ui.available_width() - 8.0;
+        let mut open: Option<View> = None;
+        let mut done = None;
+        box_frame().show(ui, |ui| {
+            ui.set_width(width - 4.0);
+            ui.set_min_height(3.0 * row_h);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for &id in &ids {
+                let me = Thing::View(id);
+                if let Some((_, buf, focus)) = rename.as_mut().filter(|r| r.0 == me) {
+                    done = rename_line(ui, buf, focus).map(|r| (me, r));
+                    continue;
+                }
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), row_h),
+                    egui::Sense::click(),
+                );
+                let v = &self.model.views[&id];
+                resp.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::Role::ListBoxOption,
+                        true,
+                        self.browser_sel == Some(id),
+                        format!("{} - Worksheet", v.name.0),
+                    )
+                });
+                let p = ui.painter();
+                if self.browser_sel == Some(id) {
+                    p.rect_filled(rect, 0.0, crate::theme::LIGHT_GRAY);
+                }
+                p.text(
+                    rect.left_center() + egui::vec2(4.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!("{} - Worksheet", v.name.0),
+                    font.clone(),
+                    BLACK,
+                );
+                // The worksheet icon: a 10×8 sheet with two ruled lines.
+                let icon = egui::Rect::from_center_size(
+                    egui::pos2(rect.right() - 9.0, rect.center().y),
+                    egui::vec2(10.0, 8.0),
+                );
+                let ink = egui::Stroke::new(1.0_f32, BLACK);
+                p.rect_stroke(icon, 0.0, ink, egui::StrokeKind::Middle);
+                for y in [icon.top() + 8.0 / 3.0, icon.top() + 16.0 / 3.0] {
+                    p.hline(icon.x_range(), y, ink);
+                }
+                if resp.clicked() {
+                    self.browser_sel = Some(id);
+                    self.browser_pick = Some(me);
+                }
+                if resp.double_clicked() {
+                    open = Some(v.clone());
+                }
+            }
+        });
+        if let Some(v) = open {
+            self.apply_view(&v);
+        }
+        let desc = match self.browser_sel.and_then(|s| self.model.views.get(&s)) {
+            Some(v) => self.view_description(v),
+            None => "(no saved views)".to_owned(),
+        };
+        ui.add_space(4.0);
+        box_frame().inner_margin(4.0).show(ui, |ui| {
+            ui.set_width(width - 8.0);
+            ui.set_min_height(2.0 * row_h);
+            ui.label(egui::RichText::new(desc).color(BLACK));
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            // Leave the button room in the narrow browser window.
+            let r = ui.add(egui::TextEdit::singleline(&mut self.view_name).desired_width(120.0));
+            a11y_name(&r, "View name");
+            if ui.button("Save view").clicked() {
+                let name = self.view_name.clone();
+                if self.save_view(&name).is_some() {
+                    self.view_name.clear();
+                }
+            }
+        });
+        done
+    }
+
+    /// The Info panel (spec §4.7): a NeXT panel window at the workspace's top
+    /// right showing the selected measure's facts. Info ▸ Info Panel… opens
+    /// it; its close box closes it.
+    fn info_panel(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let mut open = self.show_inspector;
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(ws.right() - 280.0, ws.top()),
+            egui::vec2(280.0, 240.0),
+        );
+        let win = crate::nxwin::NxWindow::new("info", "Info");
+        let rect = anchored_rect(ctx, win.id(), rect);
+        let mut toggle: Option<(MeasureId, CategoryId, bool)> = None;
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let data = self.selected().and_then(|m| self.inspector_data(m));
+                match data {
+                    None => {
+                        ui.label("No measure selected.");
+                    }
+                    Some(d) => {
+                        ui.label(format!("id: {}", d.id.0));
+                        ui.label(format!("name: {}", d.name));
+                        ui.label(format!(
+                            "kind: {}",
+                            if d.is_derived { "derived" } else { "input" }
+                        ));
+                        ui.label(format!("value type: {:?}", d.value_type));
+                        if d.value_type == ValueType::Number {
+                            ui.label(format!("format: {}", d.format.unwrap_or_default()));
+                        }
+                        ui.label(format!(
+                            "dimensions: {}",
+                            if d.dimensions.is_empty() {
+                                "(scalar)".to_string()
+                            } else {
+                                d.dimensions.join(" x ")
+                            }
+                        ));
+                        if !d.is_derived {
+                            // H1-6: a box per category; checked ones are its dimensions.
+                            let have = &self.model.measures[&d.id].categories;
+                            let mut all: Vec<_> = self.model.categories.values().collect();
+                            all.sort_by_key(|c| c.id.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for c in all {
+                                    let mut on = have.contains(&c.id);
+                                    if ui.checkbox(&mut on, c.name.0.as_str()).changed() {
+                                        toggle = Some((d.id, c.id, on));
+                                    }
+                                }
+                            });
+                        }
+                        if d.is_derived {
+                            ui.separator();
+                            ui.label(format!("depends on: {}", d.dependencies.join(", ")));
+                            if let Some(eng) = &d.formula_english {
+                                ui.label(format!("formula: {eng}"));
+                            }
+                            if d.error_cells > 0 {
+                                ui.colored_label(
+                                    crate::formula_highlight::ERROR_COLOR,
+                                    format!("{} cell(s) have errors (#ERR)", d.error_cells),
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        self.show_inspector = open;
+        if let Some((id, c, on)) = toggle {
+            let mut cats = self.model.measures[&id].categories.clone();
+            if on {
+                cats.push(c);
+            } else {
+                cats.retain(|x| *x != c);
+            }
+            self.status = self.set_input_categories(id, cats).unwrap_or_else(|e| e);
+        }
+    }
+
+    /// What the Inspector and the Format panel read: the focused worksheet's
+    /// options and its measure's number format.
+    fn panel_read(&self) -> PanelDraft {
+        let m = self.focused();
+        let f = m
+            .measure
+            .and_then(|id| self.number_format(id))
+            .unwrap_or_default();
+        PanelDraft {
+            from: (m.uid, m.measure),
+            opts: m.opts,
+            decimals: f.decimals,
+            commas: f.grouping,
+        }
+    }
+
+    /// Edit ▸ Inspector…: Improv's Inspector, a NeXT panel whose pop-up
+    /// picks its page: Grid (whether and where the worksheet is ruled),
+    /// Layout (the hidden-items marker) and Formulas (errors under their
+    /// rows). It inspects the focused worksheet and follows the focus; OK
+    /// applies the panel to it, Revert reads it back.
+    fn inspector_panel(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let Some(mut p) = self.inspector else {
+            return;
+        };
+        p.follow(self.panel_read());
+        let home = egui::Rect::from_min_size(
+            egui::pos2(ws.right() - 268.0, ws.top() + 248.0),
+            egui::vec2(260.0, 172.0),
+        );
+        let win = crate::nxwin::NxWindow::new("inspector", "Inspector");
+        let rect = anchored_rect(ctx, win.id(), home);
+        let (mut open, mut ok, mut revert) = (true, false, false);
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.inner_margin(6.0).show(ui, |ui| {
+                    use InspectorPage as I;
+                    page_popup(
+                        ui,
+                        "inspector_page",
+                        &mut p.page,
+                        &[I::Grid, I::Layout, I::Formulas],
+                    );
+                    ui.separator();
+                    let o = &mut p.draft.opts;
+                    match p.page {
+                        I::Grid => {
+                            ui.checkbox(&mut o.lines, "Show Grid Lines");
+                            ui.add_enabled_ui(o.lines, |ui| {
+                                ui.label("Lines In:");
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(&mut o.lines_in, LinesIn::Cells, "Cell Area");
+                                    ui.radio_value(&mut o.lines_in, LinesIn::Items, "Item Area");
+                                    ui.radio_value(&mut o.lines_in, LinesIn::Both, "Both");
+                                });
+                            });
+                        }
+                        I::Layout => {
+                            ui.label("Show Markers:");
+                            ui.checkbox(&mut o.hidden_marker, "Hidden Items");
+                        }
+                        I::Formulas => {
+                            ui.checkbox(&mut o.errors_inline, "Show Errors In Line");
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        ok = ui.button("OK").clicked();
+                        revert = ui.button("Revert").clicked();
+                    });
+                });
+            });
+        if revert {
+            p.draft = p.read;
+        }
+        if ok {
+            if let Some(m) = self.matrices.iter_mut().find(|m| m.uid == p.draft.from.0) {
+                m.opts = p.draft.opts;
+                self.status = "worksheet options set".into();
+            }
+        }
+        self.inspector = open.then_some(p);
+    }
+
+    /// Format ▸ Format Panel… (Command-Shift-f): Improv's Format panel,
+    /// whose pop-up picks Number (General, or Specific decimal places, and
+    /// commas) or Alignment (Smart, Left, Center, Right), over a sample of
+    /// the result. Set applies both pages: the format to the focused
+    /// worksheet's measure (one undo step), the alignment to its cells.
+    fn format_window(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let Some(mut p) = self.format_panel else {
+            return;
+        };
+        p.follow(self.panel_read());
+        let numeric = p
+            .draft
+            .from
+            .1
+            .and_then(|id| self.model.measures.get(&id))
+            .is_some_and(|m| m.value_type == ValueType::Number);
+        let home = egui::Rect::from_min_size(
+            egui::pos2(ws.right() - 548.0, ws.top() + 248.0),
+            egui::vec2(272.0, 180.0),
+        );
+        let win = crate::nxwin::NxWindow::new("format", "Format");
+        let rect = anchored_rect(ctx, win.id(), home);
+        let (mut open, mut set) = (true, false);
+        let locale = &self.locale;
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.inner_margin(6.0).show(ui, |ui| {
+                    use FormatPage as F;
+                    page_popup(ui, "format_page", &mut p.page, &[F::Number, F::Alignment]);
+                    ui.separator();
+                    let d = &mut p.draft;
+                    match p.page {
+                        F::Number if !numeric => {
+                            ui.label("This measure holds no numbers to format.");
+                        }
+                        F::Number => {
+                            let mut specific = d.decimals.is_some();
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut specific, false, "General");
+                                ui.radio_value(&mut specific, true, "Specific");
+                            });
+                            ui.add_enabled_ui(specific, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Decimal Places:");
+                                    let mut n = d.decimals.unwrap_or(2);
+                                    let r = ui.add(
+                                        egui::DragValue::new(&mut n)
+                                            .range(0..=NumberFormat::MAX_DECIMALS),
+                                    );
+                                    a11y_name(&r, "Decimal Places");
+                                    d.decimals = specific.then_some(n);
+                                });
+                            });
+                            ui.checkbox(&mut d.commas, "Commas");
+                        }
+                        F::Alignment => {
+                            ui.horizontal(|ui| {
+                                for (a, name) in [
+                                    (CellAlign::Smart, "Smart"),
+                                    (CellAlign::Left, "Left"),
+                                    (CellAlign::Center, "Center"),
+                                    (CellAlign::Right, "Right"),
+                                ] {
+                                    ui.radio_value(&mut d.opts.align, a, name);
+                                }
+                            });
+                        }
+                    }
+                    // The sample: a number as Set would show it.
+                    let f = NumberFormat {
+                        decimals: d.decimals,
+                        grouping: d.commas,
+                    };
+                    let text = improv_engine::format_number(-1234.5678, Some(&f), locale);
+                    let (r, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 20.0),
+                        egui::Sense::hover(),
+                    );
+                    let pt = ui.painter();
+                    pt.rect(
+                        r,
+                        0.0,
+                        crate::theme::WHITE,
+                        egui::Stroke::new(1.0_f32, crate::theme::BLACK),
+                        egui::StrokeKind::Inside,
+                    );
+                    let (x, anchor) = match d.opts.align {
+                        CellAlign::Left => (r.left() + 4.0, egui::Align2::LEFT_CENTER),
+                        CellAlign::Center => (r.center().x, egui::Align2::CENTER_CENTER),
+                        CellAlign::Smart | CellAlign::Right => {
+                            (r.right() - 4.0, egui::Align2::RIGHT_CENTER)
+                        }
+                    };
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    pt.text(
+                        egui::pos2(x, r.center().y),
+                        anchor,
+                        text,
+                        font,
+                        crate::theme::BLACK,
+                    );
+                    ui.add_space(6.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        set = ui.button("Set").clicked();
+                    });
+                });
+            });
+        if set {
+            self.status = self.format_set(p.draft, numeric);
+        }
+        self.format_panel = open.then_some(p);
+    }
+
+    /// The Format panel's Set: `d`'s alignment to its worksheet, and, for a
+    /// number measure, its format. Returns the status line.
+    fn format_set(&mut self, d: PanelDraft, numeric: bool) -> String {
+        let mut said = Vec::new();
+        if let Some(m) = self.matrices.iter_mut().find(|m| m.uid == d.from.0) {
+            if m.opts.align != d.opts.align {
+                m.opts.align = d.opts.align;
+                said.push(format!("cells aligned {:?}", d.opts.align).to_lowercase());
+            }
+        }
+        let f = NumberFormat {
+            decimals: d.decimals,
+            grouping: d.commas,
+        };
+        let now = d
+            .from
+            .1
+            .and_then(|id| self.number_format(id))
+            .unwrap_or_default();
+        if numeric && f != now {
+            said.push(self.set_format(f).unwrap_or_else(|e| e));
+        }
+        if said.is_empty() {
+            "the format is unchanged".into()
+        } else {
+            said.join("; ")
+        }
+    }
+
+    /// Point for Help's click: taken out of the frame's raw input before
+    /// egui reads it (eframe's `raw_input_hook`), so the click only asks.
+    pub(crate) fn take_help_click(&mut self, raw: &mut egui::RawInput) {
+        if self.pointing {
+            if let Some(at) = crate::help::take_click(raw) {
+                self.pointing = false;
+                self.help_click = Some(at);
+            }
+        }
+    }
+
+    /// Point for Help, each frame: the question-mark pointer while it waits
+    /// (Esc cancels), then the page for what the click landed on.
+    fn point_for_help(&mut self, ctx: &egui::Context) {
+        if self.pointing {
+            ctx.set_cursor_icon(egui::CursorIcon::Help);
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.pointing = false;
+                self.status = "Point for Help cancelled".into();
+            }
+        }
+        if let Some(at) = self.help_click.take() {
+            let layer = ctx.layer_id_at(at);
+            self.help = Some(self.topic_at(layer, Some(at)));
+            self.status.clear();
+        }
+    }
+
+    /// The help page for the window in front (Info ▸ Context Help…): the
+    /// last one raised, as Improv's showed the page for the current window.
+    /// Read from the frame's start ([`Self::front`]): the windows shown
+    /// this frame may already have asked to be raised.
+    fn context_topic(&self) -> crate::help::Topic {
+        self.topic_at(self.front, None)
+    }
+
+    /// The help page for `layer` and, in a worksheet window, the point `at`
+    /// in it: its tiles, its grid or its formula pane.
+    fn topic_at(&self, layer: Option<egui::LayerId>, at: Option<egui::Pos2>) -> crate::help::Topic {
+        use crate::help::topic;
+        const PANELS: &[&str] = &[
+            "browser",
+            "info",
+            "inspector",
+            "format",
+            "print",
+            "page_layout",
+            "report_layout",
+            "graph",
+            "fnhelp",
+            "keys",
+            "file_panel",
+            "delete_panel",
+            "help",
+        ];
+        let Some(layer) = layer else {
+            return crate::help::IMPROV;
+        };
+        let id = layer.id;
+        let menu = menu::menu_id();
+        if id == menu || (0..16).any(|i| id == menu.with(("sub", i))) {
+            return topic("menu");
+        }
+        if let Some(name) = PANELS
+            .iter()
+            .find(|n| id == crate::nxwin::NxWindow::new(**n, "").id())
+        {
+            return topic(name);
+        }
+        let Some(m) = self.matrices.iter().find(|m| matrix_window_id(m.uid) == id) else {
+            return crate::help::IMPROV;
+        };
+        match (at, m.gutters) {
+            (Some(p), Some(g)) if g.top.contains(p) || g.well.contains(p) => topic("tiles"),
+            (Some(p), Some(g)) if p.y > g.well.bottom() => topic("formulas"),
+            _ => topic("worksheet"),
+        }
+    }
+
+    /// The help window: a NeXT panel with the page's title and text, a
+    /// button to its section of the user guide, and Point for Help.
+    fn help_window(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let Some(t) = self.help else {
+            return;
+        };
+        let home = egui::Rect::from_min_size(
+            egui::pos2(ws.center().x - 60.0, ws.bottom() - 168.0),
+            egui::vec2(340.0, 160.0),
+        );
+        let win = crate::nxwin::NxWindow::new("help", "Help");
+        let rect = anchored_rect(ctx, win.id(), home);
+        let (mut open, mut guide, mut point) = (true, false, false);
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.inner_margin(8.0).show(ui, |ui| {
+                    ui.heading(t.title);
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(t.text).wrap());
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        guide = ui.button("More in the User Guide").clicked();
+                        point = ui.button("Point for Help").clicked();
+                    });
+                });
+            });
+        if guide {
+            let url = format!("{}{}", crate::help::GUIDE, t.guide);
+            ctx.open_url(egui::OpenUrl::new_tab(&url));
+            self.status = format!("opening {url}");
+        }
+        if point {
+            self.run_command(ctx, Command::PointForHelp);
+        }
+        self.help = if open { self.help } else { None };
+    }
+
+    /// The focused worksheet as Print… lays it out: its item names and
+    /// cells as they show (the selection only, with `selection`), its
+    /// formulas, and the Inspector's rules.
+    pub(crate) fn print_sheet(&self, selection: bool) -> crate::print::Sheet {
+        use crate::print::{Align, Sheet};
+        let m = self.focused();
+        let Some(measure) = m.measure else {
+            return Sheet::default();
+        };
+        let name = |c: &CategoryId| {
+            self.model
+                .categories
+                .get(c)
+                .map_or_else(|| format!("category {}", c.0), |x| x.name.0.clone())
+        };
+        let row_cats = m.row_cats(&self.model);
+        let col_cats = m.col_cats(&self.model);
+        let (n_rows, n_cols) = m.grid_dims(&self.model);
+        let (rows, cols) = if selection {
+            m.selection()
+        } else {
+            (0..=n_rows.saturating_sub(1), 0..=n_cols.saturating_sub(1))
+        };
+        let (r0, c0) = (*rows.start(), *cols.start());
+        let size = (
+            (rows.end() + 1).min(n_rows).saturating_sub(r0),
+            (cols.end() + 1).min(n_cols).saturating_sub(c0),
+        );
+        // shortcut: printing is capped at 10,000 rows, as Copy is; page
+        // through a larger grid's slices if whole huge models are printed.
+        let size = (size.0.min(10_000), size.1);
+        let col_lines: Vec<_> = m
+            .axis_tuples(&self.model, &col_cats)
+            .into_iter()
+            .skip(c0)
+            .take(size.1)
+            .collect();
+        let row_lists = m.axis_item_lists(&self.model, &row_cats);
+        let keys = m.block_keys(&self.model, (r0, c0), size);
+        let numeric = self
+            .model
+            .measures
+            .get(&measure)
+            .is_some_and(|x| x.value_type == ValueType::Number);
+        let align = |v: Option<&CellValue>| match m.opts.align {
+            CellAlign::Left => Align::Left,
+            CellAlign::Center => Align::Center,
+            CellAlign::Right => Align::Right,
+            CellAlign::Smart if numeric && matches!(v, Some(CellValue::Num(_))) => Align::Right,
+            CellAlign::Smart => Align::Left,
+        };
+        let rows = keys
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                let items = if row_lists.is_empty() {
+                    Vec::new()
+                } else {
+                    nth_tuple(&row_lists, r0 + i)
+                        .into_iter()
+                        .map(|(_, n)| n)
+                        .collect()
+                };
+                let cells = row
+                    .iter()
+                    .map(|k| {
+                        let v = self.cell_value(measure, k);
+                        let shown = self.cell_shown(measure, k).unwrap_or_default();
+                        (shown, align(v.as_ref()))
+                    })
+                    .collect();
+                (items, cells)
+            })
+            .collect();
+        let o = m.opts;
+        Sheet {
+            corner: row_cats.iter().map(name).collect(),
+            col_heads: (0..col_cats.len())
+                .map(|lvl| col_lines.iter().map(|t| t[lvl].1.clone()).collect())
+                .collect(),
+            rows,
+            formulas: self
+                .formula_rows()
+                .iter()
+                .enumerate()
+                .map(|(i, r)| format!("{}. {} = {}", i + 1, r.target, r.text))
+                .collect(),
+            item_rules: o.lines && o.lines_in != LinesIn::Cells,
+            cell_rules: o.lines && o.lines_in != LinesIn::Items,
+        }
+    }
+
+    /// The focused worksheet laid out with the Page and Report Layouts.
+    pub(crate) fn print_doc(&self, selection: bool) -> crate::print::Doc {
+        let now = chrono::Local::now();
+        let names = crate::print::Names {
+            date: now.format("%Y-%m-%d").to_string(),
+            time: now.format("%H:%M").to_string(),
+            view: self
+                .current_view
+                .and_then(|v| self.model.views.get(&v))
+                .map(|v| v.name.0.clone())
+                .unwrap_or_default(),
+            worksheet: self.matrix_title(self.focus_index()),
+            model: self.file_name().to_owned(),
+        };
+        crate::print::layout(
+            &self.print_sheet(selection),
+            &self.page_layout,
+            &self.report_layout,
+            &names,
+        )
+    }
+
+    /// Format ▸ Page Layout…: Improv's Page Layout panel, the paper, its
+    /// orientation and the scale every print uses. It applies as it is set.
+    fn page_layout_panel(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        use crate::print::Paper;
+        if !self.show_page_layout {
+            return;
+        }
+        let home = egui::Rect::from_min_size(
+            egui::pos2(ws.right() - 288.0, ws.top() + 60.0),
+            egui::vec2(280.0, 150.0),
+        );
+        let win = crate::nxwin::NxWindow::new("page_layout", "Page Layout");
+        let rect = anchored_rect(ctx, win.id(), home);
+        let mut open = true;
+        let p = &mut self.page_layout;
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.inner_margin(6.0).show(ui, |ui| {
+                    egui::Grid::new("page_layout_grid")
+                        .num_columns(2)
+                        .spacing(egui::vec2(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.label("Paper Size:");
+                            egui::ComboBox::from_id_salt("paper")
+                                .selected_text(format!("{:?}", p.paper))
+                                .show_ui(ui, |ui| {
+                                    for x in Paper::ALL {
+                                        ui.selectable_value(&mut p.paper, x, format!("{x:?}"));
+                                    }
+                                });
+                            ui.end_row();
+                            ui.label("Orientation:");
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut p.landscape, false, "Portrait");
+                                ui.radio_value(&mut p.landscape, true, "Landscape");
+                            });
+                            ui.end_row();
+                            ui.label("Scale:");
+                            ui.horizontal(|ui| {
+                                let r = ui.add(egui::DragValue::new(&mut p.scale).range(10..=400));
+                                a11y_name(&r, "Scale, percent");
+                                ui.label("%");
+                            });
+                            ui.end_row();
+                        });
+                    let (w, h) = p.size();
+                    ui.label(format!("{:.1} x {:.1} in", w / 72.0, h / 72.0));
+                });
+            });
+        self.show_page_layout = open;
+    }
+
+    /// Format ▸ Report Layout…: Improv's Report Layout panel. Header and
+    /// footer (left, center and right, with its markers inserted from a
+    /// pop-up), the first page's number, the page order and the content.
+    fn report_layout_panel(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        if !self.show_report_layout {
+            return;
+        }
+        let home = egui::Rect::from_min_size(
+            egui::pos2(ws.center().x - 220.0, ws.top() + 60.0),
+            egui::vec2(440.0, 268.0),
+        );
+        let win = crate::nxwin::NxWindow::new("report_layout", "Report Layout");
+        let rect = anchored_rect(ctx, win.id(), home);
+        let mut open = true;
+        let r = &mut self.report_layout;
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.inner_margin(6.0).show(ui, |ui| {
+                    ui.strong("Header / Footer");
+                    egui::Grid::new("report_bands")
+                        .num_columns(4)
+                        .spacing(egui::vec2(4.0, 4.0))
+                        .show(ui, |ui| {
+                            for (band, slots) in
+                                [("Header", &mut r.header), ("Footer", &mut r.footer)]
+                            {
+                                ui.label(band);
+                                for (slot, at) in slots.iter_mut().zip(["left", "center", "right"])
+                                {
+                                    let resp = ui
+                                        .add(egui::TextEdit::singleline(slot).desired_width(110.0));
+                                    a11y_name(&resp, &format!("{band}, {at}"));
+                                    egui::Popup::context_menu(&resp).show(|ui| {
+                                        ui.label("Insert Marker");
+                                        for m in crate::print::MARKERS {
+                                            if ui.button(m).clicked() {
+                                                slot.push_str(&format!("<{m}>"));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    ui.label(
+                        egui::RichText::new(
+                            "Markers: <Date> <Time> <View Name> <Worksheet Name> <Model Name> \
+                             <Page #> (right-click a field to insert one)",
+                        )
+                        .color(crate::theme::DARK_GRAY),
+                    );
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("First Page Number:");
+                        let resp = ui.add(egui::DragValue::new(&mut r.first_page).range(1..=9999));
+                        a11y_name(&resp, "First Page Number");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Number Pages:");
+                        ui.radio_value(&mut r.across_first, false, "Top to Bottom");
+                        ui.radio_value(&mut r.across_first, true, "Left to Right");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Content:");
+                        ui.checkbox(&mut r.data, "Data");
+                        ui.checkbox(&mut r.formulas, "Formulas");
+                    });
+                });
+            });
+        self.show_report_layout = open;
+    }
+
+    /// Print… (Command-p): Improv's Print panel over the focused worksheet.
+    /// Copies, All pages or From–To, Print Selected Data Only; then Print
+    /// (the platform's print system, [`crate::print::spooler`], or the
+    /// Windows print dialog), or Save as PDF or PostScript to the path.
+    fn print_window(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        let Some(mut p) = self.print_panel.clone() else {
+            return;
+        };
+        let home = egui::Rect::from_min_size(
+            egui::pos2(ws.center().x - 170.0, ws.center().y - 120.0),
+            egui::vec2(340.0, 200.0),
+        );
+        let win = crate::nxwin::NxWindow::new("print", "Print");
+        let rect = anchored_rect(ctx, win.id(), home);
+        let mut open = true;
+        let (rows, cols) = self.focused().selection();
+        let has_selection = rows.start() != rows.end() || cols.start() != cols.end();
+        p.selection &= has_selection;
+        let pages = self.print_doc(p.selection).pages.len();
+        let spooler = crate::print::local_spooler(&p.printer, p.copies);
+        let mut go: Option<&str> = None;
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.inner_margin(6.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Copies:");
+                        let r = ui.add(egui::DragValue::new(&mut p.copies).range(1..=999));
+                        a11y_name(&r, "Copies");
+                        ui.label(format!(
+                            "({pages} page{})",
+                            if pages == 1 { "" } else { "s" }
+                        ));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Pages:");
+                        let mut some = p.pages.is_some();
+                        ui.radio_value(&mut some, false, "All");
+                        ui.radio_value(&mut some, true, "From");
+                        let (mut f, mut t) = p.pages.unwrap_or((1, pages.max(1)));
+                        ui.add_enabled_ui(some, |ui| {
+                            let r = ui.add(egui::DragValue::new(&mut f).range(1..=pages.max(1)));
+                            a11y_name(&r, "From page");
+                            ui.label("to");
+                            let r = ui.add(egui::DragValue::new(&mut t).range(f..=pages.max(1)));
+                            a11y_name(&r, "To page");
+                        });
+                        p.pages = some.then_some((f, t.max(f)));
+                    });
+                    ui.add_enabled(
+                        has_selection,
+                        egui::Checkbox::new(&mut p.selection, "Print Selected Data Only"),
+                    );
+                    if !cfg!(windows) {
+                        ui.horizontal(|ui| {
+                            ui.label("Printer:");
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut p.printer)
+                                    .hint_text("default")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            a11y_name(&r, "Printer");
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("File:");
+                        let r = ui.add(
+                            egui::TextEdit::singleline(&mut p.path).desired_width(f32::INFINITY),
+                        );
+                        a11y_name(&r, "File to save the pages in");
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save as PDF").clicked() {
+                            go = Some("pdf");
+                        }
+                        if ui.button("Save as PostScript").clicked() {
+                            go = Some("ps");
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let can = cfg!(windows) || spooler.is_some();
+                            let b = ui.add_enabled(can, egui::Button::new("Print"));
+                            if b.clicked() {
+                                go = Some("print");
+                            }
+                            if !can {
+                                b.on_disabled_hover_text("No lp or lpr: save as PDF or PostScript");
+                            }
+                        });
+                    });
+                });
+            });
+        if let Some(what) = go {
+            let doc = self.print_doc(p.selection).range(p.pages);
+            self.status = match self.run_print(what, &doc, &p) {
+                Ok(msg) => {
+                    open = false;
+                    msg
+                }
+                Err(e) => e,
+            };
+        }
+        self.print_panel = open.then_some(p);
+    }
+
+    /// Print's three buttons: `pdf` and `ps` write `p.path`, `print` sends
+    /// the job to the platform. Returns the status line.
+    fn run_print(
+        &self,
+        what: &str,
+        doc: &crate::print::Doc,
+        p: &PrintPanel,
+    ) -> Result<String, String> {
+        if doc.pages.is_empty() {
+            return Err("nothing to print: Report Layout's Content is empty".into());
+        }
+        let n = doc.pages.len();
+        let pages = format!("{n} page{}", if n == 1 { "" } else { "s" });
+        let save = |ext: &str, data: Vec<u8>| {
+            let path = std::path::Path::new(p.path.trim()).with_extension(ext);
+            std::fs::write(&path, data)
+                .map(|()| format!("saved {pages} to {}", path.display()))
+                .map_err(|e| format!("could not write {}: {e}", path.display()))
+        };
+        match what {
+            "pdf" => save("pdf", doc.to_pdf()),
+            "ps" => save("ps", doc.to_postscript()),
+            #[cfg(windows)]
+            _ => crate::print::print_windows(doc, p.copies),
+            #[cfg(not(windows))]
+            _ => {
+                let (cmd, args, format) = crate::print::local_spooler(&p.printer, p.copies)
+                    .ok_or("no lp or lpr to print with: save as PDF or PostScript")?;
+                let data = match format {
+                    crate::print::Format::Pdf => doc.to_pdf(),
+                    crate::print::Format::PostScript => doc.to_postscript(),
+                };
+                crate::print::spool(cmd, &args, &data).map(|()| format!("sent {pages} to {cmd}"))
+            }
+        }
+    }
+
+    /// Help ▸ Keys…: a NeXT window at the workspace's right listing the
+    /// menu's key equivalents (read from the menu, Ctrl or Cmd) and the grid
+    /// and editor keys ([`GRID_KEYS`]). Its close box or Help ▸ Keys… again
+    /// closes it.
+    fn keys_panel(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        if !self.show_keys {
+            return;
+        }
+        let win = crate::nxwin::NxWindow::new("keys", "Keys");
+        let mut open = true;
+        let chord = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
+        // A key whose command is not built is not listed.
+        let rows: Vec<(String, String)> = menu::key_equivalents()
+            .filter(|(_, _, c)| c.is_some())
+            .map(|(k, item, _)| {
+                let k = if k.is_uppercase() {
+                    format!("{chord}+Shift+{}", k.to_ascii_lowercase())
+                } else {
+                    format!("{chord}+{k}")
+                };
+                (k, item)
+            })
+            .chain([(format!("{chord}+y"), "Edit: Redo".to_owned())])
+            .chain(
+                GRID_KEYS
+                    .iter()
+                    .map(|(k, w)| ((*k).to_owned(), (*w).to_owned())),
+            )
+            .collect();
+        // Sized to its rows (19 pt each: a 12 pt line, its spacing), the
+        // note under them and the chrome.
+        let size = egui::vec2(440.0, 19.0 * rows.len() as f32 + 80.0);
+        let home =
+            egui::Rect::from_min_size(egui::pos2(ws.right() - size.x - 8.0, ws.top() + 48.0), size);
+        let rect = anchored_rect(ctx, win.id(), home);
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE.inner_margin(6.0).show(ui, |ui| {
+                    egui::Grid::new("keys_grid")
+                        .num_columns(2)
+                        .spacing(egui::vec2(16.0, 2.0))
+                        .show(ui, |ui| {
+                            for (k, what) in &rows {
+                                ui.label(k);
+                                ui.label(what);
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(6.0);
+                    ui.label("Key equivalents do not fire while a text field has the keyboard.");
+                });
+            });
+        self.show_keys &= open;
+    }
+
+    /// Help ▸ Functions… (F1): a NeXT window at the workspace's right
+    /// with a search line over the built-in functions, the matches grouped
+    /// by category (each with its signature), and the selected one's
+    /// details. Insert (or a double-click, or Enter in the search line)
+    /// puts `NAME(` into the formula last edited, at its caret.
+    fn function_help(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        use crate::function_help::{aliases, category_title};
+        use crate::theme::{BLACK, BOLD, DARK_GRAY, LIGHT_GRAY, WHITE};
+        // F1 toggles it from anywhere, a formula edit included.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
+            self.run_command(ctx, Command::FunctionHelp);
+        }
+        let mut open = self.fn_help.open;
+        if !open {
+            return;
+        }
+        let size = egui::vec2(420.0, 440.0);
+        let home =
+            egui::Rect::from_min_size(egui::pos2(ws.right() - size.x - 8.0, ws.top() + 32.0), size);
+        let win = crate::nxwin::NxWindow::new("fnhelp", "Functions");
+        let rect = anchored_rect(ctx, win.id(), home);
+        let search_id = egui::Id::unique("fnhelp_search");
+        let mut insert = None;
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .min_size(egui::vec2(300.0, 300.0))
+            .show(ctx, |ui| {
+                egui::Frame::NONE.inner_margin(4.0).show(ui, |ui| {
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    let bold = egui::FontId::new(font.size, egui::FontFamily::Name(BOLD.into()));
+                    let row_h = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+                    let width = ui.available_width();
+                    let search = ui
+                        .horizontal(|ui| {
+                            ui.label("Search:");
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut self.fn_help.query)
+                                    .id(search_id)
+                                    .hint_text("name or description")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            a11y_name(&r, "Search functions");
+                            r
+                        })
+                        .inner;
+                    if std::mem::take(&mut self.fn_help.focus_search) {
+                        search.request_focus();
+                    }
+                    let (up, down, enter) = ui.input(|i| {
+                        (
+                            i.key_pressed(egui::Key::ArrowUp),
+                            i.key_pressed(egui::Key::ArrowDown),
+                            i.key_pressed(egui::Key::Enter),
+                        )
+                    });
+                    let mut moved = false;
+                    if search.has_focus() && (up || down) {
+                        self.fn_help.step(if up { -1 } else { 1 });
+                        moved = true;
+                    }
+                    if search.lost_focus() && enter {
+                        consume_enter(ui);
+                        insert = self.fn_help.selected;
+                    }
+                    let groups = self.fn_help.groups().to_vec();
+                    let selected = self.fn_help.selected.map(|d| d.id);
+                    let n: usize = groups.iter().map(|(_, fs)| fs.len()).sum();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{n} function{}",
+                            if n == 1 { "" } else { "s" }
+                        ))
+                        .color(DARK_GRAY),
+                    );
+                    let detail_h = 5.0 * row_h + 36.0;
+                    let list_h = (ui.available_height() - detail_h - 8.0).max(3.0 * row_h);
+                    let boxed = || {
+                        egui::Frame::NONE
+                            .fill(WHITE)
+                            .stroke(egui::Stroke::new(1.0_f32, BLACK))
+                            .inner_margin(2.0)
+                    };
+                    boxed().show(ui, |ui| {
+                        ui.set_width(width - 4.0);
+                        crate::theme::next_scroll(
+                            ui,
+                            egui::ScrollArea::vertical()
+                                .id_salt("fnhelp_list")
+                                .max_height(list_h)
+                                .min_scrolled_height(list_h)
+                                .auto_shrink(false),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = 0.0;
+                                for (cat, fs) in &groups {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), row_h),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().text(
+                                        rect.left_center() + egui::vec2(4.0, 0.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        category_title(*cat),
+                                        bold.clone(),
+                                        BLACK,
+                                    );
+                                    for &d in fs {
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(ui.available_width(), row_h),
+                                            egui::Sense::click(),
+                                        );
+                                        resp.widget_info(|| {
+                                            egui::WidgetInfo::selected(
+                                                egui::Role::ListBoxOption,
+                                                true,
+                                                selected == Some(d.id),
+                                                d.hint(),
+                                            )
+                                        });
+                                        let p = ui.painter();
+                                        if selected == Some(d.id) {
+                                            p.rect_filled(rect, 0.0, LIGHT_GRAY);
+                                            if moved {
+                                                resp.scroll_to_me(None);
+                                            }
+                                        }
+                                        p.text(
+                                            rect.left_center() + egui::vec2(16.0, 0.0),
+                                            egui::Align2::LEFT_CENTER,
+                                            d.hint(),
+                                            font.clone(),
+                                            BLACK,
+                                        );
+                                        if resp.clicked() {
+                                            self.fn_help.selected = Some(d);
+                                        }
+                                        if resp.double_clicked() {
+                                            insert = Some(d);
+                                        }
+                                    }
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(4.0);
+                    boxed().inner_margin(4.0).show(ui, |ui| {
+                        ui.set_width(width - 8.0);
+                        ui.set_min_height(detail_h - 36.0);
+                        match self.fn_help.selected {
+                            None => {
+                                ui.label("No function matches.");
+                            }
+                            Some(d) => {
+                                ui.label(egui::RichText::new(d.hint()).font(bold.clone()));
+                                let mut facts = category_title(d.category).to_string();
+                                if let Some(a) = aliases(d) {
+                                    facts.push_str(" · ");
+                                    facts.push_str(&a);
+                                }
+                                ui.label(egui::RichText::new(facts).color(DARK_GRAY));
+                                ui.label(d.doc);
+                                ui.label(
+                                    egui::RichText::new(format!("Arguments: {}", d.signature()))
+                                        .color(DARK_GRAY),
+                                );
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can = self.fn_help.selected.is_some();
+                        if ui.add_enabled(can, egui::Button::new("Insert")).clicked() {
+                            insert = self.fn_help.selected;
+                        }
+                    });
+                });
+            });
+        self.fn_help.open = open;
+        if let Some(d) = insert {
+            self.insert_function(ctx, d.name);
+        }
+    }
+
+    /// Insert `NAME(` into the formula editor last focused (the selected
+    /// row's while it is shown, else the `Name = formula` line), at its
+    /// caret, and give that editor the keyboard.
+    fn insert_function(&mut self, ctx: &egui::Context, name: &str) {
+        let target = match self.formula_target {
+            FormulaEditor::Row if self.formula_for.is_some() => FormulaEditor::Row,
+            _ => FormulaEditor::NewLine,
+        };
+        let id = target.id();
+        let buf = match target {
+            FormulaEditor::Row => {
+                self.formula_error = None;
+                &mut self.formula_buf
+            }
+            FormulaEditor::NewLine => {
+                self.new_formula_error = None;
+                &mut self.new_formula_line
+            }
+        };
+        let caret = caret_byte(ctx, id, buf);
+        let (text, at) = crate::function_help::insert_call(buf, caret, name);
+        *buf = text;
+        set_caret(ctx, id, buf, at);
+        ctx.memory_mut(|m| m.request_focus(id));
+        self.status = format!("inserted {name}(");
+    }
+
+    /// **The Step 2 formula pane** (plan
+    /// `docs/reviews/2026-09-22-gui-reconstruction-plan.md`): the whole model's
+    /// logic as one persistent, numbered, individually-checkable list — the
+    /// shape every reference shows (`✓ 1. Gross Margin = Sum of Revenue - Sum of
+    /// Cost of Sales`), and the thing a single-line bar for the selected measure
+    /// alone can never be.
+    ///
+    /// Reference-faithful in the parts that carry meaning:
+    ///
+    /// * a split bar across the top with a `Calc` button that recomputes;
+    /// * one row per derived measure: a checkbox (the `✓`), a **bold 1-based
+    ///   number**, then `Target = formula`;
+    /// * the selected row highlighted, and clicking any row selecting that
+    ///   measure so the grid follows;
+    /// * inline error text under a row whose formula does not compile.
+    ///
+    /// The selected row *is* the editor ([`Self::formula_editor`]), and a last
+    /// line takes `Name = formula` to add one; there is no separate bar.
+    fn formula_list(&mut self, ui: &mut egui::Ui, mi: usize) {
+        // Only the focused window edits, so the editor's global id is unique.
+        let editing = mi == self.focus_index();
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Calc").clicked() {
+                    self.recalculate();
+                }
+            });
+        });
+        ui.separator();
+        let rows = self.formula_rows();
+        // What the user clicked, applied after the loop so the model is
+        // not mutated while `rows` borrows nothing from it but the UI
+        // still reads `self.selected` per row.
+        let mut select: Option<MeasureId> = None;
+        let mut toggle: Option<(MeasureId, bool)> = None;
+        let mut rects: Vec<(MeasureId, egui::Rect)> = Vec::new();
+        crate::theme::next_scroll(
+            ui,
+            egui::ScrollArea::vertical().auto_shrink([false, true]),
+            |ui| {
+                white_selection(ui);
+                for (i, row) in rows.iter().enumerate() {
+                    let selected = self.selected() == Some(row.measure);
+                    ui.horizontal(|ui| {
+                        let mut on = row.enabled;
+                        let r = ui.add(egui::Checkbox::without_text(&mut on));
+                        let name = self
+                            .model
+                            .measures
+                            .get(&row.measure)
+                            .map_or("", |m| &m.name.0);
+                        a11y_name(&r, &format!("Enable formula {name}"));
+                        if r.on_hover_text(
+                            "Enabled. Uncheck to stop this formula \
+                                         computing (dependents recompute without it).",
+                        )
+                        .changed()
+                        {
+                            toggle = Some((row.measure, on));
+                        }
+                        formula_status(ui, name, row.error.as_deref());
+                        // `1.` `2.` … bold, as the reference numbers them.
+                        ui.strong(format!("{}.", i + 1));
+                        // A disabled formula is dimmed, not hidden: it is
+                        // still part of the model's logic.
+                        let label = format!("{} = {}", row.target, row.text);
+                        let text = if row.enabled {
+                            egui::RichText::new(label)
+                        } else {
+                            egui::RichText::new(label).weak().strikethrough()
+                        };
+                        let resp = if selected && editing {
+                            self.formula_editor(ui, row.measure, &row.target, row.error.as_deref())
+                        } else {
+                            ui.selectable_label(selected, text)
+                        };
+                        // Only the part the scroll area shows is clickable.
+                        let shown = resp.rect.intersect(ui.clip_rect());
+                        if shown.is_positive() {
+                            rects.push((row.measure, shown));
+                        }
+                        if resp.clicked() {
+                            select = Some(row.measure);
+                        }
+                    });
+                    let edit_err = if selected && editing {
+                        self.formula_error.clone()
+                    } else {
+                        None
+                    };
+                    // The Inspector's Show Errors In Line; off, the status
+                    // indicator's tip says it.
+                    let row_err = row
+                        .error
+                        .as_deref()
+                        .filter(|_| self.matrices[mi].opts.errors_inline)
+                        .map(|e| diagnostics::compile_error(&self.model, &row.text, e));
+                    if let Some(d) = edit_err.or(row_err) {
+                        let _ = formula_error_lines(ui, &d);
+                    }
+                }
+                self.new_formula_line(ui, editing);
+            },
+        );
+        self.formula_row_rects = rects;
+        // Selection left the rows (an input measure, or none): re-seed the
+        // editor next time, as the old bar did on every selection change.
+        if editing && !rows.iter().any(|r| Some(r.measure) == self.selected()) {
+            self.formula_for = None;
+        }
+        if let Some(id) = select {
+            self.focused_mut().select(Some(id));
+        }
+        if let Some((id, on)) = toggle {
+            match self.set_formula_enabled(id, on) {
+                Ok(()) => {
+                    self.status = format!(
+                        "formula {} {}",
+                        self.model
+                            .measures
+                            .get(&id)
+                            .map(|m| m.name.0.clone())
+                            .unwrap_or_default(),
+                        if on { "enabled" } else { "disabled" }
+                    );
+                }
+                Err(e) => self.status = format!("toggle failed: {e}"),
+            }
+        }
+    }
+
+    /// The selected row's in-place editor: `Name =` and a highlighted
+    /// single-line edit over `formula_buf`. Enter commits (errors show under
+    /// the row), Esc reverts. A formula with no editable spelling shows its
+    /// English text read-only (see [`Self::formula_source`]).
+    fn formula_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        mid: MeasureId,
+        target: &str,
+        row_error: Option<&str>,
+    ) -> egui::Response {
+        let source = self.formula_source(mid);
+        // Reload the buffer when the selection changes, clearing any stale
+        // inline error from the previously selected measure.
+        if self.formula_for != Some(mid) {
+            self.formula_for = Some(mid);
+            self.formula_buf = source.clone().unwrap_or_default();
+            self.formula_error = None;
+        }
+        let Some(source) = source else {
+            let english = self
+                .model
+                .measures
+                .get(&mid)
+                .and_then(|m| match &m.kind {
+                    MeasureKind::Derived(f) => {
+                        Some(describe_formula(&NlContext::new(&self.model), f))
+                    }
+                    MeasureKind::Input => None,
+                })
+                .unwrap_or_default();
+            return ui.selectable_label(true, format!("{target} = {english}"));
+        };
+        ui.strong(format!("{target} ="));
+        // A standing compile error is underlined while the text is unedited.
+        let standing = row_error
+            .filter(|_| self.formula_buf == source)
+            .and_then(|e| diagnostics::compile_error(&self.model, &source, e).span);
+        let span = match &self.formula_error {
+            Some(d) => d.span.clone(),
+            None => standing,
+        };
+        let resp = assisted_formula_edit(
+            ui,
+            &self.model,
+            &mut self.formula_buf,
+            egui::Id::unique("formula_edit"),
+            "e.g. Price * Quantity",
+            span,
+            0,
+        );
+        if resp.has_focus() {
+            self.formula_target = FormulaEditor::Row;
+        }
+        if resp.changed() {
+            // The previous error no longer describes what's on screen.
+            self.formula_error = None;
+        }
+        let (enter, esc) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if esc && (resp.has_focus() || resp.lost_focus()) {
+            self.formula_buf = source;
+            self.formula_error = None;
+            resp.surrender_focus();
+        } else if enter && resp.lost_focus() {
+            consume_enter(ui);
+            let text = self.formula_buf.clone();
+            match self.commit_formula(mid, &text) {
+                Ok(()) => self.status = "formula updated".into(),
+                Err(e) => {
+                    self.status = format!("formula error: {e}");
+                    let span = self.formula_error.as_ref().and_then(|d| d.span.clone());
+                    refocus_at_error(&resp, &text, span);
+                }
+            }
+        }
+        resp
+    }
+
+    /// The formula list's last line: type `Name = formula`, press Enter, and a
+    /// derived measure is added and selected. `editing` (the focused window)
+    /// gets the global id `formula_new`; other windows scope theirs.
+    fn new_formula_line(&mut self, ui: &mut egui::Ui, editing: bool) {
+        let id = if editing {
+            egui::Id::unique("formula_new")
+        } else {
+            ui.scope_id().with("formula_new")
+        };
+        // Only the focused window's line shows (and owns) the error.
+        let span = self
+            .new_formula_error
+            .as_ref()
+            .filter(|_| editing)
+            .and_then(|d| d.span.clone());
+        let resp = ui
+            .horizontal(|ui| {
+                // Past the checkbox and number, under the rows' text.
+                ui.add_space(44.0);
+                // Names are completed in the formula, after the `=`.
+                let from = self
+                    .new_formula_line
+                    .find('=')
+                    .map_or(usize::MAX, |i| i + 1);
+                assisted_formula_edit(
+                    ui,
+                    &self.model,
+                    &mut self.new_formula_line,
+                    id,
+                    "Name = formula",
+                    span,
+                    from,
+                )
+            })
+            .inner;
+        if resp.has_focus() && editing {
+            self.formula_target = FormulaEditor::NewLine;
+        }
+        if resp.changed() {
+            self.new_formula_error = None;
+        }
+        let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if entered {
+            consume_enter(ui);
+            self.add_from_formula_line();
+            // Refused: the line keeps its text and the keyboard.
+            if !self.new_formula_line.is_empty() {
+                let span = self.new_formula_error.as_ref().and_then(|d| d.span.clone());
+                refocus_at_error(&resp, &self.new_formula_line, span);
+            }
+        }
+        if let Some(d) = self.new_formula_error.as_ref().filter(|_| editing) {
+            let shown = formula_error_lines(ui, d);
+            if entered {
+                // Under the last row, a fresh error may be past the pane's end.
+                shown.scroll_to_me(None);
+            }
+        }
+    }
+
+    /// Add the measure the new-formula line spells (`Name = formula`),
+    /// selecting it, or define the named LAMBDA it spells (`Name =
+    /// LAMBDA(…)`); on failure keep the line and locate the error in it.
+    fn add_from_formula_line(&mut self) {
+        let line = self.new_formula_line.clone();
+        if is_lambda_definition(&self.locale.canonicalize(&line)) {
+            match self.define_lambda(&line) {
+                Ok(msg) => {
+                    self.new_formula_line.clear();
+                    self.status = msg;
+                }
+                Err(e) => {
+                    if self.new_formula_error.is_none() {
+                        self.new_formula_error = Some(diagnostics::Diagnostic::plain(e.clone()));
+                    }
+                    self.status = format!("formula error: {e}");
+                }
+            }
+            return;
+        }
+        let Some((name, expr)) = line.split_once('=') else {
+            self.status = "type Name = formula".into();
+            return;
+        };
+        // Where the formula starts in the line, to place its error there.
+        let at = line.len() - expr.trim_start().len();
+        match self.add_derived_measure(name.trim(), expr.trim()) {
+            Ok(id) => {
+                self.focused_mut().select(Some(id));
+                self.new_formula_line.clear();
+                self.status = format!("added {}", name.trim());
+            }
+            Err(e) => {
+                self.new_formula_error = Some(match self.new_formula_error.take() {
+                    Some(d) => d.shifted(at),
+                    // Not the formula's fault (a duplicate name, …).
+                    None => diagnostics::Diagnostic::plain(e.clone()),
+                });
+                self.status = format!("formula error: {e}");
+            }
+        }
+    }
+
+    /// The graph window (Graph ▸ New Graph): a NeXT window titled
+    /// `<measure> - Graph - <file>` charting the focused worksheet's
+    /// selection, hot-linked as Improv's was (an edit redraws it). Above the
+    /// graph, its inspector line: the graph type, how the selection is
+    /// parsed into series, and Color (else NeXT's four grays). Its default
+    /// size is Improv's, 5.5 x 4 inches at 72 points an inch.
+    fn graph_window(&mut self, ctx: &egui::Context, ws: egui::Rect) {
+        use crate::chart::{ChartKind, ParseBy};
+        if !self.show_chart {
+            return;
+        }
+        let size = egui::vec2(396.0, 288.0 + GRAPH_INSPECTOR_H);
+        let home = egui::Rect::from_min_size(
+            egui::pos2(ws.right() - size.x - 8.0, ws.bottom() - size.y - 8.0),
+            size,
+        );
+        let mi = self.focus_index();
+        let title = format!("{} - Graph - {}", self.matrix_title(mi), self.file_name());
+        let win = crate::nxwin::NxWindow::new("graph", title).standard();
+        let rect = anchored_rect(ctx, win.id(), home);
+        let mut open = true;
+        let (mut kind, mut parse, mut color) =
+            (self.chart_kind, self.chart_parse, self.chart_color);
+        let data = self.chart_series(parse);
+        let _ = win
+            .closable(&mut open)
+            .rect(rect)
+            .min_size(egui::vec2(300.0, 220.0))
+            .show(ctx, |ui| {
+                egui::Frame::NONE.inner_margin(4.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Type");
+                        egui::ComboBox::from_id_salt("graph_type")
+                            .selected_text(kind.label())
+                            .show_ui(ui, |ui| {
+                                for k in ChartKind::ALL {
+                                    ui.selectable_value(&mut kind, k, k.label());
+                                }
+                            });
+                        ui.label("Series by");
+                        egui::ComboBox::from_id_salt("graph_parse")
+                            .selected_text(parse.label())
+                            .show_ui(ui, |ui| {
+                                for b in ParseBy::ALL {
+                                    ui.selectable_value(&mut parse, b, b.label());
+                                }
+                            });
+                        ui.checkbox(&mut color, "Color");
+                    });
+                    crate::chart::render_chart(ui, &data, kind, color);
+                });
+            });
+        (self.chart_kind, self.chart_parse, self.chart_color) = (kind, parse, color);
+        self.show_chart &= open;
+    }
+
+    /// A toggle-able window: CSV/TSV import (left) + export (right), mirroring
+    /// the CLI's `import-csv`/`export-csv` exactly. All fields are plain text
+    /// (no file-dialog dependency, same pattern as the "Save view" name box) —
+    /// see `csv_wizard::build_import_spec`/`build_export_args` for the pure
+    /// validation this panel drives.
+    fn csv_wizard_panel(&mut self, ctx: &egui::Context) {
+        if !self.show_csv_wizard {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Import / Export CSV")
+            .id(egui::Id::unique("csv_wizard"))
+            .open(&mut open)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.columns(2, |cols| {
+                    self.csv_import_form(&mut cols[0]);
+                    self.csv_export_form(&mut cols[1]);
+                });
+            });
+        if !open {
+            self.show_csv_wizard = false;
+        }
+    }
+
+    /// The import half of the wizard: file path, delimiter/header toggles,
+    /// measure id (auto-assigned)/name, value column, and a repeatable list
+    /// of dimension-mapping rows with +/- controls.
+    fn csv_import_form(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Import");
+        ui.horizontal(|ui| {
+            ui.label("file");
+            a11y_name(
+                &ui.text_edit_singleline(&mut self.import_form.path),
+                "Import file",
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.import_form.tsv, "TSV");
+            ui.checkbox(&mut self.import_form.has_header, "has header row");
+        });
+        ui.horizontal(|ui| {
+            ui.label("measure id");
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.import_form.measure_id).desired_width(60.0),
+            );
+            a11y_name(&r, "Measure id");
+            ui.label("name");
+            a11y_name(
+                &ui.text_edit_singleline(&mut self.import_form.measure_name),
+                "Measure name",
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("value column");
+            a11y_name(
+                &ui.text_edit_singleline(&mut self.import_form.value_column),
+                "Value column",
+            );
+        });
+        ui.separator();
+        ui.label("dimensions (column, category id, category name):");
+        let mut remove: Option<usize> = None;
+        for (i, row) in self.import_form.dimensions.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let n = i + 1;
+                a11y_name(
+                    &ui.text_edit_singleline(&mut row.column),
+                    &format!("Dimension {n} column"),
+                );
+                let r =
+                    ui.add(egui::TextEdit::singleline(&mut row.category_id).desired_width(40.0));
+                a11y_name(&r, &format!("Dimension {n} category id"));
+                let r = ui.text_edit_singleline(&mut row.category_name);
+                a11y_name(&r, &format!("Dimension {n} category name"));
+                if ui.small_button("-").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            self.import_form.dimensions.remove(i);
+        }
+        if ui.small_button("+ dimension").clicked() {
+            self.import_form
+                .dimensions
+                .push(csv_wizard::DimRow::default());
+        }
+        ui.separator();
+        if ui.button("Import").clicked() {
+            self.queue_csv_import();
+        }
+    }
+
+    /// The export half of the wizard: a measure combo box (from the current
+    /// model, like the browser's measure list), a target path, and a
+    /// delimiter toggle.
+    fn csv_export_form(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Export");
+        let mut ids: Vec<MeasureId> = self.model.measures.keys().copied().collect();
+        ids.sort_by_key(|m| m.0);
+        let selected_label = self
+            .export_form
+            .measure_id
+            .and_then(|m| self.model.measures.get(&m))
+            .map(|m| m.name.0.clone())
+            .unwrap_or_else(|| "(choose a measure)".to_string());
+        egui::ComboBox::from_label("measure")
+            .selected_text(selected_label)
+            .show_ui(ui, |ui| {
+                for id in &ids {
+                    let name = self.model.measures[id].name.0.clone();
+                    ui.selectable_value(&mut self.export_form.measure_id, Some(*id), name);
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.label("file");
+            a11y_name(
+                &ui.text_edit_singleline(&mut self.export_form.path),
+                "Export file",
+            );
+        });
+        ui.checkbox(&mut self.export_form.tsv, "TSV");
+        ui.separator();
+        if ui.button("Export").clicked() {
+            self.run_csv_export();
+        }
+    }
+
+    /// The **status bar** (plan Step 5): the status message on the left and the
+    /// selection-aggregate readout on the right, which is where Quantrix puts
+    /// its `Sum`.
+    fn status_bar(&mut self, root: &mut egui::Ui) {
+        let ctx = &root.ctx().clone();
+        let now = ctx.input(|i| i.time);
+        if self.status != self.status_shown {
+            self.status_shown.clone_from(&self.status);
+            self.status_at = now;
+        }
+        if !self.status.is_empty() {
+            let age = now - self.status_at;
+            if age >= STATUS_TTL {
+                self.status.clear();
+                self.status_shown.clear();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(STATUS_TTL - age));
+            }
+        }
+        {
+            egui::Panel::bottom("status_bar").show(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(&self.status);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(self.selection_readout())
+                            .on_hover_text("aggregate of the focused matrix's selection");
+                        if self.loading.is_some() {
+                            ui.label("Loading…")
+                                .on_hover_text("the model opens when its store has been read");
+                        } else if self.building.is_some() {
+                            ui.label("Recalculating…")
+                                .on_hover_text("the grid shows the last results until then");
+                        }
+                    });
+                });
+            });
+        }
+    }
+
+    /// The selection aggregate for the focused matrix, as the status bar shows
+    /// it: the reference's `Sum`.
+    ///
+    /// Selection is ONE cell today (there is no range selection yet), so the sum
+    /// over the selection is that cell's number. Written as a sum rather than as
+    /// "the cell's value" because that is what it means and what a range
+    /// selection will widen to: [`Self::selection_sum`] takes the cursor cell's
+    /// numeric value, and a non-numeric or absent cell contributes nothing, so
+    /// the readout says `Sum \u2014` rather than inventing a zero.
+    pub fn selection_readout(&self) -> String {
+        match self.selection_sum() {
+            // In the measure's format (H1-22); General is Rust's `{v}`, as before.
+            Some(v) => match self.selected().and_then(|m| self.number_format(m)) {
+                Some(f) => format!(
+                    "Sum {}",
+                    improv_engine::format_number(v, Some(&f), &self.locale)
+                ),
+                None => format!("Sum {v}"),
+            },
+            None => "Sum \u{2014}".to_string(),
+        }
+    }
+
+    /// Edit ▸ Copy (Improv's Command-c): the focused worksheet's selection
+    /// as text, a tab between cells and a newline after each row, the way
+    /// the cells show (their number format), so it pastes into another
+    /// spreadsheet or back into Improv. `None` with no measure.
+    pub fn copy_selection(&self) -> Option<String> {
+        let measure = self.selected()?;
+        // An items-only selection copies the item names, a line each.
+        if let SelPart::Items { rows } = self.focused().part {
+            let names = self.focused().selected_item_names(&self.model, rows);
+            return Some(names.iter().map(|n| format!("{n}\n")).collect());
+        }
+        let text: String = self
+            .selection_block()
+            .iter()
+            .map(|row| {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|k| self.cell_shown(measure, k).unwrap_or_default())
+                    .collect();
+                cells.join("\t") + "\n"
+            })
+            .collect();
+        Some(text)
+    }
+
+    /// The focused worksheet's selected cells, row by row: what Copy and Cut
+    /// take.
+    fn selection_block(&self) -> Vec<Vec<CoordKey>> {
+        let m = self.focused();
+        let (rows, cols) = m.selection();
+        let size = (rows.end() - rows.start() + 1, cols.end() - cols.start() + 1);
+        // ponytail: capped like the Sum (10,000 rows) so a select-all copy of
+        // a huge grid stays bounded; stream it if bigger copies matter.
+        m.block_keys(
+            &self.model,
+            (*rows.start(), *cols.start()),
+            (size.0.min(10_000), size.1),
+        )
+    }
+
+    /// Edit ▸ Cut (Improv's Command-x): the selection as Copy writes it, and
+    /// its input cells cleared, as one undo step. Returns the text and the
+    /// status line; a derived measure's cells are refused.
+    pub fn cut_selection(&mut self) -> Result<(String, String), String> {
+        let measure = self.selected().ok_or("select a worksheet cell first")?;
+        if self
+            .model
+            .measures
+            .get(&measure)
+            .is_some_and(Measure::is_derived)
+        {
+            return Err("derived cells are computed, not cut; Copy them instead".into());
+        }
+        let text = self.copy_selection().unwrap_or_default();
+        if matches!(self.focused().part, SelPart::Items { .. }) {
+            return Ok((
+                text,
+                "an items-only selection cannot be cut: it was copied".into(),
+            ));
+        }
+        let cells: Vec<(CoordKey, Option<Value>)> = self
+            .selection_block()
+            .into_iter()
+            .flatten()
+            .filter(|k| self.input(measure, &decode(k)).is_some())
+            .map(|k| (k, None))
+            .collect();
+        if cells.is_empty() {
+            return Ok((text, "copied; the cells were already empty".into()));
+        }
+        let n = cells.len();
+        let (inverse, saved) = self
+            .apply_step(Step::Cells(measure, cells))
+            .map_err(|(e, _)| e)?;
+        self.record_step(inverse);
+        saved?;
+        Ok((
+            text,
+            format!("cut {n} cell{}", if n == 1 { "" } else { "s" }),
+        ))
+    }
+
+    /// File ▸ Close (Improv's Command-Shift-w): close the model, leaving an
+    /// empty desk in memory. Changes no save wrote warn first, as Quit
+    /// does, and a second Close drops them. Returns the status line.
+    pub fn close_model(&mut self) -> String {
+        if !self.quit_allowed() {
+            return self.status.replace("Quit again", "Close again");
+        }
+        let name = self.file_name().to_owned();
+        match ImprovApp::open("") {
+            Ok(mut next) => {
+                next.locale = self.locale.clone();
+                next.menu = self.menu;
+                *self = next;
+                format!("closed {name}")
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// Edit ▸ Paste (Improv's Command-v): `text` (tab-separated cells,
+    /// newline-separated rows, as Copy writes them) into the focused input
+    /// measure, from the cursor right and down, clipped to the grid. Every
+    /// cell must parse as the measure's type or nothing changes; the whole
+    /// paste is one undo step. Returns the status line.
+    pub fn paste_cells(&mut self, text: &str) -> Result<String, String> {
+        let measure = self.selected().ok_or("select a worksheet cell first")?;
+        let m = self
+            .model
+            .measures
+            .get(&measure)
+            .ok_or("no measure selected")?;
+        if m.is_derived() {
+            return Err(
+                "derived cells are computed, not editable; paste into an input measure".into(),
+            );
+        }
+        if matches!(self.focused().part, SelPart::Items { .. }) {
+            return Err("paste into cells: Edit ▸ Select Cells Only first".into());
+        }
+        let declared = m.value_type;
+        let rows: Vec<Vec<&str>> = text
+            .trim_end_matches(['\n', '\r'])
+            .lines()
+            .map(|l| l.trim_end_matches('\r').split('\t').collect())
+            .collect();
+        let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let f = self.focused();
+        let at = (f.cursor_row, f.cursor_col);
+        let block = f.block_keys(&self.model, at, (rows.len(), width));
+        // Parse everything first: a bad cell refuses the paste, untouched.
+        let mut cells = Vec::new();
+        for (keys, texts) in block.iter().zip(&rows) {
+            for (key, t) in keys.iter().zip(texts) {
+                let t = t.trim();
+                let v = if t.is_empty() {
+                    None
+                } else {
+                    Some(
+                        parse_typed(&self.model, &self.locale, declared, t)
+                            .map_err(|e| format!("paste refused at {t:?}: {e}"))?,
+                    )
+                };
+                cells.push((key.clone(), v));
+            }
+        }
+        if cells.is_empty() {
+            return Err("nothing to paste".into());
+        }
+        let n = cells.len();
+        let given: usize = rows.iter().map(Vec::len).sum();
+        let (inverse, saved) = self
+            .apply_step(Step::Cells(measure, cells))
+            .map_err(|(e, _)| e)?;
+        self.record_step(inverse);
+        saved?;
+        let pasted = format!("pasted {n} cell{}", if n == 1 { "" } else { "s" });
+        // Improv: "If the pasteboard selection does not fit at the selected
+        // position, you are warned that the selection will be clipped".
+        Ok(if given > n {
+            format!(
+                "{pasted}; {} past the worksheet's edge were clipped",
+                given - n
+            )
+        } else {
+            pasted
+        })
+    }
+
+    /// The numeric sum over the focused matrix's selection, or `None` when
+    /// nothing numeric is selected (no measure, no addressable cell, an empty
+    /// cell, or a text/boolean/date/error cell). See [`Self::selection_readout`].
+    pub fn selection_sum(&self) -> Option<f64> {
+        let measure = self.selected()?;
+        if matches!(self.focused().part, SelPart::Items { .. }) {
+            return None;
+        }
+        let nums: Vec<f64> = self
+            .focused()
+            .selection_keys(&self.model)
+            .iter()
+            .filter_map(|k| self.cell_value(measure, k).and_then(|v| v.as_num()))
+            .collect();
+        (!nums.is_empty()).then(|| nums.iter().sum())
+    }
+
+    /// The workspace: a `#555555` desktop with each matrix floating on it as
+    /// its own NeXT worksheet window (spec §5). The workspace does not scroll;
+    /// each window's grid scrolls itself, and `Matrix::rect` holds the window
+    /// rect relative to the workspace's top-left, so views persist it.
+    ///
+    /// The focused matrix's window is made key before the windows are shown,
+    /// so a code-driven focus change (`add_matrix`, `apply_view`) shows as the
+    /// key title bar; a press on another window then makes it key, and that
+    /// is read back into the focus.
+    fn canvas_panel(&mut self, root: &mut egui::Ui) -> egui::Rect {
+        let ctx = &root.ctx().clone();
+        let ws = {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(crate::theme::DARK_GRAY))
+                .show(root, |ui| {
+                    if self.model.measures.is_empty() {
+                        // Right of the menu, where a first worksheet would open (H1-13).
+                        let at = ui.max_rect().min + egui::vec2(MENU_CLEAR, 8.0);
+                        let loading = format!("Loading {}…", self.file_name());
+                        ui.painter().text(
+                            at,
+                            egui::Align2::LEFT_TOP,
+                            if self.loading.is_some() {
+                                &loading
+                            } else {
+                                EMPTY_HINT
+                            },
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            crate::theme::WHITE,
+                        );
+                    }
+                    ui.max_rect()
+                })
+                .inner
+        };
+        self.desk = ws.size();
+        if self.model.measures.is_empty() {
+            return ws;
+        }
+        // ponytail: matrix windows own the key slot. A click on the browser or
+        // Info panel makes it key for that frame only; let it keep the key
+        // (and fence grid keys off) when a panel needs the keyboard.
+        crate::nxwin::make_key(ctx, matrix_window_id(self.focused().uid));
+        let mut closed = Vec::new();
+        for mi in 0..self.matrices.len() {
+            if !self.matrix_window(ctx, ws, mi) {
+                closed.push(mi);
+            }
+        }
+        for mi in closed.into_iter().rev() {
+            self.remove_matrix(mi);
+        }
+        ws
+    }
+
+    /// Matrix `mi` as a worksheet window on the workspace `ws`: filter shelf,
+    /// the gutter-framed grid, and the formula list (with Calc) below it. Returns `false` when its close box was
+    /// clicked (shown only while there is more than one matrix).
+    fn matrix_window(&mut self, ctx: &egui::Context, ws: egui::Rect, mi: usize) -> bool {
+        let Matrix { uid, rect: r, .. } = self.matrices[mi];
+        let rect = egui::Rect::from_min_size(ws.min + egui::vec2(r.x, r.y), egui::vec2(r.w, r.h));
+        let id = matrix_window_id(uid);
+        let mut open = true;
+        let closable = self.matrix_count() > 1;
+        // `m.rect` is the source of truth: passed in every frame, so a
+        // programmatic change (apply_view) moves the window, and read back
+        // below, so a drag or resize lands in the view.
+        let mut mini = false;
+        let mut win = crate::nxwin::NxWindow::new(("matrix", uid), self.window_title(mi))
+            .rect(rect)
+            .min_size(egui::vec2(MATRIX_MIN_W, MATRIX_MIN_H))
+            .bounds(ws)
+            .resizable(true)
+            .standard()
+            .edited(self.dirty)
+            .miniaturizable(&mut mini);
+        if closable {
+            win = win.closable(&mut open);
+        }
+        let _ = win.show(ctx, |ui| {
+            let outer_clip = ui.clip_rect();
+            egui::Panel::bottom(ui.scope_id().with("formula_pane"))
+                .resizable(true)
+                .default_size(110.0)
+                // Never squeeze the gutters and grid below what framing needs.
+                .max_size((ui.available_height() - GRID_MIN_H).max(0.0))
+                .frame(egui::Frame::NONE.fill(crate::theme::WHITE))
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    ui.shrink_clip_rect(outer_clip);
+                    self.formula_list(ui, mi);
+                });
+            self.gutter_frame(ui, mi);
+        });
+        // shortcut: a worksheet window cannot shrink to a NeXT miniwindow
+        // inside the one native window, so miniaturize minimizes that, as
+        // Hide does; draw miniwindows on the workspace if it matters.
+        if mini {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+        if let Some(after) = crate::nxwin::stored_rect(ctx, id).filter(|a| *a != rect) {
+            self.matrices[mi].rect = CanvasRect {
+                x: after.min.x - ws.min.x,
+                y: after.min.y - ws.min.y,
+                w: after.width(),
+                h: after.height(),
+            };
+        }
+        if crate::nxwin::is_key(ctx, id) && self.focus_index() != mi {
+            self.set_focus(mi);
+        }
+        open
+    }
+
+    /// A worksheet window's title (spec §4.3): `Sales: North - Worksheet -
+    /// demo`, the file being the store's stem or `Untitled` when in memory.
+    pub fn window_title(&self, mi: usize) -> String {
+        format!(
+            "{} - Worksheet - {}",
+            self.matrix_title(mi),
+            self.file_name()
+        )
+    }
+
+    /// Send the native title when it changed. An in-memory model is dirty
+    /// whenever it has undo history (nothing ever persists it).
+    fn sync_native_title(&mut self, ctx: &egui::Context) {
+        if self.db.is_empty() {
+            self.dirty = self.can_undo();
+        }
+        let t = self.native_title();
+        if t != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(t.clone()));
+            self.last_title = t;
+        }
+    }
+
+    /// The native window title: `Improv — <file>`, plus ` •` while dirty,
+    /// and ` — Loading…` while the model loads.
+    pub(crate) fn native_title(&self) -> String {
+        format!(
+            "Improv — {}{}{}",
+            self.file_name(),
+            if self.dirty { " •" } else { "" },
+            if self.loading.is_some() {
+                " — Loading…"
+            } else {
+                ""
+            }
+        )
+    }
+
+    /// The store's file stem, or `Untitled` when in memory.
+    fn file_name(&self) -> &str {
+        if improv_store::is_postgres(&self.db) {
+            // `postgres://…?model=<name>`: the model's name, never the DSN.
+            return self
+                .db
+                .rsplit_once("model=")
+                .map_or("Untitled", |(_, m)| m.split('&').next().unwrap_or(m));
+        }
+        std::path::Path::new(&self.db)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled")
+    }
+
+    /// A matrix's title text: its measure's name, plus the pinned page items
+    /// after a colon (`Sales: North`) \u2014 the reference's
+    /// `Property Financials: Virginia Ave`.
+    pub fn matrix_title(&self, mi: usize) -> String {
+        let Some(m) = self.matrices.get(mi) else {
+            return String::new();
+        };
+        let name = m
+            .measure
+            .and_then(|id| self.model.measures.get(&id))
+            .map(|x| x.name.0.clone())
+            .unwrap_or_else(|| "(no measure)".to_string());
+        let slice: Vec<String> = m
+            .pinned_pages(&self.model)
+            .iter()
+            .filter_map(|(_, it)| self.model.items.get(it).map(|x| x.name.0.clone()))
+            .collect();
+        if slice.is_empty() {
+            name
+        } else {
+            format!("{name}: {}", slice.join(", "))
+        }
+    }
+
+    /// The grid inside its **margin gutters** — the Improv pivot surface.
+    ///
+    /// Reference: `docs/reviews/refs/improv-pivot-gesture.jpg`. Category tiles
+    /// are docked in gutters that *frame* the table, and the pivot gesture IS
+    /// dragging a tile from one gutter to another:
+    ///
+    /// ```text
+    ///   +- corner --+- TOP gutter: column-axis tiles, stacked ---+
+    ///   | (blank)   |  || Travel v                               |
+    ///   |           |  || Hours  v                               |
+    ///   +-----------+----------------------------------------------+
+    ///   | LEFT      |                                              |
+    ///   | gutter:   |    the table (ruled headers + cells)         |
+    ///   | row-axis  |                                              |
+    ///   | tiles     |                                              |
+    ///   +-----------+----------------------------------------------+
+    ///   | WELL (bottom-left, inline with the horizontal scrollbar  |
+    ///   | in the reference): page/unplaced tiles + page selectors  |
+    ///   +----------------------------------------------------------+
+    /// ```
+    ///
+    /// Adjacency is **constructed, not hoped for**: the gutters are nested
+    /// [`egui::Panel`]s inside this `Ui`, and a
+    /// panel's contract is that it consumes its strip and moves the parent
+    /// cursor to its far edge, so whatever is laid out next starts exactly at
+    /// that edge. Each panel's own rect and the table's `min_rect` are recorded
+    /// in that MATRIX's own `gutters` field, `debug_assert!`ed against
+    /// [`gutters_frame_table`] every frame, and asserted in the headless layout
+    /// test — per matrix, so every matrix on the canvas frames its own table.
+    ///
+    /// Gutter *thickness* along the docked axis is left to the panels: they size
+    /// to their content (a panel re-reads its extent from the previous frame's
+    /// `PanelState`), so stacking another tile makes the gutter grow rather than
+    /// clip it against a hard-coded height. NeXT layout: page tiles (each
+    /// over its item field) top-left, column tiles top-right, row tiles in the
+    /// bottom strip; there is no gutter beside the table.
+    fn gutter_frame(&mut self, ui: &mut egui::Ui, mi: usize) {
+        let Some(m) = self.matrices.get(mi) else {
+            return;
+        };
+        let Some(measure) = m.measure else {
+            ui.weak("(no measure)");
+            return;
+        };
+        let uid = m.uid;
+        let mut moves: Vec<(CategoryId, Axis)> = Vec::new();
+        let mut freqs: Vec<TileReq> = Vec::new();
+        let col_stack = m.col_cats(&self.model);
+        let row_stack = m.row_cats(&self.model);
+        // Each page category with its item names and the current item's index.
+        let pages: Vec<(CategoryId, Vec<String>, usize)> = m
+            .page_cats(&self.model)
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let items: Vec<String> = m
+                    .sorted_items(&self.model, c)
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .collect();
+                let cur = m
+                    .page_idx
+                    .get(i)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(items.len().saturating_sub(1));
+                (c, items, cur)
+            })
+            .collect();
+        let mut page_pick: Option<(usize, usize)> = None;
+        // Each gutter panel's `show_inside` REPLACES its clip with the panel
+        // rect instead of intersecting it, so tiles escaped the canvas and drew
+        // over the side panels. The panels get no frame; each body first
+        // narrows its clip back to the canvas, then paints the gutter frame
+        // itself, so the frame and everything in it stay clipped.
+        let outer_clip = ui.clip_rect();
+        let mut hbar = egui::Rect::NOTHING;
+
+        // The row gutter: the bottom strip, row tiles left to right (the
+        // reference puts them inline with the horizontal scrollbar).
+        let well = egui::Panel::bottom(ui.scope_id().with("gutter_well"))
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                ui.shrink_clip_rect(outer_clip);
+                Self::gutter_style().show(ui, |ui| {
+                    Self::gutter_drop_zone(ui, Axis::Rows, true, &mut moves, |ui, moves| {
+                        ui.horizontal(|ui| {
+                            for c in &row_stack {
+                                Self::tile(ui, &self.model, m, *c, Axis::Rows, moves, &mut freqs);
+                            }
+                            // §4.4: the horizontal scroller runs inline, right
+                            // of the row tiles (painted once the grid is laid
+                            // out and its scroll extent known).
+                            let h = ui.spacing().scroll.bar_width;
+                            hbar = ui
+                                .allocate_exact_size(
+                                    egui::vec2(ui.available_width(), h),
+                                    egui::Sense::hover(),
+                                )
+                                .0;
+                        });
+                    });
+                });
+            })
+            .response
+            .rect;
+
+        // The top strip: page tiles (each over its item field) at the left,
+        // column tiles stacked top to bottom at the right.
+        let top = egui::Panel::top(ui.scope_id().with("gutter_top"))
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .resizable(false)
+            .show(ui, |ui| {
+                ui.shrink_clip_rect(outer_clip);
+                Self::gutter_style().show(ui, |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        Self::gutter_drop_zone(ui, Axis::Pages, false, &mut moves, |ui, moves| {
+                            ui.horizontal_top(|ui| {
+                                for (i, (c, items, cur)) in pages.iter().enumerate() {
+                                    ui.vertical(|ui| {
+                                        Self::tile(
+                                            ui,
+                                            &self.model,
+                                            m,
+                                            *c,
+                                            Axis::Pages,
+                                            moves,
+                                            &mut freqs,
+                                        );
+                                        if let Some(pick) =
+                                            Self::page_field(ui, uid, *c, items, *cur)
+                                        {
+                                            page_pick = Some((i, pick));
+                                        }
+                                    });
+                                }
+                            });
+                        });
+                        Self::gutter_drop_zone(ui, Axis::Columns, true, &mut moves, |ui, moves| {
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
+                                for c in &col_stack {
+                                    Self::tile(
+                                        ui,
+                                        &self.model,
+                                        m,
+                                        *c,
+                                        Axis::Columns,
+                                        moves,
+                                        &mut freqs,
+                                    );
+                                }
+                            });
+                        });
+                    });
+                });
+            })
+            .response
+            .rect;
+
+        // No row gutter beside the table any more (render_grid draws the row
+        // header stubs); `left` is the table's zero-width left edge, so the
+        // framing invariants still describe the layout.
+        let body = ui.available_rect_before_wrap();
+        let left = egui::Rect::from_min_max(body.left_top(), body.left_bottom());
+
+        // Whatever is left is the table, between the two strips.
+        // On a white field: NeXT grid cells are white, not panel gray.
+        let field = ui.available_rect_before_wrap();
+        ui.painter()
+            .rect_filled(field, egui::CornerRadius::ZERO, crate::theme::WHITE);
+        let mut hscroll = None;
+        let table = egui::Frame::NONE
+            .show(ui, |ui| {
+                hscroll = self.render_grid(ui, mi, measure);
+            })
+            .response
+            .rect;
+        if let Some(h) = hscroll.filter(|_| hbar.is_positive()) {
+            crate::theme::hscroller_chrome(ui, &h, hbar, 20.0);
+        }
+
+        let rects = GutterRects {
+            top,
+            left,
+            table,
+            well,
+            hbar,
+        };
+        debug_assert!(
+            !gutters_have_room(&rects) || gutters_frame_table(&rects),
+            "matrix {mi}'s gutters must frame its table: {rects:?}"
+        );
+        if let Some(m) = self.matrices.get_mut(mi) {
+            m.gutters = Some(rects);
+        }
+
+        if let Some((dim, idx)) = page_pick {
+            let model = &self.model;
+            if let Some(m) = self.matrices.get_mut(mi) {
+                m.set_page(model, dim, idx);
+            }
+        }
+
+        // A drop (or a tile-menu filter) changes THIS matrix, not the focused
+        // one: a tile in one matrix must not touch another matrix.
+        let model = &self.model;
+        let mut new_items = Vec::new();
+        if let Some(m) = self.matrices.get_mut(mi) {
+            for (c, axis) in moves {
+                m.set_axis(model, c, axis);
+            }
+            for r in freqs {
+                match r {
+                    TileReq::Toggle(c, i) => m.toggle_filter_item(model, c, i),
+                    TileReq::Clear(c) => m.clear_filter(model, c),
+                    TileReq::AddItem(field, c, name) => new_items.push((field, c, name)),
+                }
+            }
+        }
+        for (field, c, name) in new_items {
+            self.run_add(ui.ctx(), field, NewThing::Item(c), &name);
+        }
+    }
+
+    /// The NeXT-groove frame a gutter is painted with.
+    fn gutter_style() -> egui::Frame {
+        egui::Frame::default()
+            .fill(crate::theme::LIGHT_GRAY)
+            .inner_margin(egui::Margin::same(2))
+            .stroke(egui::Stroke::new(1.0_f32, crate::theme::DARK_GRAY))
+    }
+
+    /// Make the whole of `ui` a drop target for category tiles: a category
+    /// released here is recorded as a move to `axis`, which
+    /// [`Matrix::set_axis`] applies (appending to that axis' stack). The zone is
+    /// at least one tile tall so an empty axis is still droppable; `fill`
+    /// stretches it across the rest of the strip (never along a self-sizing
+    /// panel's own axis, which would ratchet the panel bigger every frame).
+    ///
+    /// The drop highlight is painted only while a tile is in flight; at rest
+    /// the zone is just its tiles, and a non-filling empty zone (Pages) takes
+    /// no room until a drag needs a target.
+    fn gutter_drop_zone(
+        ui: &mut egui::Ui,
+        axis: Axis,
+        fill: bool,
+        moves: &mut Vec<(CategoryId, Axis)>,
+        contents: impl FnOnce(&mut egui::Ui, &mut Vec<(CategoryId, Axis)>),
+    ) {
+        let dragging = egui::DragAndDrop::has_payload_of_type::<CategoryId>(ui.ctx());
+        let body = |ui: &mut egui::Ui, moves: &mut Vec<(CategoryId, Axis)>| {
+            if fill {
+                ui.set_min_width(ui.available_width());
+            } else if dragging {
+                ui.set_min_width(4.0 * TILE_H);
+            }
+            ui.set_min_height(TILE_H);
+            contents(ui, moves);
+        };
+        if !dragging {
+            ui.scope(|ui| body(ui, moves));
+            return;
+        }
+        let (_, dropped) =
+            ui.dnd_drop_zone::<CategoryId, ()>(egui::Frame::default(), |ui| body(ui, moves));
+        if let Some(c) = dropped {
+            moves.push((*c, axis));
+        }
+    }
+
+    /// A page category's item field: a white drop-down showing the current
+    /// item. Returns the index picked this frame, if any.
+    fn page_field(
+        ui: &mut egui::Ui,
+        uid: u64,
+        c: CategoryId,
+        items: &[String],
+        cur: usize,
+    ) -> Option<usize> {
+        let mut pick = None;
+        ui.scope(|ui| {
+            let w = &mut ui.visuals_mut().widgets;
+            for v in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+                v.weak_bg_fill = crate::theme::WHITE;
+                v.bg_fill = crate::theme::WHITE;
+            }
+            egui::ComboBox::from_id_salt(("page", uid, c.0))
+                .selected_text(items.get(cur).cloned().unwrap_or_default())
+                .show_ui(ui, |ui| {
+                    for (k, name) in items.iter().enumerate() {
+                        if ui.selectable_label(k == cur, name).clicked() {
+                            pick = Some(k);
+                        }
+                    }
+                });
+        });
+        pick
+    }
+
+    /// One category tile: the NeXT chip — a fixed 17 px dark-gray box with the
+    /// category name in white. The whole chip is a drag source, so dragging it
+    /// into another gutter re-pivots (the drop is handled by
+    /// [`ImprovApp::gutter_drop_zone`]). Right-click opens a "Move to …" menu,
+    /// the drag-free (and accessible) way to re-pivot, and below it a checkbox
+    /// per item filtering `c` in matrix `m` (plus "Show all"). A filtered
+    /// category's tile reads `Name*`. Last in that menu, a New item line adds
+    /// an item to `c`.
+    fn tile(
+        ui: &mut egui::Ui,
+        model: &Model,
+        m: &Matrix,
+        c: CategoryId,
+        from: Axis,
+        moves: &mut Vec<(CategoryId, Axis)>,
+        freqs: &mut Vec<TileReq>,
+    ) {
+        let uid = m.uid;
+        let filter = m.filters.iter().find(|f| f.category == c);
+        let cat = model.categories.get(&c);
+        let mut name = cat.map_or_else(|| format!("category {}", c.0), |x| x.name.0.clone());
+        if filter.is_some() && m.opts.hidden_marker {
+            name.push('*');
+        }
+        // The full (unfiltered) item list, so hidden items can be re-shown.
+        let mut items: Vec<(ItemId, String)> = cat
+            .map(|cat| {
+                cat.items
+                    .iter()
+                    .filter_map(|id| model.items.get(id).map(|it| (*id, it.name.0.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        items.sort_by_key(|(id, _)| id.0);
+        // The id is per MATRIX as well as per category: two matrices showing
+        // the same category are two distinct drag sources.
+        let resp = ui
+            .dnd_drag_source(egui::Id::unique(("tile", uid, c.0)), c, |ui| {
+                egui::Frame::default()
+                    .fill(crate::theme::DARK_GRAY)
+                    .stroke(egui::Stroke::new(1.0_f32, crate::theme::BLACK))
+                    .inner_margin(egui::Margin::symmetric(6, 0))
+                    .show(ui, |ui| {
+                        // 17 px outer = 15 inner + 2 x 1 px stroke (egui
+                        // 0.30+ counts the stroke in the size, not the margin).
+                        ui.set_height(TILE_H - 2.0);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&name).color(crate::theme::WHITE))
+                                .selectable(false)
+                                .truncate(),
+                        );
+                    });
+            })
+            .response;
+        // egui 0.37's drag source senses drags only, and a context menu
+        // opens on a secondary click, so the tile senses that too (unless
+        // it is being dragged, when it is on another layer).
+        let resp = if resp.layer_id == ui.layer_id() {
+            let menu = ui.interact(resp.rect, resp.id.with("menu"), egui::Sense::CLICK);
+            resp | menu
+        } else {
+            resp
+        };
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::Role::Button,
+                true,
+                format!("{name} tile, on {from:?}: drag or open its menu"),
+            )
+        });
+        // The menu stays open while items are checked (egui 0.37 closes a
+        // context menu on any click by default).
+        egui::Popup::context_menu(&resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                for to in [Axis::Rows, Axis::Columns, Axis::Pages] {
+                    if to != from && ui.button(format!("Move to {to:?}")).clicked() {
+                        moves.push((c, to));
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                for (id, item) in &items {
+                    let mut shown = filter.is_none_or(|f| f.items.contains(id));
+                    if ui.checkbox(&mut shown, item).changed() {
+                        freqs.push(TileReq::Toggle(c, *id));
+                    }
+                }
+                if ui.button("Show all").clicked() {
+                    freqs.push(TileReq::Clear(c));
+                    ui.close();
+                }
+                // Improv's way to add an item: type it in the category's tile.
+                ui.separator();
+                let field = egui::Id::unique(("tile_new_item", uid, c.0));
+                if let Some(name) = add_line(ui, field, "New item", false) {
+                    freqs.push(TileReq::AddItem(field, c, name));
+                }
+            });
+    }
+
+    /// Handle keyboard navigation for the grid. Arrow keys (and h/j/k/l) move
+    /// the cursor; Enter/F2 begin editing the cursor cell; `[`/`]` and
+    /// PageUp/PageDown page the first page dimension; `n`/`N` cycle the
+    /// selected measure; Ctrl/Cmd+Z undoes and Ctrl/Cmd+Shift+Z (or Ctrl+Y)
+    /// redoes. Swallowed while a cell text field is open, or while ANY other
+    /// egui widget owns keyboard focus (so typing in the formula editor, the
+    /// new-measure form, the CSV wizard, or the view-name box never also drives
+    /// the grid). `n`/`N` (not Tab) drive measure cycling because egui reserves
+    /// Tab for widget focus.
+    ///
+    /// **Only the FOCUSED matrix consumes them** (plan Step 3): `mi` is the
+    /// matrix being rendered, and a matrix that does not have the keyboard
+    /// returns immediately — otherwise one arrow key would move every matrix's
+    /// cursor at once.
+    fn handle_grid_keys(&mut self, ui: &mut egui::Ui, mi: usize) {
+        if mi != self.focus_index() {
+            return;
+        }
+        // `memory().focused()` is egui's "which widget owns the keyboard";
+        // it is `None` again as soon as focus is released, so this gate is
+        // transient, never sticky. While a CELL is being edited the focused
+        // widget is the grid's own editor, which `editing` already covers
+        // (Enter/Esc are handled in the cell rendering below).
+        let other_focus = ui.ctx().memory(|m| m.focused()).is_some();
+        if !grid_keys_enabled(self.focused().editing.is_some(), other_focus) {
+            return;
+        }
+        use egui::Key;
+        let k = |key: Key| ui.input(|i| i.key_pressed(key));
+        let modifiers = ui.input(|i| i.modifiers);
+        // Edit ▸ Cut, Copy and Paste (Command-x, -c, -v): egui turns the
+        // chords into these events; a text field that has the keyboard
+        // takes them first (this runs only when none does).
+        let (copy, cut, paste) = ui.input(|i| {
+            let copy = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
+            let cut = i.events.iter().any(|e| matches!(e, egui::Event::Cut));
+            let paste = i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(t) => Some(t.clone()),
+                _ => None,
+            });
+            (copy, cut, paste)
+        });
+        if cut {
+            match self.cut_selection() {
+                Ok((text, said)) => {
+                    ui.ctx().copy_text(text);
+                    self.status = said;
+                }
+                Err(e) => self.status = e,
+            }
+        }
+        if copy {
+            if let Some(text) = self.copy_selection() {
+                let n = text.lines().count();
+                ui.ctx().copy_text(text);
+                self.status = format!("copied {n} row{}", if n == 1 { "" } else { "s" });
+            }
+        }
+        if let Some(text) = paste {
+            self.status = self.paste_cells(&text).unwrap_or_else(|e| e);
+            return;
+        }
+        // A typed key opens the editor holding just that key. An Enter in the
+        // same frame is left for the editor, drawn later, to commit it.
+        if !modifiers.command {
+            if let Some(typed) = take_typed(ui) {
+                self.begin_edit_typed(typed);
+                return;
+            }
+        }
+        // The Enter (or F2) that opens the cell editor is used up here: the
+        // editor is drawn later this frame and would take it as its commit.
+        let open = !modifiers.command
+            && ui.input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, Key::Enter)
+                    | i.consume_key(egui::Modifiers::NONE, Key::F2)
+            });
+
+        // Undo/redo (Ctrl/Cmd chords) are handled app-wide in
+        // `handle_command_keys`, not here — the grid is not rendered at all when
+        // no measure is selected, and undoing must still work there. Leaving
+        // every modified chord alone also keeps e.g. Ctrl+N from cycling
+        // measures.
+        if modifiers.command {
+            return;
+        }
+
+        if k(Key::ArrowUp) || k(Key::K) {
+            self.with_focused(|m, model| m.step(model, -1, 0, modifiers.shift));
+        }
+        if k(Key::ArrowDown) || k(Key::J) {
+            self.with_focused(|m, model| m.step(model, 1, 0, modifiers.shift));
+        }
+        if k(Key::ArrowLeft) || k(Key::H) {
+            self.with_focused(|m, model| m.step(model, 0, -1, modifiers.shift));
+        }
+        if k(Key::ArrowRight) || k(Key::L) {
+            self.with_focused(|m, model| m.step(model, 0, 1, modifiers.shift));
+        }
+        if open {
+            self.begin_edit_cursor();
+        }
+        // Page the first page dimension, if any.
+        if k(Key::CloseBracket) || k(Key::PageDown) {
+            self.page_first(1);
+        }
+        if k(Key::OpenBracket) || k(Key::PageUp) {
+            self.page_first(-1);
+        }
+        // Cycle measures with n / N (Tab is taken by egui focus).
+        if k(Key::N) {
+            let shift = ui.input(|i| i.modifiers.shift);
+            self.cycle_measure(if shift { -1 } else { 1 });
+        }
+    }
+
+    /// Cycle the focused matrix's first page dimension by `delta` (wrapping).
+    fn page_first(&mut self, delta: isize) {
+        self.with_focused(|m, model| m.page_first(model, delta));
+    }
+
+    /// Cycle the focused matrix's measure by `delta` (wrapping) in id order.
+    fn cycle_measure(&mut self, delta: isize) {
+        let mut ids: Vec<MeasureId> = self.model.measures.keys().copied().collect();
+        if ids.is_empty() {
+            return;
+        }
+        ids.sort_by_key(|m| m.0);
+        let cur = self
+            .selected()
+            .and_then(|s| ids.iter().position(|m| *m == s))
+            .unwrap_or(0);
+        let next = (cur as isize + delta).rem_euclid(ids.len() as isize) as usize;
+        self.focused_mut().select(Some(ids[next]));
+    }
+
+    /// Render matrix `mi`'s `measure` as a 2-D pivot grid using THAT MATRIX's
+    /// axis order: its row stack on rows, its column stack on columns, the rest
+    /// pinned to its selected page items. Input cells are editable; derived
+    /// read-only.
+    ///
+    /// Every read here goes through matrix `mi`, so two matrices showing the same
+    /// measure with different pivots render differently, and only the focused one
+    /// takes keystrokes (see [`Self::handle_grid_keys`]).
+    fn render_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        mi: usize,
+        measure: MeasureId,
+    ) -> Option<GridScroll> {
+        self.handle_grid_keys(ui, mi);
+        let m = self.matrices.get(mi)?;
+        let (sel_rows, sel_cols) = m.selection();
+        let shift = ui.input(|i| i.modifiers.shift);
+        let editing = m.editing.clone();
+        let mut edit_buf = m.edit_buf.clone();
+        let mut edit_select = m.edit_select.clone();
+        let uid = m.uid;
+        let is_derived = self
+            .model
+            .measures
+            .get(&measure)
+            .map(|m| m.is_derived())
+            .unwrap_or(false);
+        let is_number = self
+            .model
+            .measures
+            .get(&measure)
+            .is_some_and(|m| m.value_type == ValueType::Number);
+        let format = self.number_format(measure);
+        let cell_font = egui::TextStyle::Body.resolve(ui.style());
+
+        // Cartesian product of stacked categories per axis. Columns are
+        // materialized up front (they become egui table columns, which the
+        // TableBuilder needs before the body, and are few in practice). Rows
+        // are VIRTUALIZED: we hold only the per-category item lists and decode
+        // the i-th row tuple on demand (see `nth_tuple`), so a grid with
+        // millions of row lines never allocates them all.
+        let row_cats = m.row_cats(&self.model);
+        let col_cats = m.col_cats(&self.model);
+        // Record what this matrix is being drawn with (see `Matrix::rendered_axes`).
+        if let Some(m) = self.matrices.get_mut(mi) {
+            m.rendered_axes = Some((row_cats.clone(), col_cats.clone()));
+        }
+        let m = self.matrices.get(mi)?;
+        // A page category filtered to zero items pins nothing, so no coordinate
+        // would fully specify the measure's dimensions: render no cells at all.
+        let pinned = m.pinned_pages_opt(&self.model);
+        let pages_ok = pinned.is_some();
+        let pinned = pinned.unwrap_or_default();
+        let row_lists = m.axis_item_lists(&self.model, &row_cats);
+        // Total row lines: product of the row categories' filtered item counts.
+        // No row categories -> 1 (a genuinely scalar axis). Any row category
+        // filtered to zero items -> 0 lines: an empty grid with headers, never a
+        // synthetic line (that line's coordinate would omit the category, and
+        // `nth_tuple` would divide by a zero radix).
+        let total_rows = if pages_ok { product_len(&row_lists) } else { 0 };
+        // Column lines, materialized. `axis_tuples` already yields one empty
+        // tuple for a scalar axis (no col categories) and nothing at all for a
+        // category filtered to zero items — keep both as-is.
+        let col_lines = if pages_ok {
+            m.axis_tuples(&self.model, &col_cats)
+        } else {
+            Vec::new()
+        };
+        let n_row_stub = row_cats.len().max(1); // stub columns (one per row cat)
+        let n_col_hdr = col_cats.len().max(1); // header rows (one per col cat)
+
+        // Decode the i-th row tuple on demand (empty when there are no row
+        // categories -> the single scalar row).
+        let row_tuple_at = |lists: &[Vec<(ItemId, String)>], i: usize| -> Vec<(ItemId, String)> {
+            if lists.is_empty() {
+                Vec::new()
+            } else {
+                nth_tuple(lists, i)
+            }
+        };
+
+        // Edits collected during rendering, applied after the table closure so
+        // we don't borrow `self` mutably inside it.
+        let mut commit: Option<(CoordKey, String)> = None;
+        let mut clicked_derived = false;
+        let mut cancel = false;
+        // The cursor cell a click chose, applied after the closure.
+        let mut clicked_cell: Option<(usize, usize)> = None;
+        let mut begin_edit: Option<(CoordKey, String)> = None;
+        // Drag-select: where a drag began, whether one is live, and the visible
+        // cells' rects to find the one under the pointer.
+        let mut drag_from: Option<(usize, usize)> = None;
+        let mut dragging = false;
+        let mut cell_rects: Vec<((usize, usize), egui::Rect)> = Vec::new();
+        let formula_tip = if is_derived {
+            self.formula_source(measure)
+        } else {
+            None
+        };
+
+        // An item header: plain text in a ruled band, as in Improv. Only the
+        // category tiles look like draggable controls, so a header is a padded
+        // label, not a beveled chip. It rules its right edge, and its top edge
+        // when it starts a group (non-empty text), so blank outer row stubs
+        // read as one outlined group. Rules span what is left of the cell, so
+        // stacked column headers are ruled level by level.
+        const RULE: egui::Stroke = egui::Stroke {
+            width: 1.0,
+            color: crate::theme::BLACK,
+        };
+        // The Inspector's Grid page: whether the item area (the headers)
+        // and the cell area are ruled.
+        let opts = m.opts;
+        let ruled = |area: LinesIn| opts.lines && opts.lines_in != area;
+        let (item_rule, cell_rule) = (
+            if ruled(LinesIn::Cells) {
+                RULE
+            } else {
+                egui::Stroke::NONE
+            },
+            if ruled(LinesIn::Items) {
+                RULE
+            } else {
+                egui::Stroke::NONE
+            },
+        );
+        // An item header senses a click (not Tab: Select All and Items Only
+        // reach items from the keyboard), which selects that item.
+        let header_cell =
+            |ui: &mut egui::Ui, text: &str, selected: bool| -> Option<egui::Response> {
+                let r = ui.available_rect_before_wrap();
+                if selected {
+                    ui.painter().rect_filled(r, 0.0, crate::theme::LIGHT_GRAY);
+                }
+                let resp = (!text.is_empty() && !ui.is_sizing_pass()).then(|| {
+                    let resp =
+                        ui.interact(r, ui.scope_id().with(("item", text)), egui::Sense::CLICK);
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::Role::Button, true, format!("Item {text}"))
+                    });
+                    resp
+                });
+                ui.painter().vline(r.right() - 0.5, r.y_range(), item_rule);
+                if !text.is_empty() {
+                    ui.painter().hline(r.x_range(), r.top() + 0.5, item_rule);
+                }
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(4, 1))
+                    .show(ui, |ui| {
+                        // Drawn over the header's click sense, so it senses
+                        // nothing itself.
+                        ui.add(
+                            egui::Label::new(text)
+                                .truncate()
+                                .selectable(false)
+                                .sense(egui::Sense::hover()),
+                        );
+                    });
+                resp
+            };
+        // An item header clicked this frame: its axis (rows: true), its
+        // line and its level (outer category first).
+        let mut item_click: Option<(bool, usize, usize)> = None;
+        let part = m.part;
+        // The rule closing the header band from the body.
+        let band_bottom = |ui: &egui::Ui| {
+            let r = ui.max_rect();
+            ui.painter().hline(r.x_range(), r.bottom() - 0.5, item_rule);
+        };
+        let cat_name = |app: &ImprovApp, c: CategoryId| {
+            app.model
+                .categories
+                .get(&c)
+                .map(|x| x.name.0.clone())
+                .unwrap_or_default()
+        };
+
+        use egui_extras::{Column, TableBuilder};
+        // Salt the table id with the matrix uid: two matrices on one canvas are
+        // two tables, and sharing an id would make them fight over column widths
+        // and scroll offsets.
+        // Cells abut: the rules, not item spacing, separate them.
+        let spacing = ui.spacing().item_spacing;
+        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+        // §4.8: the trough is `extreme_bg_color`; restored after the table.
+        ui.visuals_mut().extreme_bg_color = crate::theme::TROUGH;
+        // A grid wider than its window scrolls sideways: the table sits in a
+        // horizontal area whose own bar is hidden, because the NeXT scroller
+        // runs in the bottom strip beside the row tiles (`gutter_frame`).
+        let (hkey, vkey) = (
+            egui::Id::unique(("hgrid_key", uid)),
+            egui::Id::unique(("grid_key", uid)),
+        );
+        let mut harea = egui::ScrollArea::horizontal();
+        if let Some(x) = crate::theme::pending_offset(ui.ctx(), hkey, 0) {
+            harea = harea.horizontal_scroll_offset(x);
+        }
+        let vpending = crate::theme::pending_offset(ui.ctx(), vkey, 1);
+        let hscroll = harea
+            .id_salt(("hgrid", uid))
+            .scroll_source(egui::scroll_area::ScrollSource {
+                drag: egui::scroll_area::DragScroll::Never,
+                ..Default::default()
+            })
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                let mut table = TableBuilder::new(ui)
+                    .id_salt(("grid", uid))
+                    .striped(false)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible);
+                if let Some(y) = vpending {
+                    table = table.vertical_scroll_offset(y);
+                }
+                // One stub column per stacked row category, then one column per col line.
+                for _ in 0..n_row_stub {
+                    table = table.column(Column::auto().resizable(true));
+                }
+                for _ in &col_lines {
+                    table = table.column(Column::auto().resizable(true));
+                }
+
+                let body = table
+                    .header(22.0 * n_col_hdr as f32, |mut header| {
+                        // Corner stub: the row category names stacked, then a header
+                        // block spanning the column-category rows. With egui_extras we
+                        // render the stacked column-category labels inside one tall
+                        // header cell per column line (outer→inner, top→bottom).
+                        for (si, rc) in row_cats.iter().enumerate() {
+                            let _ = si;
+                            header.col(|ui| {
+                                let _ = header_cell(ui, &cat_name(self, *rc), false);
+                                band_bottom(ui);
+                            });
+                        }
+                        if row_cats.is_empty() {
+                            header.col(|ui| {
+                                let _ = header_cell(ui, "", false);
+                                band_bottom(ui);
+                            });
+                        }
+                        for (ci, line) in col_lines.iter().enumerate() {
+                            let selected = sel_cols.contains(&ci);
+                            header.col(|ui| {
+                                ui.vertical(|ui| {
+                                    if line.is_empty() {
+                                        let _ = header_cell(ui, "", selected);
+                                    }
+                                    for (lvl, (_, name)) in line.iter().enumerate() {
+                                        let r = header_cell(ui, name, selected);
+                                        if r.is_some_and(|r| r.clicked()) {
+                                            item_click = Some((false, ci, lvl));
+                                        }
+                                    }
+                                });
+                                band_bottom(ui);
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        // Virtualized rows: `body.rows` only invokes the closure for the
+                        // rows currently visible in the viewport. Because rows are not
+                        // built contiguously, group outlining can't rely on a running
+                        // `prev` tracker — for row `ri` we decode row `ri-1`'s tuple on
+                        // demand and blank an outer stub cell when it matches.
+                        body.rows(20.0, total_rows, |mut row| {
+                            let ri = row.index();
+                            let row_line = row_tuple_at(&row_lists, ri);
+                            let prev_line = if ri > 0 {
+                                Some(row_tuple_at(&row_lists, ri - 1))
+                            } else {
+                                None
+                            };
+                            // Stub columns: one per stacked row category.
+                            let row_selected = sel_rows.contains(&ri);
+                            for si in 0..n_row_stub {
+                                let cell = row_line.get(si);
+                                // Centered vertically, level with the values.
+                                row.col(|ui| {
+                                    let centered = egui::Layout::left_to_right(egui::Align::Center);
+                                    ui.with_layout(centered, |ui| match cell {
+                                        Some((_id, name)) => {
+                                            // Show the label on the innermost stub always,
+                                            // and on an outer stub only when this level or
+                                            // any enclosing outer level changed from the
+                                            // row above — group outlining.
+                                            let inner = si + 1 == n_row_stub;
+                                            let changed = match &prev_line {
+                                                None => true,
+                                                Some(p) => (0..=si).any(|k| {
+                                                    row_line.get(k).map(|(id, _)| id)
+                                                        != p.get(k).map(|(id, _)| id)
+                                                }),
+                                            };
+                                            let shown = if inner || changed { name } else { "" };
+                                            let r = header_cell(ui, shown, row_selected);
+                                            if r.is_some_and(|r| r.clicked()) {
+                                                item_click = Some((true, ri, si));
+                                            }
+                                        }
+                                        None => {
+                                            let _ = header_cell(ui, "", row_selected);
+                                        }
+                                    });
+                                });
+                            }
+                            // Columns are not virtualized like rows: egui lays out
+                            // every one. Draw only the cells on screen, and stop
+                            // at the first column past the right edge (the header
+                            // still spans them all, so widths and the scroll
+                            // extent hold). The sizing pass measures every cell.
+                            // At 1,000 columns this took a frame from 125 ms.
+                            let mut past_right = false;
+                            for (ci, col_line) in col_lines.iter().enumerate() {
+                                if past_right {
+                                    break;
+                                }
+                                let selected = !matches!(part, SelPart::Items { .. })
+                                    && sel_rows.contains(&ri)
+                                    && sel_cols.contains(&ci);
+                                row.col(|ui| {
+                                    let r = ui.max_rect();
+                                    if !ui.is_sizing_pass() && !ui.is_rect_visible(r) {
+                                        past_right = r.left() > ui.clip_rect().right();
+                                        return;
+                                    }
+                                    let key = cell_key_multi(
+                                        &row_cats, &row_line, &col_cats, col_line, &pinned,
+                                    );
+                                    let editing_here =
+                                        editing.as_ref() == Some(&(measure, key.clone()));
+                                    // The sizing pass (a grid's first frame) measures
+                                    // every column: take only the width the value
+                                    // needs, as its label in the cell's margin would.
+                                    // Laying out each of 1,000 columns' label, frame
+                                    // and sense took 139 ms (H3).
+                                    if ui.is_sizing_pass() && !editing_here && !full_sizing() {
+                                        let text = self
+                                            .cell_value(measure, &key)
+                                            .map(|v| v.formatted(format.as_ref(), &self.locale))
+                                            .unwrap_or_default();
+                                        let w = ui.fonts_mut(|f| {
+                                            f.layout_no_wrap(
+                                                text,
+                                                cell_font.clone(),
+                                                egui::Color32::BLACK,
+                                            )
+                                            .size()
+                                            .x
+                                        });
+                                        ui.allocate_space(egui::vec2(w + 8.0, 0.0));
+                                        return;
+                                    }
+                                    // NeXT cell: white (light gray when selected), ruled
+                                    // right and bottom in black. No per-cell chrome.
+                                    let fill = if selected {
+                                        crate::theme::LIGHT_GRAY
+                                    } else {
+                                        crate::theme::WHITE
+                                    };
+                                    ui.painter().rect_filled(r, 0.0, fill);
+                                    ui.painter().vline(r.right() - 0.5, r.y_range(), cell_rule);
+                                    ui.painter().hline(r.x_range(), r.bottom() - 0.5, cell_rule);
+                                    cell_rects.push(((ri, ci), r));
+                                    let cell_id = egui::Id::unique(("cell", uid, ri, ci));
+                                    // H2: a screen reader hears the cell's place and value.
+                                    let cell_label = {
+                                        let place: Vec<&str> = row_line
+                                            .iter()
+                                            .chain(col_line.iter())
+                                            .map(|(_, n)| n.as_str())
+                                            .collect();
+                                        let v = self
+                                            .cell_shown(measure, &key)
+                                            .unwrap_or_else(|| "empty".to_owned());
+                                        format!("{}: {v}", place.join(", "))
+                                    };
+                                    let mut sense_cell = |ui: &mut egui::Ui| {
+                                        let resp =
+                                            ui.interact(r, cell_id, egui::Sense::click_and_drag());
+                                        resp.widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::Role::Cell,
+                                                true,
+                                                &cell_label,
+                                            )
+                                        });
+                                        if resp.drag_started() {
+                                            drag_from = Some((ri, ci));
+                                        }
+                                        dragging |= resp.dragged();
+                                        resp
+                                    };
+                                    egui::Frame::NONE
+                                        .inner_margin(egui::Margin::symmetric(4, 0))
+                                        .show(ui, |ui| {
+                                            // Numbers right-align so their digits line up,
+                                            // as in Improv; text, booleans and dates stay left.
+                                            let value = self.cell_value(measure, &key);
+                                            let numeric = matches!(value, Some(CellValue::Num(_)));
+                                            // Measure left-to-right in the table's sizing
+                                            // pass: a right-to-left layout fills the cell,
+                                            // which would size every auto column to its
+                                            // fallback width instead of its content.
+                                            // The Format panel's Alignment; Smart is
+                                            // numbers right, the rest left.
+                                            let right = numeric || (editing_here && is_number);
+                                            let align = match opts.align {
+                                                _ if ui.is_sizing_pass() => {
+                                                    egui::Layout::left_to_right(egui::Align::Center)
+                                                }
+                                                CellAlign::Right => {
+                                                    egui::Layout::right_to_left(egui::Align::Center)
+                                                }
+                                                CellAlign::Smart if right => {
+                                                    egui::Layout::right_to_left(egui::Align::Center)
+                                                }
+                                                CellAlign::Center => {
+                                                    egui::Layout::centered_and_justified(
+                                                        egui::Direction::TopDown,
+                                                    )
+                                                }
+                                                _ => {
+                                                    egui::Layout::left_to_right(egui::Align::Center)
+                                                }
+                                            };
+                                            let text = value
+                                                .map(|v| v.formatted(format.as_ref(), &self.locale))
+                                                .unwrap_or_default();
+                                            ui.with_layout(align, |ui| {
+                                                if is_derived {
+                                                    ui.add(
+                                                        egui::Label::new(text).selectable(false),
+                                                    );
+                                                    let mut resp = sense_cell(ui);
+                                                    if let Some(src) = &formula_tip {
+                                                        resp = resp.on_hover_text(format!(
+                                                            "formula: {src}"
+                                                        ));
+                                                    }
+                                                    if resp.clicked() {
+                                                        clicked_cell = Some((ri, ci));
+                                                        clicked_derived = true;
+                                                    }
+                                                } else if editing_here {
+                                                    crate::theme::content(ui);
+                                                    let edit_id =
+                                                        egui::Id::unique(("cell_editor", uid));
+                                                    let had_keys =
+                                                        ui.memory(|m| m.has_focus(edit_id));
+                                                    let resp = ui.add(
+                                                        egui::TextEdit::singleline(&mut edit_buf)
+                                                            .id(edit_id)
+                                                            .align(if is_number {
+                                                                egui::Align2::RIGHT_CENTER
+                                                            } else {
+                                                                egui::Align2::LEFT_CENTER
+                                                            })
+                                                            .desired_width(f32::INFINITY),
+                                                    );
+                                                    a11y_name(&resp, &cell_label);
+                                                    resp.request_focus();
+                                                    // Until it has the keyboard, which
+                                                    // keeps the selection from then on.
+                                                    if had_keys {
+                                                        edit_select = None;
+                                                    } else if let Some(r) = &edit_select {
+                                                        select_bytes(
+                                                            ui.ctx(),
+                                                            edit_id,
+                                                            &edit_buf,
+                                                            r.clone(),
+                                                        );
+                                                    }
+                                                    let enter = ui
+                                                        .input(|i| i.key_pressed(egui::Key::Enter));
+                                                    let esc = ui.input(|i| {
+                                                        i.key_pressed(egui::Key::Escape)
+                                                    });
+                                                    if esc {
+                                                        cancel = true;
+                                                    } else if resp.lost_focus() || enter {
+                                                        commit =
+                                                            Some((key.clone(), edit_buf.clone()));
+                                                    }
+                                                } else {
+                                                    // Typed display: text, booleans, dates, and
+                                                    // #ERR all render as themselves (never blank
+                                                    // just because they are not numbers).
+                                                    // Single click selects; double-click (or
+                                                    // Enter) edits. The whole cell senses.
+                                                    ui.add(
+                                                        egui::Label::new(text.clone())
+                                                            .selectable(false),
+                                                    );
+                                                    let resp = sense_cell(ui);
+                                                    if resp.clicked() || resp.double_clicked() {
+                                                        clicked_cell = Some((ri, ci));
+                                                    }
+                                                    if resp.double_clicked() {
+                                                        begin_edit = Some((key.clone(), text));
+                                                    }
+                                                    // Modern input mark: a faint inset underline.
+                                                    ui.painter().hline(
+                                                        r.left() + 2.0..=r.right() - 2.0,
+                                                        r.bottom() - 2.0,
+                                                        egui::Stroke::new(
+                                                            1.0_f32,
+                                                            crate::theme::LIGHT_GRAY,
+                                                        ),
+                                                    );
+                                                }
+                                            });
+                                        });
+                                });
+                            }
+                        });
+                    });
+
+                // §4.8 bevel + grouped arrows; one click = one 20 px row. The table's
+                // area auto-shrinks to its content, plus the bar on the right.
+                let size = body.content_size.min(body.inner_rect.size())
+                    + egui::vec2(ui.spacing().scroll.bar_width, 0.0);
+                let outer = egui::Rect::from_min_size(body.inner_rect.min, size);
+                (body, outer)
+            });
+        // The vertical scroller stays at the window's right edge, not the
+        // far end of a grid scrolled sideways.
+        let (body, outer) = &hscroll.inner;
+        let outer = outer.with_max_x(outer.max.x.min(hscroll.inner_rect.max.x));
+        crate::theme::remember_area(ui.ctx(), hkey, hscroll.id);
+        crate::theme::remember_area(ui.ctx(), vkey, body.id);
+        crate::theme::scroller_chrome(ui, body, outer, 20.0);
+        ui.spacing_mut().item_spacing = spacing;
+        crate::theme::content(ui);
+
+        // Apply what the closure recorded. A click in ANY matrix also focuses it,
+        // so typing follows the mouse rather than staying on whichever matrix had
+        // the keyboard.
+        if let Some(m) = self.matrices.get_mut(mi) {
+            m.edit_buf = edit_buf;
+            m.edit_select = edit_select;
+            if let Some((ri, ci)) = clicked_cell {
+                // Shift+click extends from the anchor (or the old cursor).
+                m.anchor = shift.then(|| m.anchor.unwrap_or((m.cursor_row, m.cursor_col)));
+                m.cursor_row = ri;
+                m.cursor_col = ci;
+                m.part = SelPart::Cells;
+            }
+            if let Some(start) = drag_from {
+                m.anchor = Some(start);
+                (m.cursor_row, m.cursor_col) = start;
+            }
+            if dragging {
+                let p = ui.ctx().pointer_latest_pos();
+                if let Some((at, _)) = cell_rects
+                    .iter()
+                    .find(|(_, r)| p.is_some_and(|p| r.contains(p)))
+                {
+                    (m.cursor_row, m.cursor_col) = *at;
+                }
+            }
+            if let Some((key, text)) = begin_edit {
+                m.open_editor(measure, key, text);
+            }
+            if cancel || commit.is_some() {
+                m.editing = None;
+                // It asked for the keyboard this frame; the grid takes it back
+                // now, not a frame later.
+                let id = egui::Id::unique(("cell_editor", uid));
+                ui.memory_mut(|mem| mem.surrender_focus(id));
+            }
+        }
+        if let Some((rows, line, level)) = item_click {
+            let model = Arc::clone(&self.model);
+            if let Some(m) = self.matrices.get_mut(mi) {
+                m.select_item(&model, rows, line, level, shift);
+            }
+        }
+        if clicked_cell.is_some() || item_click.is_some() {
+            self.set_focus(mi);
+        }
+        if cancel {
+            self.status = "edit cancelled".into();
+        }
+        if clicked_derived {
+            self.status = "derived cells are computed, not editable".into();
+        }
+        if let Some((key, text)) = commit {
+            self.status = match self.commit_cell_text(measure, key.clone(), &text) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    // Refused: the editor stays open with what was typed (H1-16).
+                    if let Some(m) = self.matrices.get_mut(mi) {
+                        m.edit_select = Some(text.len()..text.len());
+                        m.editing = Some((measure, key));
+                        m.edit_buf = text;
+                    }
+                    format!("edit error: {e}")
+                }
+            };
+        }
+        Some(hscroll)
+    }
+}
+
+/// The sorted `CoordKey` for a cell when categories are STACKED on each axis:
+/// `row_cats[i]` binds to `row_tuple[i]`, `col_cats[j]` to `col_tuple[j]`, plus
+/// the pinned page dims. Tuples come from `axis_tuples` so they align with the
+/// category list. The general form of `cell_key`.
+fn cell_key_multi(
+    row_cats: &[CategoryId],
+    row_tuple: &[(ItemId, String)],
+    col_cats: &[CategoryId],
+    col_tuple: &[(ItemId, String)],
+    pinned: &[(CategoryId, ItemId)],
+) -> CoordKey {
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    for (c, (it, _)) in row_cats.iter().zip(row_tuple.iter()) {
+        pairs.push((c.0, it.0));
+    }
+    for (c, (it, _)) in col_cats.iter().zip(col_tuple.iter()) {
+        pairs.push((c.0, it.0));
+    }
+    for (c, i) in pinned {
+        pairs.push((c.0, i.0));
+    }
+    pairs.sort();
+    CoordKey::from_vec(pairs)
+}
+
+/// The number of axis lines the Cartesian product of `lists` produces: the
+/// product of each list's length (empty `lists` -> 1, the scalar axis; any
+/// empty list -> 0, no lines). Mirrors `axis_tuples(..).len()` but is O(k) in
+/// the number of categories, never materializing the product.
+fn product_len(lists: &[Vec<(ItemId, String)>]) -> usize {
+    lists.iter().map(|l| l.len()).product()
+}
+
+/// The i-th line of the Cartesian product of `lists` (outer category first),
+/// by mixed-radix decoding of `i` across the list lengths — the inner (last)
+/// category is the least-significant digit, matching `axis_tuples`' ordering
+/// (which increments the inner category fastest). Returns the bound
+/// `(ItemId, name)` per category.
+///
+/// # Panics
+///
+/// `i` must be `< product_len(lists)`, which implies every list is non-empty.
+/// A list filtered to zero items means the axis has NO lines, so there is no
+/// `i`-th line to decode; callers (`grid_dims`, `render_grid`, `cursor_key`)
+/// render zero lines in that case rather than calling here. The check is a
+/// hard `assert!` (not `debug_assert!`) because `i % 0` is a divide-by-zero
+/// crash in release builds.
+///
+/// This is what lets the grid virtualize rows: instead of holding every row
+/// tuple in a Vec, we decode line `i` (and, for group outlining, line `i-1`)
+/// only when that row is actually painted.
+fn nth_tuple(lists: &[Vec<(ItemId, String)>], mut i: usize) -> Vec<(ItemId, String)> {
+    let mut out: Vec<(ItemId, String)> = vec![(ItemId(0), String::new()); lists.len()];
+    for (d, list) in lists.iter().enumerate().rev() {
+        let radix = list.len();
+        assert!(radix > 0, "empty category has no lines");
+        out[d] = list[i % radix].clone();
+        i /= radix;
+    }
+    out
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    #[allow(unused_imports)]
+    use crate::TestFrames as _;
+    /// Every glyph the GUI draws from a literal (tile grip/menu, error marker)
+    /// must be covered by the fonts `theme::install_fonts` installs (Arimo plus
+    /// egui's defaults as fallback), else it renders as a tofu box. `↶`/`↷` once
+    /// did. The application menu's glyphs are checked in `menu.rs`.
+    #[test]
+    fn literal_glyphs_are_in_default_fonts() {
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let _ = ctx.test_pass(egui::RawInput::default(), |_| {});
+        let prop = egui::FontId::proportional(14.0);
+        ctx.fonts_mut(|f| {
+            assert!(f.has_glyphs(&prop, "⚠"), "⚠ is tofu");
+        });
+    }
+
+    use super::*;
+    use improv_core_model::{
+        BinaryOp, DimensionSpec, Expr, Formula, Measure, MeasureKind, Name, ValueType,
+    };
+
+    fn revenue_model() -> Model {
+        let mut m = Model::new();
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        m.add_category(t, "Time");
+        m.add_category(p, "Product");
+        m.add_item(ItemId(10), t, "2025");
+        m.add_item(ItemId(20), p, "WidgetA");
+        m.add_measure(Measure {
+            id: MeasureId(100),
+            name: Name("Price".into()),
+            value_type: ValueType::Number,
+            categories: vec![p],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        m.add_measure(Measure {
+            id: MeasureId(101),
+            name: Name("Quantity".into()),
+            value_type: ValueType::Number,
+            categories: vec![t, p],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        m.add_measure(Measure {
+            id: MeasureId(102),
+            name: Name("Revenue".into()),
+            value_type: ValueType::Number,
+            categories: vec![t, p],
+            kind: MeasureKind::Derived(Formula::new(Expr::BinaryOp(
+                BinaryOp::Mul,
+                Box::new(Expr::Ref(MeasureId(100), DimensionSpec::default())),
+                Box::new(Expr::Ref(MeasureId(101), DimensionSpec::default())),
+            ))),
+            description: None,
+            format: None,
+        });
+        let c = |pairs: &[(CategoryId, ItemId)]| {
+            improv_core_model::Coordinate::from_pairs(pairs.iter().copied())
+        };
+        m.set_input(MeasureId(100), c(&[(p, ItemId(20))]), Value::Number(10.0));
+        m.set_input(
+            MeasureId(101),
+            c(&[(t, ItemId(10)), (p, ItemId(20))]),
+            Value::Number(7.0),
+        );
+        m
+    }
+
+    /// A revenue model without the Revenue derived measure (inputs only), for
+    /// exercising the formula-commit / add-derived flows.
+    fn inputs_only_model() -> Model {
+        let mut m = revenue_model();
+        m.measures.remove(&MeasureId(102));
+        m
+    }
+
+    #[test]
+    fn loads_and_computes_derived() {
+        let app = build_app(revenue_model());
+        // The first measure, Price, is selected by default (H1-34).
+        assert_eq!(app.selected(), Some(MeasureId(100)));
+        let vals = app.values_for(MeasureId(102));
+        let mut key: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        key.sort();
+        assert_eq!(vals.get(&key), Some(&70.0)); // 10 * 7
+    }
+
+    #[test]
+    fn editing_recomputes_derived() {
+        let mut app = build_app(revenue_model());
+        // Set Quantity[2025,WidgetA] = 9 -> Revenue = 90.
+        let mut qkey: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        qkey.sort();
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(9.0))
+            .unwrap();
+        let rev = app.values_for(MeasureId(102));
+        assert_eq!(rev.get(&qkey), Some(&90.0));
+    }
+
+    #[test]
+    fn editing_derived_is_rejected() {
+        let mut app = build_app(revenue_model());
+        let key: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        assert!(app
+            .set_cell(MeasureId(102), key, Value::Number(1.0))
+            .is_err());
+    }
+
+    #[test]
+    fn commit_formula_creates_and_recomputes() {
+        // Turn an input measure into a derived one via a formula string, then
+        // confirm the snapshot recomputes.
+        let mut app = build_app(inputs_only_model());
+        // Add a fresh target measure to hold the formula.
+        let rev = app
+            .add_derived_measure("Revenue", "Price * Quantity")
+            .expect("add derived");
+        let vals = app.values_for(rev);
+        let mut key: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        key.sort();
+        assert_eq!(vals.get(&key), Some(&70.0)); // 10 * 7
+                                                 // The measure is derived and its categories are the union {Time, Product}.
+        let m = &app.model.measures[&rev];
+        assert!(m.is_derived());
+        assert_eq!(m.categories, vec![CategoryId(1), CategoryId(2)]);
+    }
+
+    #[test]
+    fn commit_formula_updates_existing_derived() {
+        let mut app = build_app(revenue_model());
+        // Redefine Revenue = Price + Quantity -> 10 + 7 = 17.
+        app.commit_formula(MeasureId(102), "Price + Quantity")
+            .expect("commit");
+        let vals = app.values_for(MeasureId(102));
+        let mut key: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        key.sort();
+        assert_eq!(vals.get(&key), Some(&17.0));
+    }
+
+    #[test]
+    fn bad_formula_leaves_model_unchanged() {
+        let mut app = build_app(revenue_model());
+        let before = (*app.model).clone();
+        let err = app.commit_formula(MeasureId(102), "Price * Widgets");
+        assert!(err.is_err());
+        assert_eq!(*app.model, before, "model unchanged on parse error");
+        // Snapshot still computes the original Revenue.
+        let vals = app.values_for(MeasureId(102));
+        let mut key: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        key.sort();
+        assert_eq!(vals.get(&key), Some(&70.0));
+    }
+
+    #[test]
+    fn commit_formula_error_sets_and_clears_error_pos() {
+        let mut app = build_app(revenue_model());
+        assert_eq!(app.formula_error, None);
+
+        // A failing commit locates the error at the token the parser names.
+        let text = "Price * Widgets";
+        let err = app.commit_formula(MeasureId(102), text).unwrap_err();
+        let d = app.formula_error.clone().expect("located");
+        assert_eq!(d.span, Some(8..15));
+        assert_eq!(d.message, "unknown measure: Widgets");
+        assert!(err.contains("Widgets") || err.contains("measure"));
+
+        // A compile error has no position: the measure it names is marked.
+        app.commit_formula(MeasureId(102), "Quantity + LEN(Price)")
+            .unwrap_err();
+        let d = app.formula_error.clone().expect("located");
+        assert_eq!(d.span, Some(11..14), "{d:?}");
+        assert!(d.message.starts_with("type mismatch"), "{}", d.message);
+
+        // A successful commit clears any leftover error state too.
+        app.commit_formula(MeasureId(102), "Price + Quantity")
+            .expect("commit");
+        assert_eq!(app.formula_error, None);
+    }
+
+    #[test]
+    fn bad_add_derived_leaves_model_unchanged() {
+        let mut app = build_app(revenue_model());
+        let before = (*app.model).clone();
+        assert!(app
+            .add_derived_measure("Junk", "does not parse [[")
+            .is_err());
+        assert!(app.add_derived_measure("Revenue", "Price").is_err()); // dup name
+        assert_eq!(*app.model, before);
+    }
+
+    // -- BUG 2: the displayed formula must commit unchanged ----------------
+
+    /// Every formula shape the formula editor can display, for the round-trip.
+    /// `SQL(...)`/`CALL(...)` are measure *definitions* whose measures stay
+    /// `MeasureKind::Input` (see `cli::cmd_define`), so the formula editor shows
+    /// them the input hint, never editable formula text — nothing to round-trip.
+    fn displayable_formulas() -> Vec<(&'static str, Formula)> {
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        let price = || Expr::Ref(MeasureId(100), DimensionSpec::default());
+        let qty = || Expr::Ref(MeasureId(101), DimensionSpec::default());
+        let bin = |op, l: Expr, r: Expr| Expr::BinaryOp(op, Box::new(l), Box::new(r));
+        vec![
+            (
+                "binary op",
+                Formula::new(bin(BinaryOp::Mul, price(), qty())),
+            ),
+            (
+                "nested binary ops needing parens",
+                Formula::new(bin(
+                    BinaryOp::Mul,
+                    bin(BinaryOp::Add, price(), qty()),
+                    bin(BinaryOp::Sub, qty(), Expr::Literal(Value::Number(2.0))),
+                )),
+            ),
+            (
+                "right-nested same-precedence",
+                Formula::new(bin(
+                    BinaryOp::Sub,
+                    price(),
+                    bin(BinaryOp::Sub, qty(), Expr::Literal(Value::Number(1.0))),
+                )),
+            ),
+            (
+                "aggregation with OVER",
+                Formula::new(Expr::Call(
+                    FuncId(1), // SUM
+                    vec![Expr::Ref(
+                        MeasureId(101),
+                        DimensionSpec {
+                            by: vec![],
+                            over: vec![t],
+                            except: vec![],
+                        },
+                    )],
+                )),
+            ),
+            (
+                "scalar call",
+                Formula::new(Expr::Call(FuncId(10), vec![price()])), // ABS
+            ),
+            (
+                "two-arg scalar call",
+                Formula::new(Expr::Call(FuncId(20), vec![price(), qty()])), // MIN2
+            ),
+            (
+                "comparison",
+                Formula::new(bin(BinaryOp::Gt, price(), qty())),
+            ),
+            (
+                "logical over comparisons",
+                Formula::new(bin(
+                    BinaryOp::And,
+                    bin(BinaryOp::Gt, price(), qty()),
+                    Expr::UnaryOp(
+                        UnaryOp::Not,
+                        Box::new(bin(BinaryOp::Eq, qty(), Expr::Literal(Value::Number(0.0)))),
+                    ),
+                )),
+            ),
+            (
+                // `-(2^2)` prints as `-Price ^ 2`; `(-Price)^2` keeps its parens.
+                "power and negation",
+                Formula::new(bin(
+                    BinaryOp::Add,
+                    Expr::UnaryOp(UnaryOp::Neg, Box::new(bin(BinaryOp::Pow, price(), qty()))),
+                    bin(
+                        BinaryOp::Pow,
+                        Expr::UnaryOp(UnaryOp::Neg, Box::new(price())),
+                        bin(BinaryOp::Pow, qty(), price()),
+                    ),
+                )),
+            ),
+            (
+                "left-nested power",
+                Formula::new(bin(
+                    BinaryOp::Pow,
+                    bin(BinaryOp::Pow, price(), qty()),
+                    price(),
+                )),
+            ),
+            (
+                "concatenation is text",
+                Formula::new(bin(
+                    BinaryOp::Eq,
+                    bin(
+                        BinaryOp::Concat,
+                        bin(BinaryOp::Add, price(), qty()),
+                        price(),
+                    ),
+                    Expr::Literal(Value::Text("x".into())),
+                )),
+            ),
+            (
+                // `NOT a == b` parses as NOT (a == b), so a NOT that is itself
+                // compared must be parenthesized.
+                "a compared NOT",
+                Formula::new(bin(
+                    BinaryOp::Eq,
+                    Expr::UnaryOp(UnaryOp::Not, Box::new(bin(BinaryOp::Gt, price(), qty()))),
+                    Expr::Literal(Value::Boolean(false)),
+                )),
+            ),
+            (
+                "NOT of an AND",
+                Formula::new(Expr::UnaryOp(
+                    UnaryOp::Not,
+                    Box::new(bin(
+                        BinaryOp::And,
+                        bin(BinaryOp::Gt, price(), qty()),
+                        bin(BinaryOp::Lt, price(), qty()),
+                    )),
+                )),
+            ),
+            (
+                "unary negation of a group",
+                Formula::new(Expr::UnaryOp(
+                    UnaryOp::Neg,
+                    Box::new(bin(BinaryOp::Add, price(), qty())),
+                )),
+            ),
+            (
+                "dimension-projected ref",
+                Formula::new(bin(
+                    BinaryOp::Mul,
+                    Expr::Ref(
+                        MeasureId(101),
+                        DimensionSpec {
+                            by: vec![t, p],
+                            over: vec![],
+                            except: vec![],
+                        },
+                    ),
+                    price(),
+                )),
+            ),
+            (
+                "date literals",
+                Formula::new(bin(
+                    BinaryOp::Gt,
+                    // Built through the parser so the test needs no chrono dep.
+                    parser::parse_expr(&revenue_model(), "#2025-01-01#")
+                        .expect("date literal parses")
+                        .expr,
+                    parser::parse_expr(&revenue_model(), "#2024-06-30T12:00:00Z#")
+                        .expect("timestamp literal parses")
+                        .expr,
+                )),
+            ),
+            (
+                "boolean and text literals",
+                Formula::new(bin(
+                    BinaryOp::Or,
+                    Expr::Literal(Value::Boolean(true)),
+                    bin(
+                        BinaryOp::Eq,
+                        Expr::Literal(Value::Text("hello world".into())),
+                        Expr::Literal(Value::Text("x".into())),
+                    ),
+                )),
+            ),
+        ]
+    }
+
+    /// The invariant: the text the formula editor puts in its buffer commits
+    /// successfully UNCHANGED, leaving the AST and the computed snapshot alone.
+    #[test]
+    fn displayed_formula_commits_unchanged() {
+        for (label, formula) in displayable_formulas() {
+            let mut model = revenue_model();
+            model.measures.get_mut(&MeasureId(102)).unwrap().kind =
+                MeasureKind::Derived(formula.clone());
+            let mut app = build_app(model);
+            select(&mut app, MeasureId(102));
+
+            // Exactly what `formula_editor` seeds the buffer with.
+            let buf = app
+                .formula_source(MeasureId(102))
+                .unwrap_or_else(|| panic!("{label}: nothing displayed"));
+            assert!(!buf.is_empty(), "{label}: nothing displayed");
+
+            let before = app.snapshot.clone();
+            app.commit_formula(MeasureId(102), &buf)
+                .unwrap_or_else(|e| panic!("{label}: displayed {buf:?} did not commit: {e}"));
+
+            let after = match &app.model.measures[&MeasureId(102)].kind {
+                MeasureKind::Derived(f) => f.clone(),
+                MeasureKind::Input => panic!("{label}: measure stopped being derived"),
+            };
+            assert_eq!(
+                after, formula,
+                "{label}: AST changed by round-trip ({buf:?})"
+            );
+            assert!(app.engine.is_some(), "{label}: engine lost");
+            assert_eq!(app.snapshot, before, "{label}: snapshot changed ({buf:?})");
+        }
+    }
+
+    #[test]
+    fn displayed_dsl_is_the_symbolic_language_not_prose() {
+        // The plain revenue model's formula shows as DSL, minimally parenthesized.
+        let app = build_app(revenue_model());
+        assert_eq!(
+            app.formula_source(MeasureId(102)).as_deref(),
+            Some("Price * Quantity")
+        );
+        // Input measures have no formula text.
+        assert_eq!(app.formula_source(MeasureId(100)), None);
+        assert_eq!(app.formula_source(MeasureId(999)), None);
+    }
+
+    #[test]
+    fn the_deepest_formula_prints_on_a_windows_sized_main_thread() {
+        // MAX_FORMULA_DEPTH nested ABS(...) prints back to its source on
+        // 1 MiB, the main thread Windows gives the GUI.
+        let m = revenue_model();
+        let depth = improv_core_model::MAX_FORMULA_DEPTH;
+        let src = format!("{}Price{}", "ABS(".repeat(depth - 1), ")".repeat(depth - 1));
+        let f = improv_core_model::parse_formula(&m, &format!("R = {src}"))
+            .expect("parses at the limit")
+            .formula;
+        let printed = std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || formula_dsl(&m, &f))
+            .unwrap()
+            .join()
+            .expect("no overflow");
+        assert_eq!(printed.as_deref(), Some(src.as_str()));
+    }
+
+    #[test]
+    fn shapes_without_a_dsl_spelling_fall_back_to_cnl_and_still_commit() {
+        // `SUM(x OVER Time, Product)`: several OVER categories print as DSL
+        // and commit back to the same formula.
+        let mut model = revenue_model();
+        let f = Formula::new(Expr::Call(
+            FuncId(1),
+            vec![Expr::Ref(
+                MeasureId(101),
+                DimensionSpec {
+                    by: vec![],
+                    over: vec![CategoryId(1), CategoryId(2)],
+                    except: vec![],
+                },
+            )],
+        ));
+        model.measures.get_mut(&MeasureId(102)).unwrap().kind = MeasureKind::Derived(f.clone());
+        let mut app = build_app(model);
+
+        let buf = app.formula_source(MeasureId(102)).expect("displayable");
+        assert_eq!(buf, "SUM(Quantity OVER Time, Product)");
+        app.commit_formula(MeasureId(102), &buf).expect("commits");
+        match &app.model.measures[&MeasureId(102)].kind {
+            MeasureKind::Derived(got) => assert_eq!(*got, f),
+            MeasureKind::Input => panic!("stopped being derived"),
+        }
+    }
+
+    #[test]
+    fn dsl_printer_refuses_inexpressible_shapes() {
+        let model = revenue_model();
+        // A bare ref carrying `over` (no aggregation) and `except` have no
+        // spelling; so does an unknown function id and an enum literal.
+        let bare_over = Formula::new(Expr::Ref(
+            MeasureId(100),
+            DimensionSpec {
+                by: vec![],
+                over: vec![CategoryId(1)],
+                except: vec![],
+            },
+        ));
+        assert_eq!(formula_dsl(&model, &bare_over), None);
+        let excepted = Formula::new(Expr::Ref(
+            MeasureId(100),
+            DimensionSpec {
+                by: vec![],
+                over: vec![],
+                except: vec![CategoryId(1)],
+            },
+        ));
+        assert_eq!(formula_dsl(&model, &excepted), None);
+        let unknown_fn = Formula::new(Expr::Call(
+            FuncId(4242),
+            vec![Expr::Ref(MeasureId(100), DimensionSpec::default())],
+        ));
+        assert_eq!(formula_dsl(&model, &unknown_fn), None);
+        assert_eq!(
+            formula_dsl(&model, &Formula::new(Expr::Literal(Value::Enum(3)))),
+            None
+        );
+        // A negative literal has no token either (only unary minus does).
+        assert_eq!(
+            formula_dsl(&model, &Formula::new(Expr::Literal(Value::Number(-1.0)))),
+            None
+        );
+    }
+
+    // -- BUG 1: failed saves and bad formulas ------------------------------
+
+    #[test]
+    fn cell_edit_and_formula_commit_report_save_failure() {
+        // A store path under a directory that does not exist: every save fails.
+        let db = std::env::temp_dir()
+            .join(format!("improv_gui_no_such_dir_{}", std::process::id()))
+            .join("model.db")
+            .to_string_lossy()
+            .into_owned();
+        let mut app = build_app(revenue_model());
+        app.db = db;
+
+        let mut key: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        key.sort();
+        let err = app
+            .set_cell(MeasureId(101), key.clone(), Value::Number(9.0))
+            .expect_err("unwritable store must fail the edit");
+        assert!(err.starts_with("save failed:"), "got {err:?}");
+
+        let err = app
+            .commit_formula(MeasureId(102), "Price + Quantity")
+            .expect_err("unwritable store must fail the commit");
+        assert!(err.starts_with("save failed:"), "got {err:?}");
+
+        let err = app
+            .add_derived_measure("Margin", "Price - Quantity")
+            .expect_err("unwritable store must fail the add");
+        assert!(err.starts_with("save failed:"), "got {err:?}");
+        assert!(err.contains("not saved yet"), "says it plainly: {err}");
+
+        // The view save reports the failure in the status line.
+        assert!(app.save_view("L1").is_some());
+        assert!(app.status.starts_with("save failed:"), "{}", app.status);
+
+        // H3: a failed save keeps each change in the window, marked unsaved,
+        // for the next save to write: the edit, the formula, the measure and
+        // the view are all there, and the title says •.
+        assert_eq!(app.cell_text(MeasureId(101), &key).as_deref(), Some("9"));
+        assert_eq!(
+            app.formula_source(MeasureId(102)).as_deref(),
+            Some("Price + Quantity")
+        );
+        assert!(app.model.measure_by_name("Margin").is_some());
+        assert_eq!(app.model.views.len(), 1);
+        assert!(app.dirty && app.native_title().ends_with(" •"));
+        assert_eq!(app.unsaved.cells.len(), 1);
+        assert!(app.unsaved.structure);
+    }
+
+    #[test]
+    fn formula_that_fails_to_build_is_not_published() {
+        let mut app = build_app(revenue_model());
+        let before_model = (*app.model).clone();
+        let before_snapshot = app.snapshot.clone();
+
+        // Revenue = Revenue + Price parses fine but reads itself outside a
+        // PREV recurrence, so the engine cannot build.
+        let err = app
+            .commit_formula(MeasureId(102), "Revenue + Price")
+            .expect_err("a self-referencing formula must be rejected");
+        assert!(err.contains("refers to itself"), "got {err:?}");
+
+        assert_eq!(*app.model, before_model, "model preserved");
+        assert_eq!(app.snapshot, before_snapshot, "snapshot preserved");
+        assert!(app.engine.is_some(), "engine preserved");
+        assert_eq!(
+            app.formula_source(MeasureId(102)).as_deref(),
+            Some("Price * Quantity")
+        );
+        let mut key: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        key.sort();
+        assert_eq!(app.values_for(MeasureId(102)).get(&key), Some(&70.0));
+
+        // Same for a type error the parser accepts but the compiler rejects
+        // (comparison result fed to arithmetic).
+        let err = app
+            .commit_formula(MeasureId(102), "(Price > Quantity) * Price")
+            .expect_err("a type error must be rejected");
+        assert!(!err.is_empty());
+        assert_eq!(*app.model, before_model, "model preserved");
+        assert!(app.engine.is_some(), "engine preserved");
+
+        // And for add_derived_measure.
+        let err = app
+            .add_derived_measure("Bad", "(Price > Quantity) * Price")
+            .expect_err("a type error must be rejected");
+        assert!(!err.is_empty());
+        assert_eq!(*app.model, before_model, "model preserved");
+        assert!(app.engine.is_some(), "engine preserved");
+    }
+
+    #[test]
+    fn inspector_data_is_correct() {
+        let app = build_app(revenue_model());
+        let d = app.inspector_data(MeasureId(102)).expect("data");
+        assert_eq!(d.name, "Revenue");
+        assert!(d.is_derived);
+        assert_eq!(
+            d.dimensions,
+            vec!["Time".to_string(), "Product".to_string()]
+        );
+        let mut deps = d.dependencies.clone();
+        deps.sort();
+        assert_eq!(deps, vec!["Price".to_string(), "Quantity".to_string()]);
+        assert!(d.formula_english.is_some());
+        assert_eq!(d.error_cells, 0);
+
+        // Input measure: no deps, no formula.
+        let di = app.inspector_data(MeasureId(100)).expect("data");
+        assert!(!di.is_derived);
+        assert!(di.dependencies.is_empty());
+        assert!(di.formula_english.is_none());
+        assert_eq!(di.dimensions, vec!["Product".to_string()]);
+    }
+
+    /// Build an app directly from a model (bypassing the store) for tests: one
+    /// matrix on the canvas, showing the default measure, as a fresh
+    /// `ImprovApp::load` would.
+    fn build_app(model: Model) -> ImprovApp {
+        let (engine, snapshot) = build_engine(&model);
+        let selected = pick_default_measure(&model);
+        let matrices = vec![Matrix::new(&model, selected)];
+        ImprovApp {
+            db: String::new(),
+            save_token: improv_store::SaveToken::default(),
+            unsaved: Default::default(),
+            saving: None,
+            saver: None,
+            save_wanted: false,
+            save_failed: false,
+            save_lost: false,
+            model: Arc::new(model),
+            held: Vec::new(),
+            engine,
+            snapshot,
+            building: None,
+            loading: None,
+            background: BACKGROUND,
+            matrices,
+            focus: 0,
+            current_view: None,
+            status: String::new(),
+            formula_buf: String::new(),
+            formula_for: None,
+            formula_error: None,
+            locale: if cfg!(test) {
+                improv_core_model::Locale::en()
+            } else {
+                improv_core_model::Locale::from_env()
+            },
+            view_name: String::new(),
+            browser_sel: None,
+            show_chart: false,
+            chart_kind: Default::default(),
+            chart_parse: Default::default(),
+            chart_color: true,
+            show_csv_wizard: false,
+            import_form: ImportForm::default(),
+            show_inspector: false,
+            show_keys: false,
+            inspector: None,
+            format_panel: None,
+            page_layout: Default::default(),
+            report_layout: Default::default(),
+            show_page_layout: false,
+            show_report_layout: false,
+            print_panel: None,
+            help: None,
+            pointing: false,
+            help_click: None,
+            front: None,
+            fn_help: Default::default(),
+            formula_target: FormulaEditor::NewLine,
+            show_browser: true,
+            quit_armed: false,
+            dirty: false,
+            last_title: String::new(),
+            status_shown: String::new(),
+            status_at: 0.0,
+            menu: menu::MenuState::default(),
+            export_form: ExportForm::default(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            formula_row_rects: Vec::new(),
+            new_formula_line: String::new(),
+            new_formula_error: None,
+            file_panel: None,
+            file_focus: false,
+            file_path: String::new(),
+            reveal: None,
+            browser_pick: None,
+            renaming: None,
+            confirm_delete: None,
+            probed_at: f64::NEG_INFINITY,
+            outside: None,
+            heard: None,
+            listened: false,
+            data_seen: None,
+            reread: Reread::default(),
+            queued_import: None,
+            desk: egui::vec2(INITIAL_WINDOW[0], INITIAL_WINDOW[1]),
+        }
+    }
+
+    /// Point the app's FOCUSED matrix at `measure` (what tests used to do by
+    /// assigning `app.selected`). Kept as a helper so the many tests that select
+    /// a measure read the same as before.
+    fn select(app: &mut ImprovApp, measure: MeasureId) {
+        app.focused_mut().select(Some(measure));
+    }
+
+    // A 3-D input measure Sales[Time, Product, Region] for paging tests
+    // (mirrors the TUI's paging fixture).
+    fn sales_3d_model() -> Model {
+        let mut m = Model::new();
+        let (time, product, region) = (CategoryId(1), CategoryId(2), CategoryId(3));
+        m.add_category(time, "Time");
+        m.add_category(product, "Product");
+        m.add_category(region, "Region");
+        m.add_item(ItemId(10), time, "2025");
+        m.add_item(ItemId(20), product, "WidgetA");
+        m.add_item(ItemId(30), region, "North");
+        m.add_item(ItemId(31), region, "South");
+        m.add_measure(Measure {
+            id: MeasureId(200),
+            name: Name("Sales".into()),
+            value_type: ValueType::Number,
+            categories: vec![time, product, region],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        let c = |pairs: &[(CategoryId, ItemId)]| {
+            improv_core_model::Coordinate::from_pairs(pairs.iter().copied())
+        };
+        m.set_input(
+            MeasureId(200),
+            c(&[
+                (time, ItemId(10)),
+                (product, ItemId(20)),
+                (region, ItemId(30)),
+            ]),
+            Value::Number(100.0),
+        );
+        m.set_input(
+            MeasureId(200),
+            c(&[
+                (time, ItemId(10)),
+                (product, ItemId(20)),
+                (region, ItemId(31)),
+            ]),
+            Value::Number(250.0),
+        );
+        m
+    }
+
+    #[test]
+    fn set_axis_moves_category_from_columns_to_rows() {
+        // Quantity[Time, Product]: natural rows=Time(1), cols=Product(2).
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        let (r, c, _) = app.resolved_axes();
+        assert_eq!(r, Some(CategoryId(1))); // Time on rows
+        assert_eq!(c, Some(CategoryId(2))); // Product on cols
+
+        // Dragging Product onto Rows STACKS it under Time (both on rows), which
+        // is the Improv semantics; columns become empty.
+        app.set_axis(CategoryId(2), Axis::Rows);
+        assert_eq!(app.row_cats(), vec![CategoryId(1), CategoryId(2)]);
+        assert!(app.col_cats().is_empty());
+        let (r, c, _) = app.resolved_axes();
+        assert_eq!(r, Some(CategoryId(1)), "primary row is still Time");
+        assert_eq!(c, None, "no column category after stacking both on rows");
+    }
+
+    #[test]
+    fn stacked_rows_form_cartesian_product_with_correct_keys() {
+        // Quantity[Time, Product] with BOTH categories stacked on rows.
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        app.set_axis(CategoryId(2), Axis::Rows); // rows = [Time, Product]
+        assert_eq!(app.row_cats(), vec![CategoryId(1), CategoryId(2)]);
+
+        // The row axis is the product of Time items x Product items.
+        let tuples = app.axis_tuples(&app.row_cats());
+        // revenue_model has Time={2025(10)}, Product={WidgetA(20)} (1x1) here,
+        // so a single tuple binding both categories.
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].len(), 2, "tuple binds both stacked categories");
+        // The cell key for that row (no columns) binds Time AND Product, sorted.
+        let key = cell_key_multi(&app.row_cats(), &tuples[0], &[], &[], &[]);
+        assert_eq!(key.as_slice(), [(1, 10), (2, 20)]);
+        // Grid dims: 1 row line, 1 col line (no col categories).
+        assert_eq!(app.grid_dims(), (1, 1));
+    }
+
+    #[test]
+    fn nth_tuple_decodes_mixed_radix_and_matches_axis_tuples() {
+        // Row cats Time(4 items) x Region(2 items): 8 lines, inner (Region)
+        // varies fastest — same order as axis_tuples.
+        let time: Vec<(ItemId, String)> =
+            (0..4).map(|k| (ItemId(10 + k), format!("T{k}"))).collect();
+        let region: Vec<(ItemId, String)> =
+            (0..2).map(|k| (ItemId(30 + k), format!("R{k}"))).collect();
+        let lists = vec![time.clone(), region.clone()];
+        assert_eq!(product_len(&lists), 8);
+
+        // line 0 = (T0, R0); line 1 = (T0, R1); line 7 = (T3, R1).
+        assert_eq!(
+            nth_tuple(&lists, 0),
+            vec![time[0].clone(), region[0].clone()]
+        );
+        assert_eq!(
+            nth_tuple(&lists, 1),
+            vec![time[0].clone(), region[1].clone()]
+        );
+        assert_eq!(
+            nth_tuple(&lists, 7),
+            vec![time[3].clone(), region[1].clone()]
+        );
+
+        // Iterating 0..total reproduces the full Cartesian product built by the
+        // reference product-builder (same ordering as axis_tuples).
+        let mut reference: Vec<Vec<(ItemId, String)>> = vec![Vec::new()];
+        for list in &lists {
+            let mut next = Vec::new();
+            for prefix in &reference {
+                for it in list {
+                    let mut t = prefix.clone();
+                    t.push(it.clone());
+                    next.push(t);
+                }
+            }
+            reference = next;
+        }
+        let decoded: Vec<_> = (0..product_len(&lists))
+            .map(|i| nth_tuple(&lists, i))
+            .collect();
+        assert_eq!(decoded, reference);
+    }
+
+    #[test]
+    fn nth_tuple_matches_apps_axis_tuples() {
+        // Cross-check against the app's own axis_tuples on the 2x2 model.
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product]
+        app.sync_axis_state();
+        app.set_axis(CategoryId(2), Axis::Rows); // rows = [Time, Product] stacked
+        let cats = app.row_cats();
+        let lists = app.axis_item_lists(&cats);
+        let want = app.axis_tuples(&cats);
+        assert_eq!(product_len(&lists), want.len());
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(nth_tuple(&lists, i), *w, "line {i}");
+        }
+    }
+
+    #[test]
+    fn large_grid_row_count_is_correct_and_does_not_panic() {
+        // A synthetic model with a category of a few thousand items so the row
+        // product is large; the pure helpers must give the right count and
+        // decode any line without materializing the whole product.
+        let mut m = Model::new();
+        let (big, small) = (CategoryId(1), CategoryId(2));
+        m.add_category(big, "Big");
+        m.add_category(small, "Small");
+        let n_big = 5_000u32;
+        for k in 0..n_big {
+            m.add_item(ItemId(1_000 + k), big, format!("b{k}"));
+        }
+        for k in 0..3u32 {
+            m.add_item(ItemId(10 + k), small, format!("s{k}"));
+        }
+        m.add_measure(Measure {
+            id: MeasureId(300),
+            name: Name("M".into()),
+            value_type: ValueType::Number,
+            categories: vec![big, small],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        let mut app = build_app(m);
+        select(&mut app, MeasureId(300));
+        app.sync_axis_state();
+        // Stack both categories on rows -> 5000 * 3 = 15000 row lines.
+        app.set_axis(small, Axis::Rows);
+        assert_eq!(app.row_cats(), vec![big, small]);
+
+        let lists = app.axis_item_lists(&app.row_cats());
+        let total = product_len(&lists);
+        assert_eq!(total, (n_big as usize) * 3);
+        // grid_dims reports the same total (no column category -> 1 col).
+        assert_eq!(app.grid_dims(), (total, 1));
+
+        // Decode the first, a middle, and the last line without panic.
+        let first = nth_tuple(&lists, 0);
+        assert_eq!(first[0].0, ItemId(1_000));
+        assert_eq!(first[1].0, ItemId(10));
+        let last = nth_tuple(&lists, total - 1);
+        assert_eq!(last[0].0, ItemId(1_000 + n_big - 1));
+        assert_eq!(last[1].0, ItemId(12));
+        // A cursor deep in the grid resolves its key without materializing rows.
+        app.focused_mut().cursor_row = total - 1;
+        app.focused_mut().cursor_col = 0;
+        let key = app.cursor_key().expect("cursor addresses a cell");
+        let mut want: CoordKey =
+            improv_engine::smallvec::smallvec![(big.0, 1_000 + n_big - 1), (small.0, 12)];
+        want.sort();
+        assert_eq!(key, want);
+    }
+
+    #[test]
+    fn pivot_rotate_swaps_axes_and_back() {
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product]
+        app.sync_axis_state();
+        let (r0, c0, _) = app.resolved_axes();
+        assert_eq!((r0, c0), (Some(CategoryId(1)), Some(CategoryId(2))));
+
+        app.pivot_rotate();
+        let (r1, c1, _) = app.resolved_axes();
+        assert_eq!((r1, c1), (Some(CategoryId(2)), Some(CategoryId(1))));
+
+        app.pivot_rotate(); // back to start for a 2-D measure
+        let (r2, c2, _) = app.resolved_axes();
+        assert_eq!((r2, c2), (Some(CategoryId(1)), Some(CategoryId(2))));
+    }
+
+    #[test]
+    fn set_page_changes_pinned_item_and_cell_value() {
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        // One page dim (Region), pinned to North (index 0) by default.
+        let (_, _, pinned) = app.resolved_axes();
+        assert_eq!(pinned, vec![(CategoryId(3), ItemId(30))]); // North
+
+        // Cell [2025, WidgetA, North] = 100.
+        let vals = app.values_for(MeasureId(200));
+        let mut north: CoordKey =
+            improv_engine::smallvec::smallvec![(1u32, 10u32), (2, 20), (3, 30)];
+        north.sort();
+        assert_eq!(vals.get(&north), Some(&100.0));
+
+        // Page to South (index 1): pinned item and the visible value change.
+        app.set_page(0, 1);
+        let (_, _, pinned) = app.resolved_axes();
+        assert_eq!(pinned, vec![(CategoryId(3), ItemId(31))]); // South
+        let mut south: CoordKey =
+            improv_engine::smallvec::smallvec![(1u32, 10u32), (2, 20), (3, 31)];
+        south.sort();
+        assert_eq!(vals.get(&south), Some(&250.0));
+    }
+
+    #[test]
+    fn switching_measure_resets_axis_order() {
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        // Pivot away from natural order.
+        app.pivot_rotate();
+        assert_ne!(
+            app.focused().axis_order,
+            vec![CategoryId(1), CategoryId(2), CategoryId(3)]
+        );
+
+        // Add a 1-D measure and select it: axis order resets to its natural order.
+        Arc::make_mut(&mut app.model).add_measure(Measure {
+            id: MeasureId(201),
+            name: Name("Tax".into()),
+            value_type: ValueType::Number,
+            categories: vec![CategoryId(2)],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        select(&mut app, MeasureId(201));
+        app.sync_axis_state();
+        assert_eq!(app.focused().axis_order, vec![CategoryId(2)]);
+        assert!(app.focused().page_idx.is_empty());
+
+        // Back to Sales: natural order restored (not the pivoted one).
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        assert_eq!(
+            app.focused().axis_order,
+            vec![CategoryId(1), CategoryId(2), CategoryId(3)]
+        );
+    }
+
+    /// A 2x2 input measure Quantity[Time(2025,2026), Product(WidgetA,WidgetB)]
+    /// plus Revenue = Price * Quantity, for cursor navigation/edit tests.
+    fn grid_2x2_model() -> Model {
+        let mut m = Model::new();
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        m.add_category(t, "Time");
+        m.add_category(p, "Product");
+        m.add_item(ItemId(10), t, "2025");
+        m.add_item(ItemId(11), t, "2026");
+        m.add_item(ItemId(20), p, "WidgetA");
+        m.add_item(ItemId(21), p, "WidgetB");
+        m.add_measure(Measure {
+            id: MeasureId(100),
+            name: Name("Price".into()),
+            value_type: ValueType::Number,
+            categories: vec![p],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        m.add_measure(Measure {
+            id: MeasureId(101),
+            name: Name("Quantity".into()),
+            value_type: ValueType::Number,
+            categories: vec![t, p],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        m.add_measure(Measure {
+            id: MeasureId(102),
+            name: Name("Revenue".into()),
+            value_type: ValueType::Number,
+            categories: vec![t, p],
+            kind: MeasureKind::Derived(Formula::new(Expr::BinaryOp(
+                BinaryOp::Mul,
+                Box::new(Expr::Ref(MeasureId(100), DimensionSpec::default())),
+                Box::new(Expr::Ref(MeasureId(101), DimensionSpec::default())),
+            ))),
+            description: None,
+            format: None,
+        });
+        let c = |pairs: &[(CategoryId, ItemId)]| {
+            improv_core_model::Coordinate::from_pairs(pairs.iter().copied())
+        };
+        m.set_input(MeasureId(100), c(&[(p, ItemId(20))]), Value::Number(10.0));
+        m.set_input(MeasureId(100), c(&[(p, ItemId(21))]), Value::Number(20.0));
+        for (ti, pi, q) in [
+            (ItemId(10), ItemId(20), 100.0),
+            (ItemId(10), ItemId(21), 50.0),
+            (ItemId(11), ItemId(20), 120.0),
+            (ItemId(11), ItemId(21), 80.0),
+        ] {
+            m.set_input(MeasureId(101), c(&[(t, ti), (p, pi)]), Value::Number(q));
+        }
+        m
+    }
+
+    #[test]
+    fn cursor_clamps_at_all_edges_and_after_pivot_shrink() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product], 2x2
+        app.sync_axis_state();
+
+        // Off the top-left: clamps to (0, 0).
+        app.move_cursor(-5, -5);
+        assert_eq!((app.focused().cursor_row, app.focused().cursor_col), (0, 0));
+        // Off the bottom-right: clamps to (1, 1).
+        app.move_cursor(100, 100);
+        assert_eq!((app.focused().cursor_row, app.focused().cursor_col), (1, 1));
+
+        // Switch to Price[Product]: 2 rows, 1 synthetic col -> column re-clamps.
+        select(&mut app, MeasureId(100));
+        app.sync_axis_state(); // resets cursor to (0,0) on measure switch
+        app.move_cursor(5, 5);
+        assert_eq!(
+            app.focused().cursor_col,
+            0,
+            "single-column grid clamps col to 0"
+        );
+        assert_eq!(app.focused().cursor_row, 1, "two rows -> max row 1");
+
+        // Sales 3-D: put the cursor at the far corner, then pivot to a shape
+        // where the cursor would be out of range; clamp_cursor must fix it.
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        // Region on cols has 2 items; move to the far cell.
+        app.pivot_rotate(); // rows=Product, cols=Region (2 cols)
+        app.move_cursor(100, 100);
+        let (r, c) = (app.focused().cursor_row, app.focused().cursor_col);
+        let (rows, cols) = app.grid_dims();
+        assert!(r < rows && c < cols, "cursor within {rows}x{cols}");
+        // Pivot again (rows=Region -> single-item axes elsewhere) and confirm
+        // the cursor never goes out of range.
+        app.pivot_rotate();
+        let (rows, cols) = app.grid_dims();
+        assert!(app.focused().cursor_row < rows && app.focused().cursor_col < cols);
+    }
+
+    #[test]
+    fn cursor_maps_to_expected_coord_key() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product]
+        app.sync_axis_state();
+        // [1,1] = Quantity[2026, WidgetB] = Time(11), Product(21).
+        app.focused_mut().cursor_row = 1;
+        app.focused_mut().cursor_col = 1;
+        let mut expect: CoordKey = improv_engine::smallvec::smallvec![(1u32, 11u32), (2, 21)];
+        expect.sort();
+        assert_eq!(app.cursor_key(), Some(expect));
+
+        // [0,1] = Quantity[2025, WidgetB] = Time(10), Product(21).
+        app.focused_mut().cursor_row = 0;
+        app.focused_mut().cursor_col = 1;
+        let mut expect: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2, 21)];
+        expect.sort();
+        assert_eq!(app.cursor_key(), Some(expect));
+    }
+
+    #[test]
+    fn move_then_edit_routes_through_set_cell_and_recomputes() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product]
+        app.sync_axis_state();
+        assert!(app.cursor_is_editable());
+
+        // Move to Quantity[2025, WidgetA] = [0,0], set it to 200.
+        app.focused_mut().cursor_row = 0;
+        app.focused_mut().cursor_col = 0;
+        let key = app.cursor_key().expect("cursor addresses a cell");
+        app.set_cell(MeasureId(101), key, Value::Number(200.0))
+            .unwrap();
+
+        // Revenue[2025, WidgetA] = Price(10) * 200 = 2000 in the snapshot.
+        let mut rkey: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2, 20)];
+        rkey.sort();
+        let rev = app.values_for(MeasureId(102));
+        assert_eq!(rev.get(&rkey), Some(&2000.0));
+
+        // Derived measure: cursor cell is not editable (status set, not enter).
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+        assert!(!app.cursor_is_editable());
+        app.begin_edit_cursor();
+        assert!(app.focused().editing.is_none());
+        assert_eq!(app.status, "derived cells are computed, not editable");
+    }
+
+    #[test]
+    fn filter_hides_an_item_from_the_rendered_rows() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product]
+        app.sync_axis_state();
+        // Rows = Time (2025, 2026); hide 2026 (ItemId 11).
+        let (row_cat, _, _) = app.resolved_axes();
+        assert_eq!(row_cat, Some(CategoryId(1)));
+        assert_eq!(app.sorted_items(CategoryId(1)).len(), 2);
+        app.toggle_filter_item(CategoryId(1), ItemId(11));
+        let rows: Vec<ItemId> = app
+            .sorted_items(CategoryId(1))
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(rows, vec![ItemId(10)], "2026 filtered out of the row axis");
+        // Columns (unfiltered Product) still show both.
+        assert_eq!(app.sorted_items(CategoryId(2)).len(), 2);
+        // Re-showing 2026 drops the filter (all items kept).
+        app.toggle_filter_item(CategoryId(1), ItemId(11));
+        assert!(app.focused().filters.is_empty());
+        assert_eq!(app.sorted_items(CategoryId(1)).len(), 2);
+    }
+
+    /// Filter `cat` down to zero visible items (the state the audit found
+    /// crashing: `nth_tuple`'s `i % 0` divide-by-zero in release builds).
+    fn hide_all_items(app: &mut ImprovApp, cat: CategoryId) {
+        let items: Vec<ItemId> = app
+            .model
+            .categories
+            .get(&cat)
+            .map(|c| c.items.clone())
+            .unwrap_or_default();
+        for it in items {
+            app.toggle_filter_item(cat, it);
+        }
+        assert!(
+            app.sorted_items(cat).is_empty(),
+            "category {cat:?} should be filtered to nothing"
+        );
+    }
+
+    #[test]
+    fn row_category_filtered_to_empty_renders_zero_lines_not_one() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product]
+        app.sync_axis_state(); // rows=Time, cols=Product
+        assert_eq!(app.grid_dims(), (2, 2));
+
+        hide_all_items(&mut app, CategoryId(1)); // Time -> nothing on rows
+        let (rows, cols) = app.grid_dims();
+        assert_eq!(rows, 0, "an empty row category must render ZERO row lines");
+        assert_eq!(cols, 2, "the column axis is untouched");
+        // No cell is addressable, so nothing is editable and no under-specified
+        // key can be produced.
+        assert_eq!(app.cursor_key(), None);
+        assert!(!app.cursor_is_editable());
+        app.begin_edit_cursor();
+        assert!(
+            app.focused().editing.is_none(),
+            "no edit may start on a missing cell"
+        );
+
+        // Showing one item back restores exactly one line, with a complete key.
+        app.toggle_filter_item(CategoryId(1), ItemId(10));
+        assert_eq!(app.grid_dims(), (1, 2));
+        let key = app.cursor_key().expect("cell exists again");
+        assert_eq!(key.len(), 2, "key binds both Time and Product");
+    }
+
+    #[test]
+    fn column_category_filtered_to_empty_renders_zero_lines_not_one() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state(); // rows=Time, cols=Product
+        hide_all_items(&mut app, CategoryId(2)); // Product -> nothing on cols
+        let (rows, cols) = app.grid_dims();
+        assert_eq!(cols, 0, "an empty column category renders ZERO columns");
+        assert_eq!(rows, 2, "the row axis is untouched");
+        assert_eq!(app.cursor_key(), None);
+        assert!(!app.cursor_is_editable());
+        app.begin_edit_cursor();
+        assert!(app.focused().editing.is_none());
+    }
+
+    #[test]
+    fn page_category_filtered_to_empty_leaves_no_addressable_cell() {
+        // Sales[Time, Product, Region]: Region is the page dimension. With no
+        // Region item pinnable, every key would omit Region — under-specified.
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        assert_eq!(app.page_cats(), vec![CategoryId(3)]);
+        let full = app.cursor_key().expect("a cell before filtering");
+        assert_eq!(full.len(), 3, "key binds Time, Product AND Region");
+
+        hide_all_items(&mut app, CategoryId(3)); // Region -> nothing pinnable
+        assert_eq!(
+            app.grid_dims(),
+            (0, 0),
+            "no page item pinnable -> nothing to render"
+        );
+        assert_eq!(
+            app.cursor_key(),
+            None,
+            "must not yield a Region-less (under-specified) key"
+        );
+        assert!(!app.cursor_is_editable());
+        app.begin_edit_cursor();
+        assert!(app.focused().editing.is_none());
+        assert!(app.status.contains("filtered"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn stacked_axis_with_one_empty_category_renders_zero_lines() {
+        // Both categories stacked on rows; emptying the INNER one zeroes the
+        // whole product (the mixed-radix decode has no valid line).
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        app.set_axis(CategoryId(2), Axis::Rows); // rows = [Time, Product]
+        assert_eq!(app.grid_dims(), (4, 1));
+        hide_all_items(&mut app, CategoryId(2));
+        assert_eq!(app.grid_dims(), (0, 1));
+        assert_eq!(app.cursor_key(), None);
+    }
+
+    #[test]
+    fn scalar_axis_with_no_categories_still_has_one_line() {
+        // The distinction the fix turns on: `product_len(&[]) == 1` (an axis
+        // with NO categories is scalar in that direction — one legitimate line)
+        // vs a category present but filtered to zero items (no lines at all).
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(100)); // Price[Product] only
+        app.sync_axis_state();
+        assert_eq!(app.col_cats(), vec![], "no column category: scalar axis");
+        assert_eq!(
+            app.grid_dims(),
+            (2, 1),
+            "2 Product rows x 1 scalar column line"
+        );
+        // That single scalar line has a complete key (Price's only dimension).
+        let key = app.cursor_key().expect("scalar column line has a cell");
+        assert_eq!(key.as_slice(), [(2u32, 20u32)]);
+        assert!(app.cursor_is_editable());
+
+        // Same model, but now the ROW category is emptied: 0 rows, while the
+        // scalar column axis stays at 1.
+        hide_all_items(&mut app, CategoryId(2));
+        assert_eq!(app.grid_dims(), (0, 1));
+        assert_eq!(app.cursor_key(), None);
+    }
+
+    #[test]
+    fn cursor_never_decodes_a_line_of_an_empty_axis() {
+        // A stale cursor (left over from before the filter) must not reach
+        // `nth_tuple` with a zero radix: that is `i % 0`, a release-mode crash.
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        app.move_cursor(10, 10); // bottom-right of the 2x2 grid
+        assert_eq!((app.focused().cursor_row, app.focused().cursor_col), (1, 1));
+        hide_all_items(&mut app, CategoryId(1));
+        // clamp_cursor ran via toggle_filter_item: the row axis has no lines, so
+        // the row index collapses to 0 (the column axis is unaffected).
+        assert_eq!(app.focused().cursor_row, 0);
+        assert_eq!(app.cursor_key(), None);
+        // Even a forced out-of-range cursor resolves to "no cell", not a panic.
+        app.focused_mut().cursor_row = 7;
+        app.focused_mut().cursor_col = 7;
+        assert_eq!(app.cursor_key(), None);
+        app.move_cursor(1, 1);
+        assert_eq!(
+            app.focused().cursor_row,
+            0,
+            "an empty axis cannot be moved into"
+        );
+    }
+
+    #[test]
+    fn save_view_captures_measure_axis_order_and_filters() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product]
+        app.sync_axis_state();
+        app.pivot_rotate(); // rows=Product, cols=Time
+        app.toggle_filter_item(CategoryId(2), ItemId(21)); // hide WidgetB
+
+        let id = app.save_view("L1").expect("saved");
+        let v = app.model.views.get(&id).expect("view stored");
+        assert_eq!(v.measure, MeasureId(101));
+        assert_eq!(v.axis_order, vec![CategoryId(2), CategoryId(1)]);
+        let f = v
+            .filters
+            .iter()
+            .find(|f| f.category == CategoryId(2))
+            .unwrap();
+        assert_eq!(f.items, vec![ItemId(20)]); // only WidgetA kept
+        assert_eq!(app.model.view_by_name("L1").map(|v| v.id), Some(id));
+    }
+
+    #[test]
+    fn apply_view_restores_axis_order_and_filters() {
+        // Build a view from one app, apply it to a fresh app -> layout matches.
+        let mut src = build_app(grid_2x2_model());
+        select(&mut src, MeasureId(101));
+        src.sync_axis_state();
+        src.pivot_rotate(); // rows=Product, cols=Time
+        src.toggle_filter_item(CategoryId(2), ItemId(21)); // hide WidgetB
+        let v = src.build_view(ViewId(1), "L1").expect("view");
+
+        let mut dst = build_app(grid_2x2_model());
+        // dst starts on Price (the first measure) with natural axes, no filters.
+        assert_eq!(dst.selected(), Some(MeasureId(100)));
+        dst.apply_view(&v);
+        dst.sync_axis_state(); // must not clobber the applied layout
+
+        assert_eq!(dst.selected(), Some(MeasureId(101)));
+        assert_eq!(dst.focused().axis_order, vec![CategoryId(2), CategoryId(1)]);
+        assert_eq!(dst.focused().filters, v.filters);
+        let (row_cat, col_cat, _) = dst.resolved_axes();
+        assert_eq!(row_cat, Some(CategoryId(2))); // Product on rows
+        assert_eq!(col_cat, Some(CategoryId(1))); // Time on cols
+                                                  // Filter reflected: only WidgetA on the (row) Product axis.
+        let rows: Vec<ItemId> = dst
+            .sorted_items(CategoryId(2))
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(rows, vec![ItemId(20)]);
+    }
+
+    #[test]
+    fn apply_view_restores_page_item() {
+        let mut src = build_app(sales_3d_model());
+        select(&mut src, MeasureId(200));
+        src.sync_axis_state();
+        // Page Region (dim 0) to South (index 1).
+        src.set_page(0, 1);
+        let (_, _, pinned) = src.resolved_axes();
+        assert_eq!(pinned, vec![(CategoryId(3), ItemId(31))]); // South
+        let v = src.build_view(ViewId(1), "south").expect("view");
+        assert_eq!(v.page_items, vec![(CategoryId(3), ItemId(31))]);
+
+        let mut dst = build_app(sales_3d_model());
+        select(&mut dst, MeasureId(200));
+        dst.sync_axis_state();
+        let (_, _, pinned) = dst.resolved_axes();
+        assert_eq!(pinned, vec![(CategoryId(3), ItemId(30))]); // North default
+        dst.apply_view(&v);
+        let (_, _, pinned) = dst.resolved_axes();
+        assert_eq!(
+            pinned,
+            vec![(CategoryId(3), ItemId(31))],
+            "page item restored"
+        );
+    }
+
+    // -- chart_series (pure; no egui) --------------------------------------
+
+    #[test]
+    fn chart_series_yields_labels_and_oracle_values() {
+        // Revenue[Time, Product], natural axes: rows=Time -> x, cols=Product ->
+        // one series each. Oracle: WidgetA = 1000/1200, WidgetB = 1000/1600.
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+        let d = app.chart_series(crate::chart::ParseBy::Columns);
+        assert_eq!(d.x_title, "Time");
+        assert_eq!(d.x_labels, vec!["2025".to_string(), "2026".to_string()]);
+        assert_eq!(d.series.len(), 2);
+        assert_eq!(d.series[0].name, "WidgetA");
+        assert_eq!(d.series[0].points, vec![Some(1000.0), Some(1200.0)]);
+        assert_eq!(d.series[1].name, "WidgetB");
+        assert_eq!(d.series[1].points, vec![Some(1000.0), Some(1600.0)]);
+        // y-range spans 0..1600 (0 always included).
+        assert_eq!(d.y_range(), (0.0, 1600.0));
+    }
+
+    #[test]
+    fn chart_series_stacked_rows_join_tuple_labels_and_match_cell_keys() {
+        // Revenue[Time, Product]: stack BOTH categories on rows, leaving no
+        // column category. x-labels become the joined row tuples
+        // ("2025 / WidgetA", ...) and there is one unnamed series whose values
+        // match cell_key_multi lookups.
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(102)); // Revenue
+        app.sync_axis_state();
+        app.set_axis(CategoryId(2), Axis::Rows); // rows = [Time, Product]
+        assert_eq!(app.row_cats(), vec![CategoryId(1), CategoryId(2)]);
+        assert!(app.col_cats().is_empty());
+
+        let d = app.chart_series(crate::chart::ParseBy::Columns);
+        assert_eq!(d.x_title, "Time / Product");
+        assert_eq!(
+            d.x_labels,
+            vec![
+                "2025 / WidgetA".to_string(),
+                "2025 / WidgetB".to_string(),
+                "2026 / WidgetA".to_string(),
+                "2026 / WidgetB".to_string(),
+            ]
+        );
+        // One series (no column categories), unnamed.
+        assert_eq!(d.series.len(), 1);
+        assert_eq!(d.series[0].name, "");
+
+        // Each point matches a direct cell_key_multi lookup on the same tuples.
+        let values = app.values_for(MeasureId(102));
+        let row_tuples = app.axis_tuples(&app.row_cats());
+        let want: Vec<Option<f64>> = row_tuples
+            .iter()
+            .map(|t| {
+                let key = cell_key_multi(&app.row_cats(), t, &[], &[], &[]);
+                values.get(&key).copied()
+            })
+            .collect();
+        assert_eq!(d.series[0].points, want);
+        // Oracle: WidgetA prices 10/20; Quantities 100,50,120,80 ->
+        // 1000, 1000, 1200, 1600.
+        assert_eq!(
+            d.series[0].points,
+            vec![Some(1000.0), Some(1000.0), Some(1200.0), Some(1600.0)]
+        );
+    }
+
+    #[test]
+    fn chart_series_stacked_columns_form_one_series_per_col_tuple() {
+        // Revenue[Time, Product]: rows=Time, columns stack both? Instead stack
+        // Product on rows AND keep Time on cols to exercise a multi-tuple
+        // column axis. Here: rows=Product (2), cols=Time (2) -> 2 x-labels,
+        // 2 series named by the (single-item) column tuples.
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+        app.pivot_rotate(); // rows=Product, cols=Time
+        assert_eq!(app.row_cats(), vec![CategoryId(2)]);
+        assert_eq!(app.col_cats(), vec![CategoryId(1)]);
+
+        let d = app.chart_series(crate::chart::ParseBy::Columns);
+        assert_eq!(d.x_title, "Product");
+        assert_eq!(
+            d.x_labels,
+            vec!["WidgetA".to_string(), "WidgetB".to_string()]
+        );
+        // One series per Time item (single-element column tuples).
+        assert_eq!(d.series.len(), 2);
+        assert_eq!(d.series[0].name, "2025");
+        assert_eq!(d.series[1].name, "2026");
+        // 2025: WidgetA=1000, WidgetB=1000; 2026: WidgetA=1200, WidgetB=1600.
+        assert_eq!(d.series[0].points, vec![Some(1000.0), Some(1000.0)]);
+        assert_eq!(d.series[1].points, vec![Some(1200.0), Some(1600.0)]);
+    }
+
+    #[test]
+    fn chart_series_1d_single_series() {
+        // Price[Product]: 1-D grid -> a single unnamed series over Product.
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(100)); // Price[Product]
+        app.sync_axis_state();
+        let d = app.chart_series(crate::chart::ParseBy::Columns);
+        assert_eq!(d.x_title, "Product");
+        assert_eq!(
+            d.x_labels,
+            vec!["WidgetA".to_string(), "WidgetB".to_string()]
+        );
+        assert_eq!(d.series.len(), 1);
+        assert_eq!(d.series[0].name, "");
+        assert_eq!(d.series[0].points, vec![Some(10.0), Some(20.0)]);
+    }
+
+    #[test]
+    fn chart_filter_removes_a_bar() {
+        // Hide 2026 on the Time (x) axis: its label and points drop out.
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+        app.toggle_filter_item(CategoryId(1), ItemId(11)); // hide 2026
+        let d = app.chart_series(crate::chart::ParseBy::Columns);
+        assert_eq!(d.x_labels, vec!["2025".to_string()], "2026 filtered out");
+        assert_eq!(d.series[0].points, vec![Some(1000.0)]); // WidgetA
+        assert_eq!(d.series[1].points, vec![Some(1000.0)]); // WidgetB
+    }
+
+    #[test]
+    fn chart_non_numeric_cell_is_a_gap_not_a_panic() {
+        // Overwrite one Revenue-input cell so a derived cell errors, and set a
+        // Text input on another measure: both surface as gaps, not panics.
+        let mut app = build_app(grid_2x2_model());
+        // Make Quantity[2026, WidgetA] a Text value -> Revenue[2026, WidgetA]
+        // becomes an Error (type mismatch), which values_for skips (gap).
+        let c = |pairs: &[(CategoryId, ItemId)]| {
+            improv_core_model::Coordinate::from_pairs(pairs.iter().copied())
+        };
+        Arc::make_mut(&mut app.model).set_input(
+            MeasureId(101),
+            c(&[(CategoryId(1), ItemId(11)), (CategoryId(2), ItemId(20))]),
+            Value::Text("oops".into()),
+        );
+        app.rebuild_engine();
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+        let d = app.chart_series(crate::chart::ParseBy::Columns); // must not panic
+                                                                  // WidgetA series: 2025 numeric, 2026 is a gap (None).
+        assert_eq!(d.series[0].name, "WidgetA");
+        assert_eq!(d.series[0].points, vec![Some(1000.0), None]);
+        // WidgetB series unaffected.
+        assert_eq!(d.series[1].points, vec![Some(1000.0), Some(1600.0)]);
+        // y-range still valid, 0 included.
+        let (lo, hi) = d.y_range();
+        assert_eq!(lo, 0.0);
+        assert!(hi >= 1600.0);
+    }
+
+    // -- regression: the displayed-text-commits-unchanged invariant ---------
+
+    /// Every aggregation arg shape, systematically: `over` of length 0/1/2/3,
+    /// crossed with an empty/non-empty `except` and a `by` list, plus non-`Ref`
+    /// args (a literal, a binary op, a nested call) — for each aggregating func
+    /// id. Whatever `formula_source` shows as editable MUST re-commit unchanged;
+    /// what it cannot spell must be `None`, never unparsable text.
+    ///
+    /// (`proptest` is not a dev-dependency of this crate, so this is the
+    /// systematic table over the arg space rather than a generator.)
+    fn aggregation_arg_space() -> Vec<(String, Formula)> {
+        let cats = [CategoryId(1), CategoryId(2), CategoryId(3)];
+        let mut out = Vec::new();
+        for func in [
+            parser::FUNC_SUM,
+            parser::FUNC_AVG,
+            parser::FUNC_MIN,
+            parser::FUNC_MAX,
+        ] {
+            // Ref args: every (over, except, by) subset combination.
+            for over_n in 0..=3usize {
+                for except_n in 0..=2usize {
+                    for by_n in 0..=2usize {
+                        let spec = DimensionSpec {
+                            by: cats[..by_n].to_vec(),
+                            over: cats[..over_n].to_vec(),
+                            except: cats[..except_n].to_vec(),
+                        };
+                        out.push((
+                            format!(
+                                "f{}(Quantity over={over_n} except={except_n} by={by_n})",
+                                func.0
+                            ),
+                            Formula::new(Expr::Call(func, vec![Expr::Ref(MeasureId(101), spec)])),
+                        ));
+                    }
+                }
+            }
+            // Non-`Ref` args: the parser's aggregation rule accepts none of them.
+            let price = || Expr::Ref(MeasureId(100), DimensionSpec::default());
+            let qty = || Expr::Ref(MeasureId(101), DimensionSpec::default());
+            for (what, arg) in [
+                ("literal", Expr::Literal(Value::Number(1.0))),
+                (
+                    "product",
+                    Expr::BinaryOp(BinaryOp::Mul, Box::new(price()), Box::new(qty())),
+                ),
+                ("negated ref", Expr::UnaryOp(UnaryOp::Neg, Box::new(qty()))),
+                ("scalar call", Expr::Call(FuncId(10), vec![qty()])),
+                (
+                    "nested agg",
+                    Expr::Call(
+                        parser::FUNC_SUM,
+                        vec![Expr::Ref(
+                            MeasureId(101),
+                            DimensionSpec {
+                                by: vec![],
+                                over: vec![CategoryId(1)],
+                                except: vec![],
+                            },
+                        )],
+                    ),
+                ),
+                ("no args", Expr::Literal(Value::Boolean(true))),
+            ] {
+                out.push((
+                    format!("f{}({what})", func.0),
+                    Formula::new(Expr::Call(func, vec![arg])),
+                ));
+            }
+            // Zero args and two args (arity the aggregation rule cannot spell).
+            out.push((
+                format!("f{}() no args at all", func.0),
+                Formula::new(Expr::Call(func, vec![])),
+            ));
+            out.push((
+                format!("f{}(two refs)", func.0),
+                Formula::new(Expr::Call(
+                    func,
+                    vec![
+                        Expr::Ref(MeasureId(100), DimensionSpec::default()),
+                        Expr::Ref(MeasureId(101), DimensionSpec::default()),
+                    ],
+                )),
+            ));
+            // The aggregation inside a larger expression (the printer recurses
+            // through `child_dsl`, which must not leak unparsable text either).
+            out.push((
+                format!("f{}(Quantity) * Price", func.0),
+                Formula::new(Expr::BinaryOp(
+                    BinaryOp::Mul,
+                    Box::new(Expr::Call(
+                        func,
+                        vec![Expr::Ref(MeasureId(101), DimensionSpec::default())],
+                    )),
+                    Box::new(Expr::Ref(MeasureId(100), DimensionSpec::default())),
+                )),
+            ));
+        }
+        out
+    }
+
+    /// DEFECT 1: an aggregation whose arg is not `Ref`-with-exactly-one-`over`
+    /// has no DSL spelling. `formula_dsl` must return `None` (so the CNL
+    /// fallback runs) instead of printing `SUM(Quantity)`, which
+    /// `parse_expr` rejects ("expected 'OVER' in aggregation").
+    #[test]
+    fn every_aggregation_arg_shape_displays_only_committable_text() {
+        let mut failures: Vec<String> = Vec::new();
+        for (label, formula) in aggregation_arg_space() {
+            let mut model = revenue_model();
+            model.add_category(CategoryId(3), "Region");
+            model.add_item(ItemId(30), CategoryId(3), "North");
+            model.measures.get_mut(&MeasureId(102)).unwrap().kind =
+                MeasureKind::Derived(formula.clone());
+            let mut app = build_app(model);
+            select(&mut app, MeasureId(102));
+
+            // Whatever the DSL printer emits must parse as the same AST.
+            if let Some(dsl) = formula_dsl(&app.model, &formula) {
+                match parser::parse_expr(&app.model, &dsl) {
+                    Ok(back) if back == formula => {}
+                    Ok(back) => failures.push(format!(
+                        "[{label}] DSL {dsl:?} reparsed to a DIFFERENT ast: {:?}",
+                        back.expr
+                    )),
+                    Err(e) => failures.push(format!("[{label}] DSL {dsl:?} DOES NOT PARSE: {e}")),
+                }
+            }
+            // And whatever the bar shows as editable must re-commit unchanged.
+            let Some(shown) = app.formula_source(MeasureId(102)) else {
+                continue; // read-only: nothing is offered for editing
+            };
+            match app.commit_formula(MeasureId(102), &shown) {
+                Ok(()) => match &app.model.measures[&MeasureId(102)].kind {
+                    MeasureKind::Derived(got) if *got == formula => {}
+                    other => failures.push(format!(
+                        "[{label}] displayed {shown:?} committed to a DIFFERENT formula: {other:?}"
+                    )),
+                },
+                Err(e) => failures.push(format!(
+                    "[{label}] displayed {shown:?} does not commit: {e}"
+                )),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} shape(s) display text that does not re-commit:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// DEFECT 1, the three-keystroke user path: type controlled English that
+    /// builds an aggregation with an empty `over`, commit, then commit the text
+    /// the bar now shows without editing it.
+    #[test]
+    fn cnl_aggregation_without_over_recommits_from_the_bar() {
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(102));
+        app.commit_formula(MeasureId(102), "the sum of Quantity")
+            .expect("CNL commits");
+        let committed = match &app.model.measures[&MeasureId(102)].kind {
+            MeasureKind::Derived(f) => f.clone(),
+            MeasureKind::Input => panic!("stopped being derived"),
+        };
+        // The bar reloads its buffer from `formula_source`; Commit again.
+        let shown = app
+            .formula_source(MeasureId(102))
+            .expect("an editable spelling exists (CNL)");
+        app.commit_formula(MeasureId(102), &shown)
+            .unwrap_or_else(|e| panic!("bar text {shown:?} does not commit: {e}"));
+        match &app.model.measures[&MeasureId(102)].kind {
+            MeasureKind::Derived(f) => assert_eq!(*f, committed, "AST changed on re-commit"),
+            MeasureKind::Input => panic!("stopped being derived"),
+        }
+    }
+
+    /// DEFECT 2, **as plan Step 4b resolves it**: an awkward measure name is no
+    /// longer a reason to go read-only. The printer now spells it with a quoted
+    /// identifier (`'Unit Price'`), the form the grammar gained in Step 4a, and
+    /// [`ImprovApp::formula_source`]'s self-verification — reparse the candidate
+    /// text and demand the IDENTICAL `Formula` — confirms it round-trips.
+    ///
+    /// The self-verification is untouched and still the gate: this test asserts
+    /// what it now *accepts*, not that it was relaxed. Every name shown as
+    /// editable is re-committed here and the AST compared.
+    ///
+    /// Exactly ONE name remains genuinely unspellable: the **empty** name. `''`
+    /// is an explicit parse error ("empty quoted name: '' names nothing"), so
+    /// there is no text for it in either language — and it must still be
+    /// refused rather than shown.
+    #[test]
+    fn awkward_measure_names_are_spelled_with_quoted_identifiers() {
+        // Bare where bare works (no needless quoting), quoted where it does not.
+        let bare = ["UnitPrice", "Unit_Price", "Price2024", "_Price"];
+        // The nine names the pre-Step-4b test listed as unspellable. Eight are
+        // now editable; `""` is the lone holdout.
+        let quoted = [
+            "Unit Price",
+            "Price/Unit",
+            "Price-2024",
+            "Q1 Revenue",
+            "Over",
+            "over",
+            "AND",
+            "Price(net)",
+        ];
+        // Plus the escape rule (`''` is one literal quote) and a dotted name,
+        // which quoting keeps out of the deliberately-unresolved qualified form.
+        let extra = ["Bob's Rate", "2024Price", "Ünit", "SUM", "Price.Unit"];
+        let unspellable = [""];
+
+        for name in bare
+            .iter()
+            .chain(quoted.iter())
+            .chain(extra.iter())
+            .chain(unspellable.iter())
+        {
+            let mut model = revenue_model();
+            model.measures.get_mut(&MeasureId(100)).unwrap().name = Name((*name).into());
+            let mut app = build_app(model);
+            select(&mut app, MeasureId(102));
+            let formula = match &app.model.measures[&MeasureId(102)].kind {
+                MeasureKind::Derived(f) => f.clone(),
+                MeasureKind::Input => panic!("Revenue is derived"),
+            };
+            match app.formula_source(MeasureId(102)) {
+                // Shown as editable => it MUST commit unchanged. This is the
+                // invariant `formula_source` self-verifies; re-check it end to
+                // end through the real commit path.
+                Some(shown) => {
+                    assert!(
+                        !unspellable.contains(name),
+                        "name {name:?} must stay unspellable but the bar shows {shown:?}"
+                    );
+                    // Bare names print bare; awkward ones print quoted.
+                    if bare.contains(name) {
+                        assert!(
+                            shown.starts_with(&format!("{name} ")),
+                            "name {name:?} needs no quoting, got {shown:?}"
+                        );
+                    } else if quoted.contains(name) {
+                        assert!(
+                            shown.starts_with(&format!("'{name}'")),
+                            "name {name:?} must print quoted, got {shown:?}"
+                        );
+                    }
+                    app.commit_formula(MeasureId(102), &shown)
+                        .unwrap_or_else(|e| {
+                            panic!("name {name:?}: displayed {shown:?} does not commit: {e}")
+                        });
+                    match &app.model.measures[&MeasureId(102)].kind {
+                        MeasureKind::Derived(f) => {
+                            assert_eq!(*f, formula, "name {name:?}: AST changed ({shown:?})")
+                        }
+                        MeasureKind::Input => panic!("stopped being derived"),
+                    }
+                }
+                // Not editable => neither parser may accept the DSL/CNL text,
+                // which is exactly why we refuse to offer it.
+                None => {
+                    assert!(
+                        unspellable.contains(name),
+                        "name {name:?} is spellable but the bar refuses to show it"
+                    );
+                    let cnl = describe_formula(&NlContext::new(&app.model), &formula);
+                    assert_ne!(
+                        app.parse_formula_text(&cnl).ok().as_ref(),
+                        Some(&formula),
+                        "name {name:?}: CNL {cnl:?} DOES round-trip; it should be editable"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The doubling escape, end to end: a name containing a literal `'` prints
+    /// as `'Bob''s Rate'` and reparses to the same measure. (`parser`'s own
+    /// tests cover the tokenizer; this pins the PRINTER's half of the pair.)
+    #[test]
+    fn an_embedded_quote_is_printed_doubled() {
+        let mut model = revenue_model();
+        model.measures.get_mut(&MeasureId(100)).unwrap().name = Name("Bob's Rate".into());
+        let app = build_app(model);
+        let shown = app
+            .formula_source(MeasureId(102))
+            .expect("a quote in a name is spellable by doubling it");
+        assert_eq!(shown, "'Bob''s Rate' * Quantity");
+    }
+
+    /// Category names inside `[...]` and after `OVER` go through the same
+    /// [`ident`], so an awkward CATEGORY name is spellable too — the other half
+    /// of the read-only defect (a CSV import names categories from headers as
+    /// well).
+    /// The P3 forms print as DSL that commits back to the same formula.
+    #[test]
+    fn dimensional_forms_round_trip_through_the_bar() {
+        let mut model = revenue_model();
+        model.add_category(CategoryId(3), "Region");
+        model.add_item(ItemId(30), CategoryId(3), "North");
+        for text in [
+            "Quantity - PREV(Quantity, Time, 1, 0)",
+            "NEXT(Quantity, Time)",
+            "Quantity * POSITION(Time)",
+            "SUM(Quantity OVER Time[FIRST..THIS])",
+            "SUM(Quantity OVER Time[THIS-2..THIS+1])",
+            "SUM(Quantity OVER Time WHERE Quantity > 90)",
+            "TEXTJOIN(\"-\", TRUE, Quantity OVER Time)",
+            "FIRST(Quantity OVER Time)",
+            "SCAN(0, Quantity OVER Time, LAMBDA(acc0, val0, acc0 + val0 * 2))",
+        ] {
+            let mut app = build_app(model.clone());
+            app.commit_formula(MeasureId(102), text)
+                .unwrap_or_else(|e| panic!("{text}: {e}"));
+            let shown = app.formula_source(MeasureId(102)).expect(text);
+            assert_eq!(shown, text, "displayed as typed");
+        }
+    }
+
+    /// A named argument is stored in its parameter's place, so the bar
+    /// shows the positional call (skipped optional ones with their
+    /// defaults), which commits back to the same formula.
+    #[test]
+    fn named_arguments_print_positionally() {
+        let model = revenue_model();
+        for (text, shown) in [
+            ("ROUND(Price, num_digits => 2)", "ROUND(Price, 2)"),
+            (
+                "PMT(0.05, 12, Price, type => 1)",
+                "PMT(0.05, 12, Price, 0, 1)",
+            ),
+            (
+                "PREV(Quantity, Time, default => 0)",
+                "PREV(Quantity, Time, 1, 0)",
+            ),
+            (
+                "FIXPOINT(Price, LAMBDA(r, r / 2), max_iter => 5)",
+                "FIXPOINT(Price, LAMBDA(acc0, acc0 / 2), 5)",
+            ),
+        ] {
+            let mut app = build_app(model.clone());
+            app.commit_formula(MeasureId(102), text)
+                .unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(app.formula_source(MeasureId(102)).as_deref(), Some(shown));
+            let named = parser::parse_expr(&model, text).unwrap();
+            assert_eq!(parser::parse_expr(&model, shown).unwrap(), named, "{text}");
+        }
+    }
+
+    /// COALESCE, FILL, RELABEL and SWAP (category arguments) and FIXPOINT
+    /// (its iterate prints as the LAMBDA parameter acc0) print as DSL that
+    /// commits back to the same formula.
+    #[test]
+    fn missing_cell_and_role_forms_round_trip_through_the_bar() {
+        let mut model = revenue_model();
+        model.add_category(CategoryId(3), "Year");
+        model.add_item(ItemId(30), CategoryId(3), "2025");
+        for text in [
+            "COALESCE(Quantity, Price * 0, 1)",
+            "FILL(Quantity, 0)",
+            "RELABEL(Quantity, Time, Year) * 2",
+            "SWAP(Quantity, Time, Product)",
+            "FIXPOINT(Quantity, LAMBDA(acc0, acc0 / 2 + Price), 50, 1e-10)",
+            "Price * 6.02e23 + 0.5",
+            "FIXPOINT(FILL(Quantity, 0), LAMBDA(acc0, RELABEL(acc0, Time, Year) * 2))",
+        ] {
+            let f = parser::parse_expr(&model, text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(formula_dsl(&model, &f).as_deref(), Some(text));
+        }
+    }
+
+    /// A named LAMBDA call prints by name and re-parses.
+    #[test]
+    fn named_lambda_calls_print_by_name() {
+        let mut model = revenue_model();
+        let improv_core_model::Definition::Lambda(l) =
+            improv_core_model::parse_definition(&model, "Margin = LAMBDA(p, c, p - c)").unwrap()
+        else {
+            panic!("a lambda")
+        };
+        model.lambdas.insert(1, l.lambda);
+        let text = "Margin(Price, Quantity * 2)";
+        let f = parser::parse_expr(&model, text).unwrap();
+        assert_eq!(formula_dsl(&model, &f).as_deref(), Some(text));
+        // A category parameter: its argument prints as the category.
+        let improv_core_model::Definition::Lambda(l) = improv_core_model::parse_definition(
+            &model,
+            "LOGNORM = LAMBDA(x, c, LN1P(x) / LN1P(MAX(x OVER c)))",
+        )
+        .unwrap() else {
+            panic!("a lambda")
+        };
+        model.lambdas.insert(2, l.lambda);
+        let text = "LOGNORM(Quantity, Time) + Margin(Price, 1)";
+        let f = parser::parse_expr(&model, text).unwrap();
+        assert_eq!(formula_dsl(&model, &f).as_deref(), Some(text));
+        model.lambdas.clear();
+        assert_eq!(
+            formula_dsl(&model, &f),
+            None,
+            "a dangling call does not print"
+        );
+    }
+
+    /// An array formula's INTO clause prints and re-parses.
+    #[test]
+    fn into_clause_round_trips() {
+        let mut model = revenue_model();
+        model.add_category(CategoryId(3), "Region");
+        model.add_item(ItemId(30), CategoryId(3), "North");
+        model.add_category(CategoryId(4), "Slot");
+        for text in [
+            "SORT(Quantity OVER Time, -1 INTO Region)",
+            "SORT(Quantity OVER Time INTO Region, Slot)",
+            "BYROW(Quantity OVER Product, LAMBDA(r, SUM(r)))",
+            "LINEST(Quantity, Price, Price OVER Time, FALSE, TRUE INTO Region, Slot)",
+        ] {
+            let f = parser::parse_expr(&model, text).unwrap();
+            let shown = formula_dsl(&model, &f);
+            if text.starts_with("BYROW") {
+                // Expanded when read: shown as the reduction it is.
+                assert_eq!(shown.as_deref(), Some("SUM(Quantity OVER Product)"));
+            } else {
+                assert_eq!(shown.as_deref(), Some(text));
+            }
+        }
+    }
+
+    /// In a German locale the formula bar shows and accepts German names,
+    /// a decimal comma and `;` separators; the model stores the canonical form.
+    #[test]
+    fn formulas_are_typed_and_shown_in_the_locale() {
+        let mut app = build_app(revenue_model());
+        app.locale = improv_core_model::Locale::de();
+        app.commit_formula(MeasureId(102), "RUNDEN(Price * Quantity * 1,5; 0)")
+            .expect("German commits");
+        assert_eq!(
+            app.formula_source(MeasureId(102)).as_deref(),
+            Some("RUNDEN(Price * Quantity * 1,5; 0)")
+        );
+        let MeasureKind::Derived(f) = &app.model.measures[&MeasureId(102)].kind else {
+            panic!("derived")
+        };
+        app.locale = improv_core_model::Locale::en();
+        assert_eq!(
+            formula_dsl(&app.model, f).as_deref(),
+            Some("ROUND(Price * Quantity * 1.5, 0)")
+        );
+    }
+
+    #[test]
+    fn awkward_category_names_are_quoted_in_dim_lists_and_over() {
+        let mut model = revenue_model();
+        model.categories.get_mut(&CategoryId(1)).unwrap().name = Name("Fiscal Year".into());
+        // Revenue = SUM(Quantity OVER 'Fiscal Year')
+        model.measures.get_mut(&MeasureId(102)).unwrap().kind =
+            MeasureKind::Derived(Formula::new(Expr::Call(
+                parser::FUNC_SUM,
+                vec![Expr::Ref(
+                    MeasureId(101),
+                    DimensionSpec {
+                        by: vec![],
+                        over: vec![CategoryId(1)],
+                        except: vec![],
+                    },
+                )],
+            )));
+        let mut app = build_app(model);
+        let shown = app
+            .formula_source(MeasureId(102))
+            .expect("a quoted category name is spellable");
+        assert_eq!(shown, "SUM(Quantity OVER 'Fiscal Year')");
+        // And it round-trips through the real commit path.
+        let before = match &app.model.measures[&MeasureId(102)].kind {
+            MeasureKind::Derived(f) => f.clone(),
+            MeasureKind::Input => panic!("derived"),
+        };
+        app.commit_formula(MeasureId(102), &shown).expect("commits");
+        match &app.model.measures[&MeasureId(102)].kind {
+            MeasureKind::Derived(f) => assert_eq!(*f, before),
+            MeasureKind::Input => panic!("stopped being derived"),
+        }
+    }
+
+    /// DEFECT 5: with an empty ROW axis the grid renders zero lines; the chart
+    /// must not invent an x line labelled `""`.
+    #[test]
+    fn chart_with_an_empty_row_axis_has_no_x_lines() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+        assert_eq!(app.grid_dims(), (2, 2));
+        // Hide every Time item: rows -> empty.
+        for it in [ItemId(10), ItemId(11)] {
+            app.toggle_filter_item(CategoryId(1), it);
+        }
+        assert_eq!(app.grid_dims(), (0, 2), "grid renders no rows");
+        let d = app.chart_series(crate::chart::ParseBy::Columns);
+        assert!(
+            d.x_labels.is_empty() && d.series.is_empty(),
+            "chart invented {} x line(s) / {} series for an empty row axis: {d:?}",
+            d.x_labels.len(),
+            d.series.len()
+        );
+    }
+
+    /// DEFECT 5: an empty COLUMN axis likewise yields no series, and an
+    /// unpinnable PAGE category yields nothing at all (the grid is (0,0)) —
+    /// never a full chart drawn at keys that omit the page category.
+    #[test]
+    fn chart_with_an_empty_column_or_page_axis_has_no_data() {
+        // Empty column axis.
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+        for it in [ItemId(20), ItemId(21)] {
+            app.toggle_filter_item(CategoryId(2), it);
+        }
+        assert_eq!(app.grid_dims(), (2, 0), "grid renders no columns");
+        let d = app.chart_series(crate::chart::ParseBy::Columns);
+        assert!(
+            d.x_labels.is_empty() && d.series.is_empty(),
+            "chart drew data for an empty column axis: {d:?}"
+        );
+
+        // Empty page axis (3-D measure: Region pages).
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        assert_eq!(app.page_cats(), vec![CategoryId(3)]);
+        for it in [ItemId(30), ItemId(31)] {
+            app.toggle_filter_item(CategoryId(3), it);
+        }
+        assert_eq!(app.grid_dims(), (0, 0), "grid renders nothing");
+        let d = app.chart_series(crate::chart::ParseBy::Columns);
+        assert_eq!(
+            d,
+            crate::chart::ChartData::default(),
+            "chart plotted at Region-less (under-specified) keys: {d:?}"
+        );
+    }
+
+    /// DEFECT 7: a parse error sets the inline red underline; a subsequent
+    /// VALID formula whose SAVE fails must not leave that underline pointing
+    /// into text which parses cleanly.
+    #[test]
+    fn stale_parse_error_is_cleared_when_a_later_save_fails() {
+        let mut app = build_app(revenue_model());
+        // Step 1: a parse error sets the inline highlight.
+        app.commit_formula(MeasureId(102), "Price *** Quantity")
+            .expect_err("a parse error");
+        assert!(app.formula_error.is_some(), "parse error marked");
+
+        // Step 2: a VALID formula whose save fails (unwritable store path).
+        app.db = std::env::temp_dir()
+            .join(format!("improv_gui_no_such_dir_{}", std::process::id()))
+            .join("model.db")
+            .to_string_lossy()
+            .into_owned();
+        let err = app
+            .commit_formula(MeasureId(102), "Price + Quantity")
+            .expect_err("unwritable store must fail the commit");
+        assert!(err.starts_with("save failed:"), "got {err:?}");
+        assert_eq!(
+            app.formula_error, None,
+            "a stale inline parse error survived a save failure"
+        );
+    }
+    /// A category left in `axis_order` that is NOT a dimension of the selected
+    /// measure must not affect that measure's grid. Regression for the review's
+    /// defect #4: a stale PAGE category filtered to zero items blanked a grid
+    /// whose every cell was fully specified.
+    #[test]
+    fn stale_non_dimension_page_category_does_not_blank_the_grid() {
+        let mut m = Model::new();
+        let (t, p, r) = (CategoryId(1), CategoryId(2), CategoryId(3));
+        for (c, n) in [(t, "Time"), (p, "Product"), (r, "Region")] {
+            m.add_category(c, n);
+        }
+        m.add_item(ItemId(10), t, "2025");
+        m.add_item(ItemId(20), p, "W");
+        m.add_item(ItemId(30), r, "North");
+        // Sales ranges over Time x Product ONLY; Region is not a dimension.
+        m.add_measure(Measure {
+            id: MeasureId(1),
+            name: Name("Sales".into()),
+            value_type: ValueType::Number,
+            categories: vec![t, p],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        let cell = improv_core_model::Coordinate::from_pairs([(t, ItemId(10)), (p, ItemId(20))]);
+        m.set_input(MeasureId(1), cell, Value::Number(42.0));
+
+        let mut app = build_app(m);
+        select(&mut app, MeasureId(1));
+        app.sync_axis_state();
+        // What apply_view leaves behind after the measure was re-imported over
+        // fewer dimensions: a stale Region page category.
+        app.focused_mut().axis_order = vec![t, p, r];
+        app.focused_mut().n_rows = 1;
+        app.focused_mut().n_cols = 1;
+        app.focused_mut().page_idx = vec![0];
+        app.focused_mut().filters = vec![Filter {
+            category: r,
+            items: vec![],
+        }];
+
+        assert!(
+            app.page_cats().is_empty(),
+            "a non-dimension category must not count as a page axis"
+        );
+        assert_eq!(
+            app.grid_dims(),
+            (1, 1),
+            "grid must still render its one cell"
+        );
+        assert!(
+            app.cursor_key().is_some(),
+            "cell coordinate is fully specified"
+        );
+
+        // Contrast, and the 6a4b862 behavior that must NOT regress: a category
+        // that IS a real dimension, filtered to empty, still yields zero lines.
+        app.focused_mut().filters = vec![Filter {
+            category: p,
+            items: vec![],
+        }];
+        assert_eq!(
+            app.grid_dims().1,
+            0,
+            "a real dimension filtered empty => no lines"
+        );
+    }
+
+    /// Regression for the review's defect #6: a failed save must not leave the
+    /// in-memory model diverged from the store.
+    #[test]
+    fn failed_cell_save_keeps_the_edit_unsaved() {
+        let mut app = build_app(revenue_model());
+        // An unwritable store path: save() must fail.
+        app.db = "/nonexistent-dir-improv/cannot-write.db".to_string();
+        let measure = MeasureId(101); // Quantity (input)
+        let coord: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+
+        let res = app.set_cell(measure, coord.clone(), Value::Number(999.0));
+        assert!(res.is_err(), "save to an unwritable path must fail");
+        // H3 (defect #6 revisited): the edit stays, marked unsaved, and is
+        // kept for the next save; the window never claims it is saved.
+        assert_eq!(
+            app.model.input(measure, &decode(&coord)).cloned(),
+            Some(Value::Number(999.0))
+        );
+        assert!(app.dirty);
+        assert_eq!(app.unsaved.cells, vec![(measure, decode(&coord))]);
+        assert!(app.can_undo(), "and it undoes like any edit");
+    }
+
+    // -- typed (non-numeric) cell display + editing -------------------------
+
+    /// A `Value::DateTime` built through the same literal grammar cell editing
+    /// uses (so tests need no direct chrono dependency).
+    fn date(text: &str) -> Value {
+        parse_typed(
+            &Model::new(),
+            &improv_core_model::Locale::en(),
+            ValueType::DateTime,
+            text,
+        )
+        .expect("fixture date")
+    }
+
+    /// One input measure per declared type, all over a single category so each
+    /// grid is 1x1 and the coordinate is trivial.
+    fn typed_model() -> Model {
+        let mut m = Model::new();
+        let p = CategoryId(1);
+        m.add_category(p, "Product");
+        m.add_item(ItemId(10), p, "WidgetA");
+        for (id, name, vt) in [
+            (1u32, "Qty", ValueType::Number),
+            (2, "Label", ValueType::Text),
+            (3, "Active", ValueType::Boolean),
+            (4, "Shipped", ValueType::DateTime),
+        ] {
+            m.add_measure(Measure {
+                id: MeasureId(id),
+                name: Name(name.into()),
+                value_type: vt,
+                categories: vec![p],
+                kind: MeasureKind::Input,
+                description: None,
+                format: None,
+            });
+        }
+        let cell = improv_core_model::Coordinate::from_pairs([(p, ItemId(10))]);
+        m.set_input(MeasureId(1), cell.clone(), Value::Number(7.0));
+        m.set_input(MeasureId(2), cell.clone(), Value::Text("hello".into()));
+        m.set_input(MeasureId(3), cell.clone(), Value::Boolean(true));
+        m.set_input(MeasureId(4), cell, date("2025-03-04"));
+        m
+    }
+
+    fn typed_key() -> CoordKey {
+        improv_engine::smallvec::smallvec![(1u32, 10u32)]
+    }
+
+    /// A typed edit flows through the live engine: a derived measure over a
+    /// Text input (`Label = "go"`) and one over a Boolean (`NOT Active`)
+    /// recompute on the edit itself, not only after a rebuild. Before, a
+    /// non-number edit cleared the engine cell, so both went blank.
+    #[test]
+    fn typed_edits_recompute_their_dependents_live() {
+        let mut m = typed_model();
+        let p = CategoryId(1);
+        let derived = |id: u32, name: &str, expr: Expr| Measure {
+            id: MeasureId(id),
+            name: Name(name.into()),
+            value_type: ValueType::Boolean,
+            categories: vec![p],
+            kind: MeasureKind::Derived(Formula::new(expr)),
+            description: None,
+            format: None,
+        };
+        m.add_measure(derived(
+            10,
+            "IsGo",
+            Expr::BinaryOp(
+                improv_core_model::BinaryOp::Eq,
+                Box::new(Expr::Ref(MeasureId(2), Default::default())),
+                Box::new(Expr::Literal(Value::Text("go".into()))),
+            ),
+        ));
+        m.add_measure(derived(
+            11,
+            "Idle",
+            Expr::UnaryOp(
+                improv_core_model::UnaryOp::Not,
+                Box::new(Expr::Ref(MeasureId(3), Default::default())),
+            ),
+        ));
+        let mut app = build_app(m);
+        let key = typed_key();
+        let shown = |app: &ImprovApp, id| app.cell_text(MeasureId(id), &key);
+        assert_eq!(shown(&app, 10).as_deref(), Some("false"));
+        assert_eq!(shown(&app, 11).as_deref(), Some("false"));
+        app.commit_cell_text(MeasureId(2), key.clone(), "go")
+            .unwrap();
+        app.commit_cell_text(MeasureId(3), key.clone(), "false")
+            .unwrap();
+        assert_eq!(
+            shown(&app, 10).as_deref(),
+            Some("true"),
+            "text edit recomputed"
+        );
+        assert_eq!(
+            shown(&app, 11).as_deref(),
+            Some("true"),
+            "bool edit recomputed"
+        );
+        // Clearing the input clears what depends on it.
+        app.commit_cell_text(MeasureId(2), key.clone(), "").unwrap();
+        assert_eq!(shown(&app, 10), None);
+    }
+
+    /// Every declared type RENDERS its value. Pre-fix the grid projected input
+    /// cells through `f64`, so Text/Boolean/DateTime cells were blank.
+    #[test]
+    fn typed_input_cells_render_their_values() {
+        let app = build_app(typed_model());
+        let key = typed_key();
+        assert_eq!(app.cell_text(MeasureId(1), &key).as_deref(), Some("7"));
+        assert_eq!(app.cell_text(MeasureId(2), &key).as_deref(), Some("hello"));
+        assert_eq!(app.cell_text(MeasureId(3), &key).as_deref(), Some("true"));
+        assert_eq!(
+            app.cell_text(MeasureId(4), &key).as_deref(),
+            Some("2025-03-04T00:00:00+00:00")
+        );
+        // A cell with no value is still blank (absence, not type).
+        assert_eq!(
+            app.cell_text(
+                MeasureId(2),
+                &improv_engine::smallvec::smallvec![(1u32, 99u32)]
+            ),
+            None
+        );
+    }
+
+    /// Each declared type round-trips through an edit: type-appropriate text in,
+    /// the matching `Value` variant stored, the display reading it back.
+    #[test]
+    fn every_declared_type_round_trips_through_an_edit() {
+        let mut app = build_app(typed_model());
+        let key = typed_key();
+        let coord = decode(&key);
+        let cases: Vec<(MeasureId, &str, Value)> = vec![
+            (MeasureId(1), "12.5", Value::Number(12.5)),
+            (
+                MeasureId(2),
+                "widget label",
+                Value::Text("widget label".into()),
+            ),
+            (MeasureId(3), "false", Value::Boolean(false)),
+            (MeasureId(4), "2026-01-02", date("2026-01-02")),
+        ];
+        for (m, text, want) in cases {
+            assert_eq!(
+                app.commit_cell_text(m, key.clone(), text).as_deref(),
+                Ok("cell updated"),
+                "measure {} rejected {text:?}",
+                m.0
+            );
+            assert_eq!(
+                app.model.input(m, &coord),
+                Some(&want),
+                "measure {} stored the wrong variant",
+                m.0
+            );
+            assert_eq!(
+                app.cell_text(m, &key),
+                Some(
+                    CellValue::from_model_value(&want)
+                        .expect("typed cell")
+                        .to_string()
+                ),
+                "measure {} reads back differently than it stored",
+                m.0
+            );
+        }
+    }
+
+    /// The DECLARED type wins over the text's shape: numeric-looking text typed
+    /// into a Text measure stays Text. Pre-fix every commit parsed `f64` and
+    /// stored `Value::Number`, corrupting the cell's type.
+    #[test]
+    fn text_measure_never_stores_a_number() {
+        let mut app = build_app(typed_model());
+        let key = typed_key();
+        let coord = decode(&key);
+        for text in ["hello", "42"] {
+            app.commit_cell_text(MeasureId(2), key.clone(), text)
+                .expect("text commit");
+            assert_eq!(
+                app.model.input(MeasureId(2), &coord),
+                Some(&Value::Text(text.into())),
+                "{text:?} must stay Text for a Text-declared measure"
+            );
+        }
+        // And the typed API refuses a mismatched variant outright.
+        let err = app
+            .set_cell(MeasureId(2), key, Value::Number(42.0))
+            .expect_err("a Text measure must refuse a Number");
+        assert!(err.contains("declared Text"), "got {err:?}");
+    }
+
+    /// Text that does not parse as the declared type is rejected: the error is
+    /// surfaced and the prior typed value is untouched.
+    #[test]
+    fn invalid_typed_input_is_rejected_and_prior_value_survives() {
+        let mut app = build_app(typed_model());
+        let key = typed_key();
+        let coord = decode(&key);
+        let cases = [
+            (MeasureId(1), "abc", Value::Number(7.0), "not a number"),
+            (MeasureId(3), "maybe", Value::Boolean(true), "not a boolean"),
+            (MeasureId(4), "not-a-date", date("2025-03-04"), "not a date"),
+        ];
+        for (m, bad, prior, msg) in cases {
+            let err = app
+                .commit_cell_text(m, key.clone(), bad)
+                .expect_err("invalid input must be rejected");
+            assert!(err.contains(msg), "measure {} said {err:?}", m.0);
+            assert_eq!(
+                app.model.input(m, &coord),
+                Some(&prior),
+                "measure {} lost its prior value to a rejected edit",
+                m.0
+            );
+        }
+    }
+
+    /// The chosen empty-commit behavior: an empty buffer CLEARS the cell
+    /// (Escape already cancels, so this is the only way to delete a value).
+    #[test]
+    fn empty_commit_clears_the_cell() {
+        let mut app = build_app(typed_model());
+        let key = typed_key();
+        let coord = decode(&key);
+        assert_eq!(
+            app.commit_cell_text(MeasureId(2), key.clone(), "   ")
+                .as_deref(),
+            Ok("cell cleared")
+        );
+        assert_eq!(app.model.input(MeasureId(2), &coord), None);
+        assert_eq!(app.cell_text(MeasureId(2), &key), None, "cleared = blank");
+        // Clearing an already-empty cell is a no-op success.
+        assert!(app.commit_cell_text(MeasureId(2), key, "").is_ok());
+    }
+
+    /// Clearing a numeric cell must retract it from the live engine too, so
+    /// derived measures stop computing with a value the cell no longer holds.
+    #[test]
+    fn clearing_a_numeric_cell_retracts_it_from_the_engine() {
+        let mut app = build_app(revenue_model());
+        let mut key: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        key.sort();
+        assert_eq!(
+            app.values_for(MeasureId(102)).get(&key),
+            Some(&70.0),
+            "Revenue = Price(10) * Quantity(7)"
+        );
+        app.clear_cell(MeasureId(101), key.clone())
+            .expect("clear input cell");
+        assert_eq!(
+            app.values_for(MeasureId(102)).get(&key),
+            None,
+            "a cleared input must not leave a stale derived cell"
+        );
+    }
+
+    /// Retyping a cell as a non-numeric value must also retract it from the
+    /// engine's numeric lane (only numbers flow there), so no derived cell keeps
+    /// computing from a number the cell no longer holds.
+    #[test]
+    fn retyping_a_numeric_cell_as_text_retracts_it_from_the_engine() {
+        // Build the engine while Quantity is numeric, so it really holds the
+        // cell (declaring Text up front makes `Price * Quantity` fail to
+        // compile, leaving no engine and testing nothing), THEN redeclare the
+        // measure as Text so a text edit is the legal one.
+        let mut app = build_app(revenue_model());
+        assert!(app.engine.is_some(), "the fixture needs a live engine");
+        Arc::make_mut(&mut app.model)
+            .measures
+            .get_mut(&MeasureId(101))
+            .expect("Quantity")
+            .value_type = ValueType::Text;
+        let mut key: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2u32, 20u32)];
+        key.sort();
+        assert_eq!(
+            app.values_for(MeasureId(102)).get(&key),
+            Some(&70.0),
+            "the engine starts out computing from the numeric cell"
+        );
+        app.commit_cell_text(MeasureId(101), key.clone(), "n/a")
+            .expect("text commit");
+        assert_eq!(
+            app.cell_text(MeasureId(101), &key).as_deref(),
+            Some("n/a"),
+            "the text value is what the grid shows"
+        );
+        // The text value replaces the number in the engine (typed edits reach
+        // it), and arithmetic over text is NaN, never the stale 70.
+        let revenue = app.values_for(MeasureId(102)).get(&key).copied();
+        assert!(
+            !revenue.is_some_and(f64::is_finite),
+            "derived cell must not keep computing from the retracted number: {revenue:?}"
+        );
+    }
+
+    /// Defect-6 atomicity on the TYPED path: a failed save rolls the in-memory
+    /// typed edit back (set AND clear), prior value intact.
+    #[test]
+    fn failed_save_keeps_a_typed_edit_unsaved() {
+        let mut app = build_app(typed_model());
+        app.db = "/nonexistent-dir-improv/cannot-write.db".to_string();
+        let key = typed_key();
+        let coord = decode(&key);
+
+        let err = app
+            .commit_cell_text(MeasureId(2), key.clone(), "replacement")
+            .expect_err("save to an unwritable path must fail");
+        assert!(err.starts_with("save failed:"), "got {err:?}");
+        assert_eq!(
+            app.model.input(MeasureId(2), &coord),
+            Some(&Value::Text("replacement".into())),
+            "the typed edit stays, unsaved"
+        );
+
+        let err = app
+            .commit_cell_text(MeasureId(2), key, "")
+            .expect_err("save must fail");
+        assert!(err.starts_with("save failed:"), "got {err:?}");
+        assert_eq!(
+            app.model.input(MeasureId(2), &coord),
+            None,
+            "cleared, unsaved"
+        );
+        assert!(app.dirty);
+        // Both failed saves name the one cell: merged, written once.
+        assert!(app
+            .unsaved
+            .cells
+            .iter()
+            .all(|c| *c == (MeasureId(2), coord.clone())));
+    }
+
+    /// Begin-edit seeds the buffer with the cell's TYPED display text, so a
+    /// text/date cell is tweaked rather than retyped from blank.
+    #[test]
+    fn begin_edit_seeds_the_typed_display_text() {
+        let mut app = build_app(typed_model());
+        select(&mut app, MeasureId(2)); // Label (Text)
+        app.sync_axis_state();
+        app.begin_edit_cursor();
+        assert_eq!(
+            app.focused().editing.as_ref().map(|(m, _)| *m),
+            Some(MeasureId(2))
+        );
+        assert_eq!(app.focused().edit_buf, "hello", "text cell seeded blank");
+    }
+
+    // -- ITEM 1: grid shortcuts must not steal keystrokes ------------------
+
+    /// The gate is a pure predicate so it can be checked exhaustively: grid
+    /// bindings run only when NOTHING owns the keyboard. Pre-fix the decision
+    /// was `!editing` alone, so the `(false, true)` row — some *other* text
+    /// field focused — wrongly enabled them.
+    #[test]
+    fn grid_keys_are_enabled_only_when_nothing_owns_the_keyboard() {
+        assert!(grid_keys_enabled(false, false), "idle grid: keys act");
+        assert!(!grid_keys_enabled(true, false), "cell editor open");
+        assert!(
+            !grid_keys_enabled(false, true),
+            "another text field is focused: it must get the keystroke"
+        );
+        assert!(!grid_keys_enabled(true, true), "cell editor focused");
+    }
+
+    /// Feed one frame of key presses through `handle_grid_keys` with `focus`
+    /// optionally held by a NON-grid widget id, and report what the grid state
+    /// became: (selected measure, cursor, first page index).
+    ///
+    /// The keys are delivered to the FOCUSED matrix (index `app.focus_index()`),
+    /// which is what the canvas does; `frame_with_keys_for` drives a specific
+    /// matrix, for asserting that an unfocused one ignores them.
+    fn frame_with_keys(
+        app: &mut ImprovApp,
+        keys: &[egui::Key],
+        focus: Option<&str>,
+    ) -> (Option<MeasureId>, (usize, usize), usize) {
+        let mi = app.focus_index();
+        frame_with_keys_for(app, mi, keys, focus)
+    }
+
+    /// [`frame_with_keys`], addressed at matrix `mi` rather than the focused one.
+    fn frame_with_keys_for(
+        app: &mut ImprovApp,
+        mi: usize,
+        keys: &[egui::Key],
+        focus: Option<&str>,
+    ) -> (Option<MeasureId>, (usize, usize), usize) {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            events: keys
+                .iter()
+                .map(|k| egui::Event::Key {
+                    key: *k,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let _ = ctx.test_ui(raw, |ctx_ui| {
+            if let Some(id) = focus {
+                // Exactly what a focused TextEdit elsewhere in the app does.
+                ctx.memory_mut(|m| m.request_focus(egui::Id::unique(id)));
+            }
+            egui::CentralPanel::default().show(ctx_ui, |ui| {
+                app.handle_grid_keys(ui, mi);
+            });
+        });
+        (
+            app.selected(),
+            (app.focused().cursor_row, app.focused().cursor_col),
+            app.focused().page_idx.first().copied().unwrap_or(0),
+        )
+    }
+
+    /// Typing in the formula editor / new-measure form / CSV wizard / view-name
+    /// box must not drive the grid: with focus elsewhere, `n`, `j`/`l` and `]`
+    /// change nothing. Pre-fix each of them cycled the measure, moved the cell
+    /// cursor, and paged a dimension mid-word.
+    #[test]
+    fn focused_text_field_elsewhere_swallows_grid_shortcuts() {
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        let before = (
+            app.selected(),
+            (app.focused().cursor_row, app.focused().cursor_col),
+            0,
+        );
+
+        use egui::Key;
+        let keys = [Key::N, Key::J, Key::L, Key::CloseBracket, Key::Enter];
+        for field in ["formula_edit", "csv_path", "view_name"] {
+            let after = frame_with_keys(&mut app, &keys, Some(field));
+            assert_eq!(after, before, "{field} focused, yet the grid reacted");
+            assert!(
+                app.focused().editing.is_none(),
+                "{field} focused, yet Enter opened a cell editor"
+            );
+        }
+    }
+
+    /// The gate is transient, not sticky: the very next frame after focus is
+    /// released, the same keys work again.
+    #[test]
+    fn grid_shortcuts_work_again_once_focus_is_released() {
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200)); // Sales[Time, Product, Region]
+        app.sync_axis_state();
+
+        // Frame 1: focused elsewhere -> `]` must not page.
+        use egui::Key;
+        let (_, _, page) = frame_with_keys(&mut app, &[Key::CloseBracket], Some("some_text_field"));
+        assert_eq!(page, 0, "paged while a text field had focus");
+
+        // Frame 2: focus released -> the very same key works again (the gate is
+        // transient, not a latch).
+        let (_, cursor, page) = frame_with_keys(&mut app, &[Key::CloseBracket], None);
+        assert_eq!(page, 1, "`]` must page the first page dimension again");
+        assert_eq!(cursor, (0, 0));
+    }
+
+    /// Cell editing is untouched by the gate: `editing.is_some()` already
+    /// suppressed the bindings, and the editor's own focus must not change that.
+    #[test]
+    fn cell_editing_still_works_while_editing() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product]
+        app.sync_axis_state();
+
+        // Enter opens the editor (no focus held).
+        use egui::Key;
+        frame_with_keys(&mut app, &[Key::Enter], None);
+        let editing = app.focused().editing.clone();
+        assert!(
+            editing.is_some(),
+            "Enter must begin editing the cursor cell"
+        );
+
+        // While editing, the cell editor holds focus. The grid bindings stay
+        // out of the way and the edit buffer survives the frame.
+        app.focused_mut().edit_buf = "7".into();
+        let after = frame_with_keys(&mut app, &[Key::N, Key::J, Key::L], Some("cell_editor"));
+        assert_eq!(after.1, (0, 0), "cursor moved under the open editor");
+        assert_eq!(
+            app.focused().editing,
+            editing,
+            "the open editor was disturbed"
+        );
+        assert_eq!(app.focused().edit_buf, "7");
+
+        // And committing the buffer still writes the cell.
+        let key = app.cursor_key().expect("cursor addresses a cell");
+        let msg = app
+            .commit_cell_text(MeasureId(101), key.clone(), &app.focused().edit_buf.clone())
+            .expect("commit");
+        assert_eq!(msg, "cell updated");
+        assert_eq!(app.cell_text(MeasureId(101), &key).as_deref(), Some("7"));
+    }
+
+    /// Ctrl+Z goes through the same gate: it must not fire while a text field
+    /// is focused (Ctrl+Z belongs to that field's own editing), and must fire
+    /// when nothing is focused.
+    #[test]
+    fn undo_shortcut_honors_the_focus_gate() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        let key = app.cursor_key().expect("cell");
+        app.set_cell(MeasureId(101), key.clone(), Value::Number(999.0))
+            .expect("edit");
+        assert!(app.can_undo());
+
+        let press_undo = |app: &mut ImprovApp, focus: Option<&str>| {
+            let ctx = egui::Context::default();
+            let raw = egui::RawInput {
+                events: vec![
+                    egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                    egui::Event::Key {
+                        key: egui::Key::Z,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::COMMAND,
+                    },
+                ],
+                ..Default::default()
+            };
+            let _ = ctx.test_pass(raw, |ctx| {
+                if let Some(id) = focus {
+                    ctx.memory_mut(|m| m.request_focus(egui::Id::unique(id)));
+                }
+                app.handle_command_keys(ctx);
+            });
+        };
+
+        press_undo(&mut app, Some("formula_edit"));
+        assert_eq!(
+            app.cell_text(MeasureId(101), &key).as_deref(),
+            Some("999"),
+            "Ctrl+Z fired while typing in another field"
+        );
+
+        press_undo(&mut app, None);
+        assert_eq!(
+            app.cell_text(MeasureId(101), &key).as_deref(),
+            Some("100"),
+            "Ctrl+Z with no focus must undo"
+        );
+    }
+
+    // -- ITEM 2: undo / redo of MODEL state -------------------------------
+
+    /// The oracle cell + its Revenue key for the 2x2 fixture.
+    fn q_and_rev_keys() -> (CoordKey, CoordKey) {
+        let mut k: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2, 20)];
+        k.sort();
+        (k.clone(), k)
+    }
+
+    #[test]
+    fn undo_restores_the_cell_and_the_engine_snapshot() {
+        let mut app = build_app(grid_2x2_model());
+        let (qkey, rkey) = q_and_rev_keys();
+        // Quantity[2025, WidgetA] = 100, Price[WidgetA] = 10 -> Revenue 1000.
+        assert_eq!(app.values_for(MeasureId(102)).get(&rkey), Some(&1000.0));
+
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(200.0))
+            .expect("edit");
+        assert_eq!(app.values_for(MeasureId(102)).get(&rkey), Some(&2000.0));
+
+        app.undo().expect("undo");
+        assert_eq!(
+            app.cell_text(MeasureId(101), &qkey).as_deref(),
+            Some("100"),
+            "undo must restore the prior cell value"
+        );
+        assert_eq!(
+            app.values_for(MeasureId(102)).get(&rkey),
+            Some(&1000.0),
+            "the engine snapshot must agree with the restored model"
+        );
+
+        app.redo().expect("redo");
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("200"));
+        assert_eq!(app.values_for(MeasureId(102)).get(&rkey), Some(&2000.0));
+    }
+
+    #[test]
+    fn undo_restores_a_cleared_cell() {
+        let mut app = build_app(grid_2x2_model());
+        let (qkey, rkey) = q_and_rev_keys();
+        app.clear_cell(MeasureId(101), qkey.clone()).expect("clear");
+        assert_eq!(app.cell_text(MeasureId(101), &qkey), None);
+
+        app.undo().expect("undo");
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("100"));
+        assert_eq!(app.values_for(MeasureId(102)).get(&rkey), Some(&1000.0));
+    }
+
+    #[test]
+    fn undo_a_formula_commit_and_a_new_derived_measure() {
+        let mut app = build_app(revenue_model());
+        let mut rkey: CoordKey = improv_engine::smallvec::smallvec![(1u32, 10u32), (2, 20)];
+        rkey.sort();
+        assert_eq!(app.values_for(MeasureId(102)).get(&rkey), Some(&70.0));
+
+        app.commit_formula(MeasureId(102), "Price + Quantity")
+            .expect("commit");
+        assert_eq!(app.values_for(MeasureId(102)).get(&rkey), Some(&17.0));
+
+        app.undo().expect("undo");
+        assert_eq!(
+            app.formula_source(MeasureId(102)).as_deref(),
+            Some("Price * Quantity"),
+            "undo must restore the prior formula"
+        );
+        assert_eq!(
+            app.values_for(MeasureId(102)).get(&rkey),
+            Some(&70.0),
+            "the engine must be rebuilt from the restored formula"
+        );
+
+        // A new derived measure is undone away entirely.
+        let id = app
+            .add_derived_measure("Margin", "Price - Quantity")
+            .expect("add");
+        assert!(app.model.measures.contains_key(&id));
+        app.undo().expect("undo");
+        assert!(
+            app.model.measure_by_name("Margin").is_none(),
+            "undo must remove the added measure"
+        );
+        assert!(
+            !app.snapshot.contains_key(&id),
+            "the snapshot must not keep values for a measure that is gone"
+        );
+        assert_eq!(app.selected(), Some(MeasureId(100)), "selection re-pointed");
+    }
+
+    #[test]
+    fn undo_a_view_save() {
+        let mut app = build_app(revenue_model());
+        let id = app.save_view("L1").expect("saved");
+        assert!(app.model.views.contains_key(&id));
+        app.undo().expect("undo");
+        assert!(app.model.views.is_empty(), "undo must drop the saved view");
+    }
+
+    /// A CSV import creates a measure, a category, and items. Undo must take
+    /// all of them away, not just the cells.
+    #[test]
+    fn undo_a_csv_import_removes_what_it_created() {
+        let path = std::env::temp_dir().join(format!(
+            "improv_gui_undo_import_{}_{}.csv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::write(&path, "region,amount\nNorth,5\nSouth,7\n").expect("write csv");
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+
+        let mut app = build_app(inputs_only_model());
+        let before = (*app.model).clone();
+        app.import_form = ImportForm {
+            path: path.to_string_lossy().into_owned(),
+            tsv: false,
+            has_header: true,
+            measure_id: "500".into(),
+            measure_name: "Imported".into(),
+            value_column: "amount".into(),
+            dimensions: vec![csv_wizard::DimRow {
+                column: "region".into(),
+                category_id: "9".into(),
+                category_name: "Region".into(),
+            }],
+        };
+        app.run_csv_import();
+        assert!(
+            app.status.starts_with("imported 2 cell(s)"),
+            "import failed: {}",
+            app.status
+        );
+        assert!(app.model.measures.contains_key(&MeasureId(500)));
+        assert!(app.model.categories.contains_key(&CategoryId(9)));
+        let imported_items = app.model.items.len();
+        assert!(imported_items > before.items.len(), "items were minted");
+
+        app.undo().expect("undo");
+        assert!(
+            !app.model.measures.contains_key(&MeasureId(500)),
+            "undo must remove the imported measure"
+        );
+        assert!(
+            !app.model.categories.contains_key(&CategoryId(9)),
+            "undo must remove the category the import created"
+        );
+        assert_eq!(*app.model, before, "undo must restore the pre-import model");
+        assert_eq!(
+            app.selected(),
+            pick_default_measure(&before),
+            "selection must leave the measure that no longer exists"
+        );
+
+        app.redo().expect("redo");
+        assert!(app.model.measures.contains_key(&MeasureId(500)));
+        assert_eq!(app.model.items.len(), imported_items);
+    }
+
+    #[test]
+    fn undo_at_the_bottom_of_the_stack_is_a_no_op() {
+        let mut app = build_app(revenue_model());
+        let before = (*app.model).clone();
+        assert!(!app.can_undo());
+        app.undo().expect("undo on an empty history is a no-op");
+        app.redo().expect("redo on an empty history is a no-op");
+        assert_eq!(*app.model, before);
+        // And after undoing the only recorded step.
+        let (qkey, _) = q_and_rev_keys();
+        app.set_cell(MeasureId(101), qkey, Value::Number(1.0))
+            .expect("edit");
+        app.undo().expect("undo");
+        assert!(!app.can_undo());
+        app.undo().expect("still a no-op, not a panic");
+        assert_eq!(*app.model, before);
+    }
+
+    #[test]
+    fn history_depth_is_bounded_and_evicts_the_oldest() {
+        let mut app = build_app(grid_2x2_model());
+        let (qkey, _) = q_and_rev_keys();
+        // UNDO_DEPTH + 5 edits: the five oldest undo points are evicted.
+        for i in 1..=(UNDO_DEPTH + 5) {
+            app.set_cell(
+                MeasureId(101),
+                qkey.clone(),
+                Value::Number(1000.0 + i as f64),
+            )
+            .expect("edit");
+        }
+        assert_eq!(app.undo_stack.len(), UNDO_DEPTH, "depth bound not enforced");
+
+        // Undo everything we can: we land on the state after edit #5 (the
+        // oldest still-recorded point), never the original 100.
+        while app.can_undo() {
+            app.undo().expect("undo");
+        }
+        assert_eq!(
+            app.cell_text(MeasureId(101), &qkey).as_deref(),
+            Some("1005"),
+            "the oldest retained undo point should be the state after edit 5"
+        );
+    }
+
+    #[test]
+    fn a_new_mutation_after_undo_clears_the_redo_stack() {
+        let mut app = build_app(grid_2x2_model());
+        let (qkey, _) = q_and_rev_keys();
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(200.0))
+            .expect("edit");
+        app.undo().expect("undo");
+        assert!(app.can_redo(), "undo must make the step redoable");
+
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(300.0))
+            .expect("edit");
+        assert!(
+            !app.can_redo(),
+            "a fresh mutation must make the undone future unreachable"
+        );
+        app.undo().expect("undo");
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("100"));
+    }
+
+    /// Undo must PERSIST: undo then quit must not resurrect the undone state.
+    #[test]
+    fn undo_is_saved_to_the_store() {
+        let db = std::env::temp_dir()
+            .join(format!(
+                "improv_gui_undo_persist_{}_{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(db.clone());
+
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed the store");
+        let mut app = ImprovApp::load(&db).expect("load");
+        let (qkey, _) = q_and_rev_keys();
+
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(200.0))
+            .expect("edit");
+        app.undo().expect("undo");
+
+        let reloaded = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert_eq!(
+            reloaded.input(MeasureId(101), &decode(&qkey)),
+            Some(&Value::Number(100.0)),
+            "the undone value was left in the store"
+        );
+    }
+
+    /// A store write that fails during undo is surfaced, and nothing is lost:
+    /// the undo is taken in the window (H3), unsaved, its redo step is there,
+    /// and the next save writes it.
+    #[test]
+    fn a_failed_save_during_undo_is_reported_and_kept_unsaved() {
+        let mut app = build_app(grid_2x2_model());
+        let (qkey, _) = q_and_rev_keys();
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(200.0))
+            .expect("edit");
+
+        app.db = std::env::temp_dir()
+            .join(format!("improv_gui_no_such_dir_{}", std::process::id()))
+            .join("model.db")
+            .to_string_lossy()
+            .into_owned();
+        let err = app
+            .undo()
+            .expect_err("an unwritable store must fail the undo's save");
+        assert!(err.starts_with("save failed:"), "got {err:?}");
+        assert_eq!(
+            app.cell_text(MeasureId(101), &qkey).as_deref(),
+            Some("100"),
+            "the undo is taken, unsaved"
+        );
+        assert!(app.dirty && app.can_redo());
+
+        // The UI path reports it instead of claiming success.
+        app.redo_with_status();
+        assert!(app.status.starts_with("redo failed:"), "{}", app.status);
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("200"));
+    }
+
+    // -- STEP 1: margin gutters (docs/reviews/2026-09-22-gui-reconstruction-plan.md)
+
+    /// A headless egui `Context` sized like a desktop window, plus a `pass`
+    /// closure that lays out one real frame of the whole app and returns the
+    /// gutter/table geometry the grid recorded.
+    ///
+    /// This is a genuine headless frame: `Context::run` over the same panel
+    /// sequence `eframe::App::update` drives, so the rects are the ones a user
+    /// would see, not a reconstruction. (`eframe::Frame` cannot be built outside
+    /// eframe, but `update` only forwards it, so the panel calls are made
+    /// directly here.) The `Context` is handed back so a caller can run MANY
+    /// frames on ONE context: egui carries panel extents from frame to frame, so
+    /// single-frame geometry cannot see a gutter that ratchets.
+    fn layout_harness() -> (
+        egui::Context,
+        impl FnMut(&egui::Context, &mut ImprovApp) -> GutterRects,
+    ) {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut time = 0.0_f64;
+        let pass = move |ctx: &egui::Context, app: &mut ImprovApp| {
+            time += 1.0 / 60.0;
+            let _ = full_frame(ctx, app, egui::vec2(1200.0, 800.0), time);
+            app.focused()
+                .gutters
+                .expect("the focused matrix must record its gutters")
+        };
+        (ctx, pass)
+    }
+
+    /// Run one whole-app frame (every panel, in `update`'s order) at `size`.
+    fn full_frame(
+        ctx: &egui::Context,
+        app: &mut ImprovApp,
+        size: egui::Vec2,
+        time: f64,
+    ) -> egui::FullOutput {
+        full_frame_with(ctx, app, size, time, Vec::new(), |_| ())
+    }
+
+    /// [`full_frame`] delivering `events`, then calling `inspect` inside the
+    /// pass (while the layers' shapes are still in `ctx.graphics`).
+    fn full_frame_with(
+        ctx: &egui::Context,
+        app: &mut ImprovApp,
+        size: egui::Vec2,
+        time: f64,
+        events: Vec<egui::Event>,
+        mut inspect: impl FnMut(&egui::Context),
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            time: Some(time),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            // As a backend does: the held modifiers ride along with the events.
+            events: events
+                .iter()
+                .find_map(|e| match e {
+                    egui::Event::Key { modifiers, .. }
+                    | egui::Event::PointerButton { modifiers, .. } => Some(*modifiers),
+                    _ => None,
+                })
+                .map(egui::Event::ModifiersChanged)
+                .into_iter()
+                .chain(events)
+                .collect(),
+            ..Default::default()
+        };
+        // Exactly what eframe runs each frame (raw_input_hook, App::ui).
+        let mut raw = raw;
+        app.take_help_click(&mut raw);
+        ctx.test_ui(raw, |ui| {
+            app.frame(ui);
+            inspect(&ui.ctx().clone());
+        })
+    }
+
+    /// Item headers are plain dark text in a ruled band, not beveled chips:
+    /// no filled rect sits behind a header, and its text is the body color.
+    #[test]
+    fn item_headers_are_plain_text() {
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(102));
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut shapes = Vec::new();
+        for i in 0..8 {
+            shapes = full_frame(
+                &ctx,
+                &mut app,
+                egui::vec2(1280.0, 800.0),
+                f64::from(i) / 60.0,
+            )
+            .shapes;
+        }
+        // "WidgetA" is the column header, "2025" the row stub.
+        for header in ["WidgetA", "2025"] {
+            let (rect, color) = shapes
+                .iter()
+                .find_map(|c| match &c.shape {
+                    // A label's job color is a placeholder; the shape's
+                    // fallback color is what is painted.
+                    egui::Shape::Text(t) if t.galley.text() == header => Some((
+                        t.galley.rect.translate(t.pos.to_vec2()),
+                        t.override_text_color.unwrap_or(t.fallback_color),
+                    )),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("header {header:?} was not drawn"));
+            assert!(
+                color.r() < 0x60 && color.g() < 0x60 && color.b() < 0x60,
+                "header {header:?} must be dark body text, got {color:?}"
+            );
+            let chip = shapes.iter().any(|c| match &c.shape {
+                // Chip-sized only: the #555555 workspace behind every
+                // window contains every header too.
+                egui::Shape::Rect(r) => {
+                    r.fill == crate::theme::DARK_GRAY
+                        && r.rect.contains_rect(rect)
+                        && r.rect.height() < 4.0 * rect.height()
+                }
+                _ => false,
+            });
+            assert!(!chip, "header {header:?} sits on a beveled chip");
+        }
+    }
+
+    /// Numbers right-align in their column so the digits line up (Improv's
+    /// grid); text stays left. Two values of different widths in one column
+    /// must share a right edge, and a text cell must not.
+    #[test]
+    fn numeric_cells_right_align() {
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        let mut m = Model::new();
+        m.add_category(t, "Time");
+        m.add_category(p, "Product");
+        m.add_item(ItemId(10), t, "Q1");
+        m.add_item(ItemId(11), t, "Q2");
+        m.add_item(ItemId(20), p, "W");
+        for (id, name, ty) in [(1, "N", ValueType::Number), (2, "S", ValueType::Text)] {
+            m.add_measure(Measure {
+                id: MeasureId(id),
+                name: Name(name.into()),
+                value_type: ty,
+                categories: vec![t, p],
+                kind: MeasureKind::Input,
+                description: None,
+                format: None,
+            });
+        }
+        let at = |q| improv_core_model::Coordinate::from_pairs([(t, ItemId(q)), (p, ItemId(20))]);
+        m.set_input(MeasureId(1), at(10), Value::Number(5.0));
+        m.set_input(MeasureId(1), at(11), Value::Number(12345.5));
+        m.set_input(MeasureId(2), at(10), Value::Text("a".into()));
+        m.set_input(MeasureId(2), at(11), Value::Text("abcdefgh".into()));
+
+        // The on-screen [left, right] x-extent of the text drawn as `s`.
+        let extent = |shapes: &[egui::epaint::ClippedShape], s: &str| {
+            shapes
+                .iter()
+                .find_map(|c| match &c.shape {
+                    egui::Shape::Text(t) if t.galley.text() == s => {
+                        let r = t.galley.rect.translate(t.pos.to_vec2());
+                        Some((r.min.x, r.max.x))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{s:?} was not drawn"))
+        };
+        let mut app = build_app(m);
+        let mut lay_out = |measure, short, long| {
+            select(&mut app, MeasureId(measure));
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let mut shapes = Vec::new();
+            for i in 0..8 {
+                shapes = full_frame(
+                    &ctx,
+                    &mut app,
+                    egui::vec2(1280.0, 800.0),
+                    f64::from(i) / 60.0,
+                )
+                .shapes;
+            }
+            (extent(&shapes, short), extent(&shapes, long))
+        };
+        let (num_short, num_long) = lay_out(1, "5", "12345.5");
+        let (txt_short, txt_long) = lay_out(2, "a", "abcdefgh");
+        assert!(
+            (num_short.1 - num_long.1).abs() < 0.5,
+            "numbers share a right edge: {num_short:?} vs {num_long:?}"
+        );
+        assert!(
+            (txt_short.0 - txt_long.0).abs() < 0.5 && (txt_short.1 - txt_long.1).abs() > 0.5,
+            "text stays left-aligned: {txt_short:?} vs {txt_long:?}"
+        );
+        // The column still fits its widest value: right-aligning must not
+        // inflate the auto-sized column (the widest number starts where the
+        // column, i.e. a left-aligned value, starts).
+        assert!(
+            (num_long.0 - txt_short.0).abs() < 0.5,
+            "the numeric column grew past its content: {num_long:?} starts after {txt_short:?}"
+        );
+    }
+
+    /// At the minimum window size (and the old 800x600 default) nothing a
+    /// worksheet window paints or makes interactive reaches outside its own
+    /// window rect. Windows float over the side panels by design (NeXT
+    /// floating windows); what must not happen is the gutter panels escaping
+    /// the window, which `show_inside` would do by replacing their clip.
+    #[test]
+    fn window_content_never_paints_outside_its_window() {
+        for size in [
+            egui::Vec2::from(crate::app::MIN_WINDOW),
+            egui::vec2(800.0, 600.0),
+        ] {
+            let mut app = gutter_app();
+            app.add_matrix(app.focused().measure);
+            // Below the minimum (as a hand-edited view could be), so the
+            // gutters overflow the body.
+            for m in &mut app.matrices {
+                (m.rect.w, m.rect.h) = (120.0, 80.0);
+            }
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let mut shapes: Vec<Vec<egui::epaint::ClippedShape>> = Vec::new();
+            let ids = [win_id(&app, 0), win_id(&app, 1)];
+            for i in 0..8 {
+                let _ = full_frame_with(
+                    &ctx,
+                    &mut app,
+                    size,
+                    f64::from(i) / 60.0,
+                    Vec::new(),
+                    |ctx| {
+                        shapes = ids
+                            .iter()
+                            .map(|&id| {
+                                let layer = egui::LayerId::new(egui::Order::Middle, id);
+                                ctx.graphics(|g| {
+                                    g.get(layer)
+                                        .map(|l| l.all_entries().cloned().collect())
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .collect();
+                    },
+                );
+            }
+            let widgets = ctx.viewport(|v| v.prev_pass.widgets.clone());
+            for (mi, shapes) in shapes.iter().enumerate() {
+                let win = win_rect(&ctx, &app, mi).expand(1.0);
+                assert!(shapes.len() > 20, "{size:?}: window {mi} painted its grid");
+                for s in shapes {
+                    let seen = s.shape.visual_bounding_rect().intersect(s.clip_rect);
+                    assert!(
+                        !seen.is_positive() || win.contains_rect(seen),
+                        "{size:?}: window {mi} {win:?} paints at {seen:?}"
+                    );
+                }
+                let layer = egui::LayerId::new(egui::Order::Middle, ids[mi]);
+                let mut n = 0;
+                for w in widgets.get_layer(layer) {
+                    n += 1;
+                    assert!(
+                        !w.sense.interactive()
+                            || !w.interact_rect.is_positive()
+                            || win.contains_rect(w.interact_rect),
+                        "{size:?}: window {mi} {win:?} takes input at {:?}",
+                        w.interact_rect
+                    );
+                }
+                assert!(n > 5, "{size:?}: window {mi} registered its widgets");
+            }
+        }
+    }
+
+    /// Lay out the whole app for several frames at a desktop window size and
+    /// return EVERY matrix's recorded gutter geometry, in canvas order.
+    ///
+    /// The multi-matrix counterpart of [`layout_frame`]: a canvas holding N
+    /// matrices must have N framed tables, not one.
+    fn layout_all(app: &mut ImprovApp) -> Vec<GutterRects> {
+        let (ctx, mut pass) = layout_harness();
+        for _ in 0..8 {
+            let _ = pass(&ctx, app);
+        }
+        app.matrices
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                m.gutters
+                    .unwrap_or_else(|| panic!("matrix {i} recorded no gutters"))
+            })
+            .collect()
+    }
+
+    /// Lay out `app` until its geometry stops changing, and return it. A panel
+    /// reads its extent from the previous frame's `PanelState`, so the frame
+    /// right after a layout change still reports the old size; settling makes an
+    /// assertion about *the* layout rather than about a transient.
+    ///
+    /// Panics if the geometry never settles within 20 frames — which is itself
+    /// the check that no gutter ratchets open frame after frame.
+    fn settle(
+        ctx: &egui::Context,
+        app: &mut ImprovApp,
+        pass: &mut impl FnMut(&egui::Context, &mut ImprovApp) -> GutterRects,
+    ) -> GutterRects {
+        let mut prev = pass(ctx, app);
+        for _ in 0..20 {
+            let now = pass(ctx, app);
+            if now == prev {
+                return now;
+            }
+            prev = now;
+        }
+        panic!("the gutter layout never settled (it drifts every frame): {prev:?}");
+    }
+
+    /// Lay out one app on a fresh context and return its settled geometry.
+    fn layout_frame(app: &mut ImprovApp) -> GutterRects {
+        let (ctx, mut pass) = layout_harness();
+        settle(&ctx, app, &mut pass)
+    }
+
+    /// A `Sales[Time, Product, Region]` app ready to lay out: `Time` on rows,
+    /// `Product` on columns, `Region` in the well.
+    fn gutter_app() -> ImprovApp {
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        app
+    }
+
+    /// Re-pivoting repeatedly on ONE long-lived context must not make any gutter
+    /// creep: stacking a tile grows the column gutter, unstacking shrinks it back
+    /// to exactly its old size, and the corner well returns to its old height.
+    ///
+    /// This is a regression the first draft of this step actually had: a drop
+    /// zone claiming `available_size()` inside a self-sizing panel ratcheted the
+    /// well taller every frame, because the next frame's "available" included
+    /// what the zone claimed in the last one. A single-frame test cannot see it.
+    #[test]
+    fn gutters_do_not_creep_across_frames_or_repivots() {
+        let mut app = gutter_app();
+        // No page tiles: their item field would outgrow two column tiles and
+        // hide the column stack's growth.
+        app.set_axis(CategoryId(3), Axis::Rows);
+        let (ctx, mut pass) = layout_harness();
+        let one = settle(&ctx, &mut app, &mut pass);
+
+        app.set_axis(CategoryId(3), Axis::Columns);
+        let two = settle(&ctx, &mut app, &mut pass);
+        assert!(
+            two.top.height() > one.top.height(),
+            "a second stacked column tile must make the gutter taller"
+        );
+
+        app.set_axis(CategoryId(3), Axis::Rows);
+        let back = settle(&ctx, &mut app, &mut pass);
+        assert_eq!(
+            back.top.height(),
+            one.top.height(),
+            "the column gutter must shrink back, not latch open"
+        );
+        assert_eq!(
+            back.well.height(),
+            one.well.height(),
+            "the corner well must shrink back, not ratchet"
+        );
+        assert!(gutters_frame_table(&back), "{back:?}");
+    }
+
+    /// Shrinking the window must never panic a debug build, and must never claim
+    /// the gutters frame the table when they have been squeezed flat. At a real
+    /// window size the invariant holds; below the size where the panels still fit
+    /// [`gutters_have_room`] reports that and the per-frame `debug_assert!`
+    /// stands down.
+    ///
+    /// This drives [`ImprovApp::gutter_frame`]'s own `debug_assert!` at every
+    /// size, so a regression that breaks adjacency at a usable window size fails
+    /// here rather than at a user's first resize.
+    #[test]
+    fn shrinking_the_window_never_panics_and_never_lies_about_framing() {
+        let sizes = [
+            (1200.0, 800.0),
+            (900.0, 600.0),
+            (600.0, 400.0),
+            (300.0, 200.0),
+            (120.0, 80.0),
+            (10.0, 10.0),
+        ];
+        let mut framed_at_least_once = false;
+        for (w, h) in sizes {
+            let mut app = gutter_app();
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            // Several frames so the panels settle at this size (and so the
+            // per-frame debug assertion runs on the settled geometry too).
+            for i in 0..8 {
+                let raw = egui::RawInput {
+                    time: Some(f64::from(i) / 60.0),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, h),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.test_ui(raw, |ui| {
+                    app.sync_axis_state();
+                    app.canvas_panel(ui);
+                });
+            }
+            let g = app
+                .focused()
+                .gutters
+                .expect("gutters recorded at every size");
+            if gutters_have_room(&g) {
+                framed_at_least_once = true;
+                assert!(
+                    gutters_frame_table(&g),
+                    "{w}x{h}: there was room, so the gutters must frame the table: {g:?}"
+                );
+            }
+        }
+        assert!(
+            framed_at_least_once,
+            "no size had room — the test would be vacuous"
+        );
+    }
+
+    /// **The Step 1 acceptance test.** The row gutter's rect adjoins the
+    /// table's LEFT edge and the column gutter's adjoins its TOP edge — the
+    /// geometric check the old three-zone horizontal shelf failed (it sat
+    /// entirely above the grid, touching neither edge).
+    #[test]
+    fn row_gutter_adjoins_the_tables_left_edge_and_column_gutter_its_top() {
+        let g = layout_frame(&mut gutter_app());
+
+        assert!(
+            (g.left.max.x - g.table.min.x).abs() <= EDGE_EPS,
+            "row gutter right edge {} must BE the table's left edge {} (gutters {g:?})",
+            g.left.max.x,
+            g.table.min.x
+        );
+        assert!(
+            (g.top.max.y - g.table.min.y).abs() <= EDGE_EPS,
+            "column gutter bottom edge {} must BE the table's top edge {} (gutters {g:?})",
+            g.top.max.y,
+            g.table.min.y
+        );
+        // The gutters run ALONGSIDE the table, not merely touch a corner.
+        assert!(
+            g.left.min.y <= g.table.min.y && g.left.max.y > g.table.min.y,
+            "the row gutter must span the table vertically: {g:?}"
+        );
+        assert!(
+            g.top.min.x <= g.table.min.x && g.top.max.x > g.table.min.x,
+            "the column gutter must span the table horizontally: {g:?}"
+        );
+        // The top gutter is a real strip; `left` is the table's left edge.
+        assert!(g.left.height() > 0.0, "{g:?}");
+        assert!(g.top.width() > 0.0 && g.top.height() > 0.0, "{g:?}");
+        // And the whole arrangement satisfies the framing invariant.
+        assert!(gutters_frame_table(&g), "{g:?}");
+    }
+
+    /// The row strip is the BOTTOM-LEFT one the reference shows (`Product` /
+    /// `Channel` inline with the horizontal scrollbar): below the table, flush
+    /// with its left edge.
+    #[test]
+    fn the_page_well_is_the_bottom_left_corner() {
+        let g = layout_frame(&mut gutter_app());
+        assert!(
+            g.well.min.y >= g.left.max.y - EDGE_EPS,
+            "the well must sit BELOW the framed region (the row gutter): {g:?}"
+        );
+        assert!(
+            g.well.min.y >= g.table.min.y,
+            "the well must be below the table's top, not beside it: {g:?}"
+        );
+        assert!(
+            (g.well.min.x - g.left.min.x).abs() <= EDGE_EPS,
+            "the well must be flush with the row gutter's left edge: {g:?}"
+        );
+    }
+
+    /// NeXT placement: every row tile in the bottom strip, every column tile
+    /// in the top strip, right of every page tile.
+    #[test]
+    fn tiles_sit_in_their_next_gutters() {
+        let mut app = gutter_app();
+        app.set_axis(CategoryId(3), Axis::Pages);
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let g = app.focused().gutters.expect("laid out");
+        let (rows, cols, pages) = (app.row_cats(), app.col_cats(), app.page_cats());
+        assert!(!rows.is_empty() && !cols.is_empty() && !pages.is_empty());
+        let page_right = pages
+            .iter()
+            .map(|&c| tile_rect(&desk, &app, c).right())
+            .fold(f32::MIN, f32::max);
+        for c in rows {
+            let t = tile_rect(&desk, &app, c);
+            assert!(g.well.contains_rect(t), "row tile {t:?} outside {g:?}");
+        }
+        for c in cols {
+            let t = tile_rect(&desk, &app, c);
+            assert!(g.top.contains_rect(t), "col tile {t:?} outside {g:?}");
+            assert!(t.left() > page_right, "col tile {t:?} left of pages");
+        }
+    }
+
+    /// Stacking two categories on the column axis makes the column gutter
+    /// TALLER (tiles stack vertically, as the reference's "Result" panel shows
+    /// `Travel` above `Hours`) while still adjoining the table's top edge.
+    #[test]
+    fn stacked_column_tiles_grow_the_gutter_downward_and_stay_docked() {
+        let mut app = gutter_app();
+        // No page tiles (their item field is taller than two column tiles).
+        app.set_axis(CategoryId(3), Axis::Rows);
+        let one = layout_frame(&mut app);
+        assert_eq!(app.col_cats().len(), 1);
+
+        // Stack a second category on columns (the drop a drag would produce).
+        app.set_axis(CategoryId(3), Axis::Columns);
+        assert_eq!(app.col_cats().len(), 2, "two categories on the column axis");
+        let two = layout_frame(&mut app);
+
+        assert!(
+            two.top.height() > one.top.height(),
+            "a second stacked column tile must make the gutter taller: {} -> {}",
+            one.top.height(),
+            two.top.height()
+        );
+        assert!(
+            (two.top.max.y - two.table.min.y).abs() <= EDGE_EPS,
+            "the taller gutter must still adjoin the table's top edge: {two:?}"
+        );
+        assert!(gutters_frame_table(&two), "{two:?}");
+
+        // ...and unstacking shrinks it back: the gutter must not latch at its
+        // tallest (a drop zone sized to `available_size` inside a self-sizing
+        // panel would ratchet the panel open forever).
+        app.set_axis(CategoryId(3), Axis::Rows);
+        assert_eq!(app.col_cats().len(), 1);
+        let back = layout_frame(&mut app);
+        assert!(
+            back.top.height() <= one.top.height() + EDGE_EPS,
+            "the column gutter latched open: {} vs {}",
+            back.top.height(),
+            one.top.height()
+        );
+        assert!(gutters_frame_table(&back), "{back:?}");
+    }
+
+    /// An axis filtered to zero lines still lays out gutters that frame the
+    /// table (the empty-axis fix must not be regressed by the new geometry).
+    #[test]
+    fn gutters_still_frame_the_table_when_an_axis_is_empty() {
+        let mut app = gutter_app();
+        let rows = app.row_cats();
+        hide_all_items(&mut app, rows[0]);
+        assert_eq!(app.grid_dims().0, 0, "the row axis must render zero lines");
+        let g = layout_frame(&mut app);
+        assert!(gutters_frame_table(&g), "{g:?}");
+    }
+
+    /// Dragging a tile from one gutter to another re-pivots through `set_axis`:
+    /// the drop is egui-internal, so drive the same payload/axis pair the drop
+    /// zone produces and assert on the axis state.
+    #[test]
+    fn dropping_a_tile_in_another_gutter_repivots() {
+        let mut app = gutter_app(); // Sales[Time, Product, Region]
+        let (time, product, region) = (CategoryId(1), CategoryId(2), CategoryId(3));
+        assert_eq!(app.row_cats(), vec![time]);
+        assert_eq!(app.col_cats(), vec![product]);
+        assert_eq!(app.page_cats(), vec![region]);
+
+        // Drag `Time` from the row gutter into the column gutter: it leaves rows
+        // and APPENDS to the column stack (the reference's `Travel` landing
+        // under `Hours`).
+        app.set_axis(time, Axis::Columns);
+        assert!(app.row_cats().is_empty(), "Time must leave the row gutter");
+        assert_eq!(
+            app.col_cats(),
+            vec![product, time],
+            "Time must stack UNDER the existing column category"
+        );
+
+        // Drag `Region` out of the well into the row gutter.
+        app.set_axis(region, Axis::Rows);
+        assert_eq!(app.row_cats(), vec![region]);
+        assert!(app.page_cats().is_empty(), "the well must be empty now");
+
+        // And the layout still frames the table after the re-pivot.
+        let g = layout_frame(&mut app);
+        assert!(gutters_frame_table(&g), "{g:?}");
+    }
+
+    /// `set_axis` (what a tile's drop and "Move to" menu call) round-trips a
+    /// category rows -> columns -> pages -> rows.
+    #[test]
+    fn set_axis_cycles_a_category_through_all_three_axes() {
+        let mut app = gutter_app();
+        let time = CategoryId(1);
+        assert_eq!(app.row_cats(), vec![time]);
+        app.set_axis(time, Axis::Columns);
+        assert!(app.col_cats().contains(&time));
+        app.set_axis(time, Axis::Pages);
+        assert!(app.page_cats().contains(&time));
+        app.set_axis(time, Axis::Rows);
+        assert_eq!(app.row_cats(), vec![time]);
+    }
+
+    /// `gutters_frame_table` must REJECT the old horizontal shelf: three zones
+    /// laid out side by side above the grid touch neither edge. Without this the
+    /// invariant could be vacuously true.
+    #[test]
+    fn the_old_horizontal_shelf_fails_the_framing_invariant() {
+        let r = |x0, y0, x1, y1| egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
+        // Shelf: [Columns][Rows][Pages] in one row at y 0..30, grid below at y 40.
+        let shelf = GutterRects {
+            top: r(0.0, 0.0, 120.0, 30.0),
+            left: r(126.0, 0.0, 246.0, 30.0),
+            well: r(252.0, 0.0, 372.0, 30.0),
+            table: r(0.0, 40.0, 800.0, 600.0),
+            hbar: egui::Rect::NOTHING,
+        };
+        assert!(
+            !gutters_frame_table(&shelf),
+            "the shelf must NOT count as framing the table"
+        );
+        // The gutter arrangement passes.
+        let docked = GutterRects {
+            top: r(0.0, 0.0, 800.0, 40.0),
+            left: r(0.0, 40.0, 120.0, 600.0),
+            table: r(120.0, 40.0, 800.0, 600.0),
+            well: r(0.0, 600.0, 800.0, 634.0),
+            hbar: egui::Rect::NOTHING,
+        };
+        assert!(gutters_frame_table(&docked), "{docked:?}");
+    }
+
+    /// Spec §4.4/§4.8: the horizontal scroller runs in the bottom strip,
+    /// right of the row tiles, and a grid wider than its window scrolls
+    /// sideways with it (before, the far columns could not be reached).
+    #[test]
+    fn a_wide_grid_scrolls_sideways_with_the_inline_scroller() {
+        // Quantity[Time, Product] with 40 products: far wider than the window.
+        let mut m = grid_2x2_model();
+        for i in 0..40 {
+            m.add_item(ItemId(100 + i), CategoryId(2), format!("Product{i:02}"));
+        }
+        let mut app = build_app(m);
+        // A window sized for Quantity's grid, clear of the model browser.
+        app.matrices[0] = Matrix::new(&app.model, Some(MeasureId(101)));
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let g = app.focused().gutters.expect("laid out");
+        let win = win_rect(&desk.ctx, &app, 0);
+        assert!(g.hbar.is_positive(), "the scroller has room: {g:?}");
+        assert!(g.well.contains_rect(g.hbar), "inline in the bottom strip");
+        let tile = tile_rect(&desk, &app, CategoryId(1));
+        assert!(tile.right() <= g.hbar.left(), "right of the row tile");
+        assert!(
+            (g.hbar.center().y - tile.center().y).abs() < 6.0,
+            "level with it"
+        );
+        assert!(g.hbar.right() <= win.right(), "inside the window");
+
+        let header_x = |desk: &mut Desk, app: &mut ImprovApp, name: &str| {
+            desk.frame(app, Vec::new())
+                .shapes
+                .iter()
+                .find_map(|c| match &c.shape {
+                    egui::Shape::Text(t) if t.galley.text() == name => Some(t.pos.x),
+                    _ => None,
+                })
+        };
+        let first = header_x(&mut desk, &mut app, "Product00").expect("first column shown");
+        // Three clicks on the right arrow move the columns left by 3 lines.
+        let [_, right, _] = crate::theme::hscroller_rects(g.hbar);
+        for _ in 0..3 {
+            desk.click(&mut app, right.center());
+        }
+        let moved = header_x(&mut desk, &mut app, "Product00").expect("still shown");
+        assert!((first - moved - 60.0).abs() < 1.0, "{first} -> {moved}");
+        // Dragging the knob to the far end brings the last column into view,
+        // inside the window's right edge.
+        // Back to the start (the left arrow), so the knob begins the track.
+        let [left, _, _] = crate::theme::hscroller_rects(g.hbar);
+        for _ in 0..3 {
+            desk.click(&mut app, left.center());
+        }
+        assert_eq!(header_x(&mut desk, &mut app, "Product00"), Some(first));
+        let knob_from = egui::pos2(
+            g.hbar.left() + 2.0 * crate::theme::ARROW + 4.0,
+            g.hbar.center().y,
+        );
+        desk.drag(
+            &mut app,
+            knob_from,
+            egui::pos2(win.right() + 400.0, g.hbar.center().y),
+        );
+        let last = header_x(&mut desk, &mut app, "Product39").expect("last column reachable");
+        assert!(last < win.right(), "{last} vs {win:?}");
+        // The vertical scroller stays at the window's right edge.
+        let g2 = app.focused().gutters.expect("laid out");
+        assert!(g2.table.right() <= win.right() + EDGE_EPS, "{g2:?} {win:?}");
+    }
+
+    // -- STEP 2: the formula list pane
+    // (docs/reviews/2026-09-22-gui-reconstruction-plan.md)
+
+    /// A model with FOUR derived measures, one chained onto another, so the
+    /// formula list has several rows and disabling one has a visible dependent:
+    ///
+    /// * `Revenue   = Price * Quantity`      (id 102)
+    /// * `Tax       = Revenue * Rate`        (id 103, depends on Revenue)
+    /// * `Net       = Revenue - Tax`         (id 104, depends on both)
+    /// * `Doubled   = Quantity + Quantity`   (id 105, independent)
+    fn four_formula_model() -> Model {
+        let mut m = grid_2x2_model();
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        m.add_measure(Measure {
+            id: MeasureId(110),
+            name: Name("Rate".into()),
+            value_type: ValueType::Number,
+            categories: vec![t, p],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        // Declared over the same dimensions as Revenue, with a cell at every
+        // coordinate: this engine aligns a derived*input product on matching
+        // dimensions, it does not broadcast a narrower input across them.
+        for ti in [ItemId(10), ItemId(11)] {
+            for pi in [ItemId(20), ItemId(21)] {
+                m.set_input(
+                    MeasureId(110),
+                    improv_core_model::Coordinate::from_pairs([(t, ti), (p, pi)]),
+                    Value::Number(0.1),
+                );
+            }
+        }
+        let refm = |id| Expr::Ref(id, DimensionSpec::default());
+        for (id, name, expr) in [
+            (
+                103u32,
+                "Tax",
+                Expr::BinaryOp(
+                    BinaryOp::Mul,
+                    Box::new(refm(MeasureId(102))),
+                    Box::new(refm(MeasureId(110))),
+                ),
+            ),
+            (
+                104,
+                "Net",
+                Expr::BinaryOp(
+                    BinaryOp::Sub,
+                    Box::new(refm(MeasureId(102))),
+                    Box::new(refm(MeasureId(103))),
+                ),
+            ),
+            (
+                105,
+                "Doubled",
+                Expr::BinaryOp(
+                    BinaryOp::Add,
+                    Box::new(refm(MeasureId(101))),
+                    Box::new(refm(MeasureId(101))),
+                ),
+            ),
+        ] {
+            m.add_measure(Measure {
+                id: MeasureId(id),
+                name: Name(name.into()),
+                value_type: ValueType::Number,
+                categories: vec![t, p],
+                kind: MeasureKind::Derived(Formula::new(expr)),
+                description: None,
+                format: None,
+            });
+        }
+        m
+    }
+
+    /// **Step 2 acceptance, part 1:** a model with several derived measures
+    /// lists ALL of them, numbered, each with its target measure and formula
+    /// text — the whole model's logic visible at once, which a single-line bar
+    /// for the selected measure cannot show.
+    #[test]
+    fn the_formula_list_shows_every_formula_numbered() {
+        let app = build_app(four_formula_model());
+        let rows = app.formula_rows();
+
+        // Every derived measure, and ONLY derived measures (Price/Quantity/Rate
+        // are inputs: they have no formula, so they have no row).
+        assert_eq!(
+            rows.iter().map(|r| r.target.as_str()).collect::<Vec<_>>(),
+            vec!["Revenue", "Tax", "Net", "Doubled"],
+            "all four formulas, in measure-id order"
+        );
+        assert_eq!(
+            app.model
+                .measures
+                .values()
+                .filter(|m| m.is_derived())
+                .count(),
+            rows.len(),
+            "one row per derived measure, no more"
+        );
+
+        // Each row carries its formula text, and it is the editable spelling.
+        assert_eq!(rows[0].text, "Price * Quantity");
+        assert_eq!(rows[1].text, "Revenue * Rate");
+        assert_eq!(rows[2].text, "Revenue - Tax");
+        assert_eq!(rows[3].text, "Quantity + Quantity");
+        assert!(rows.iter().all(|r| r.error.is_none()), "{rows:?}");
+        assert!(rows.iter().all(|r| r.enabled), "formulas start enabled");
+
+        // The display number is the 1-based row position (the reference's
+        // `1.` `2.` …): inserting a formula renumbers, it is not an identity.
+        let numbered: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| format!("{}. {} = {}", i + 1, r.target, r.text))
+            .collect();
+        assert_eq!(numbered[0], "1. Revenue = Price * Quantity");
+        assert_eq!(numbered[3], "4. Doubled = Quantity + Quantity");
+    }
+
+    /// **Step 2 acceptance, part 2:** clicking a row selects that measure, so
+    /// the grid follows the formula list. Driven through a real headless frame
+    /// (a synthesized click at the row's own screen position), not by calling a
+    /// handler — so a row that renders un-clickable fails here.
+    #[test]
+    fn clicking_a_formula_row_selects_its_measure() {
+        let mut app = build_app(four_formula_model());
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+
+        // Find where row 4 ("Doubled") landed, then click it.
+        let target = MeasureId(105);
+        assert_ne!(app.selected(), Some(target), "not already selected");
+        let clicked = click_formula_row(&mut app, target);
+        assert!(clicked, "row for measure {target:?} was never laid out");
+        assert_eq!(
+            app.selected(),
+            Some(target),
+            "clicking the row must select its measure so the grid follows"
+        );
+        // And the grid really did follow: the pivot state re-homed onto it.
+        app.sync_axis_state();
+        assert_eq!(app.focused().axis_for, Some(target));
+    }
+
+    /// Lay out `app` in real headless frames and click the formula-list row for
+    /// `measure`, at the position the row actually occupied. Returns whether
+    /// such a row was laid out.
+    ///
+    /// Two phases, because egui hit-tests a click against the rect a widget had
+    /// in a PREVIOUS frame: settle the panels first (recording
+    /// `formula_row_rects`), then deliver a press+release at that point. A row
+    /// that renders un-clickable therefore fails this, where calling a handler
+    /// directly would not.
+    fn click_formula_row(app: &mut ImprovApp, measure: MeasureId) -> bool {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let frame = |app: &mut ImprovApp, events: Vec<egui::Event>, time: f64| {
+            let raw = egui::RawInput {
+                time: Some(time),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.test_ui(raw, |ui| {
+                app.sync_axis_state();
+                let ws = app.canvas_panel(ui);
+                let ctx = &ui.ctx().clone();
+                app.model_browser(ctx, ws);
+                app.info_panel(ctx, ws);
+            });
+        };
+
+        // Settle the panels so the pane's rows have their final positions.
+        for i in 0..4 {
+            frame(app, Vec::new(), f64::from(i) / 60.0);
+        }
+        let Some(&(_, rect)) = app.formula_row_rects.iter().find(|(m, _)| *m == measure) else {
+            return false;
+        };
+        let at = rect.center();
+
+        // A real press+release at the row's center.
+        frame(
+            app,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            1.0,
+        );
+        true
+    }
+
+    /// Plan step 4a: the formula list is part of each worksheet window, under
+    /// its grid, not an app-wide bottom panel. With two windows, the rows are
+    /// laid out inside each window in turn (the last one drawn records them).
+    #[test]
+    fn formula_list_lives_in_each_worksheet_window() {
+        let mut app = build_app(four_formula_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let size = egui::vec2(1200.0, 800.0);
+        let check = |app: &ImprovApp, ctx: &egui::Context, mi: usize| {
+            let win = crate::nxwin::stored_rect(ctx, matrix_window_id(app.matrices[mi].uid))
+                .expect("window shown");
+            let table = app.matrices[mi].gutters.expect("laid out").table;
+            assert!(!app.formula_row_rects.is_empty(), "rows laid out");
+            for (m, r) in &app.formula_row_rects {
+                assert!(
+                    win.contains_rect(*r),
+                    "row {m:?} {r:?} outside window {win:?}"
+                );
+                assert!(
+                    r.min.y >= table.max.y,
+                    "row {m:?} {r:?} not below grid {table:?}"
+                );
+            }
+        };
+        for i in 0..4 {
+            let _ = full_frame(&ctx, &mut app, size, f64::from(i) / 60.0);
+        }
+        check(&app, &ctx, 0);
+        let last = app.add_matrix(Some(MeasureId(101)));
+        for i in 4..8 {
+            let _ = full_frame(&ctx, &mut app, size, f64::from(i) / 60.0);
+        }
+        check(&app, &ctx, last);
+    }
+
+    /// **Step 2 acceptance, part 3:** toggling a formula off recomputes
+    /// dependents. Asserted on the SNAPSHOT, which is what the grid draws.
+    ///
+    /// `Tax = Revenue * Rate` and `Net = Revenue - Tax`. Disabling `Tax` must
+    /// make `Tax` compute nothing *and* change `Net`, which is the real test: a
+    /// GUI-only "hide this formula" flag would leave `Net` sitting at its old
+    /// value.
+    ///
+    /// `Net` goes *absent* rather than falling back to `Revenue - 0`, because
+    /// this engine JOINS its operands: a measure with no cells contributes no
+    /// coordinates, so every dependent loses those coordinates too. That is the
+    /// same behavior a dependent of an empty input measure already has —
+    /// disabling a formula makes it indistinguishable from an input nobody has
+    /// filled in, which is the honest reading of "this formula is not running".
+    #[test]
+    fn disabling_a_formula_recomputes_its_dependents() {
+        let mut app = build_app(four_formula_model());
+        let (qkey, _) = q_and_rev_keys();
+
+        // Baseline: Revenue 1000, Tax 100, Net 900.
+        assert_eq!(app.values_for(MeasureId(102)).get(&qkey), Some(&1000.0));
+        assert_eq!(app.values_for(MeasureId(103)).get(&qkey), Some(&100.0));
+        assert_eq!(app.values_for(MeasureId(104)).get(&qkey), Some(&900.0));
+
+        app.set_formula_enabled(MeasureId(103), false)
+            .expect("disable Tax");
+
+        // Tax computes nothing now — it is no longer a dataflow output.
+        assert!(
+            !app.formula_enabled(MeasureId(103)),
+            "the model records Tax as disabled"
+        );
+        assert_eq!(
+            app.values_for(MeasureId(103)).get(&qkey),
+            None,
+            "a disabled formula must compute nothing"
+        );
+        // ...and the DEPENDENT recomputed rather than keeping its stale 900:
+        // Net's operand vanished, so Net vanished with it.
+        assert_eq!(
+            app.values_for(MeasureId(104)).get(&qkey),
+            None,
+            "Net must recompute without Tax, not keep its old 900"
+        );
+        assert!(
+            app.values_for(MeasureId(104)).is_empty(),
+            "no coordinate of Net survives its operand being switched off"
+        );
+        // The untouched formulas are unaffected — only the dependents moved.
+        assert_eq!(app.values_for(MeasureId(102)).get(&qkey), Some(&1000.0));
+        assert_eq!(app.values_for(MeasureId(105)).get(&qkey), Some(&200.0));
+
+        // Re-enabling restores every value exactly — the formula was kept, not
+        // re-derived from text.
+        app.set_formula_enabled(MeasureId(103), true)
+            .expect("re-enable Tax");
+        assert!(app.formula_enabled(MeasureId(103)));
+        assert_eq!(app.values_for(MeasureId(103)).get(&qkey), Some(&100.0));
+        assert_eq!(app.values_for(MeasureId(104)).get(&qkey), Some(&900.0));
+    }
+
+    /// **Step 2 acceptance, part 4:** the disable SURVIVES a save/reload round
+    /// trip through `storage_mentat` — which is why it is a model-level fact and
+    /// not a GUI flag. After reload the formula is still present, still
+    /// disabled, and the reloaded engine still computes dependents without it.
+    #[test]
+    fn a_disabled_formula_survives_a_save_reload_round_trip() {
+        let db = std::env::temp_dir()
+            .join(format!(
+                "improv_gui_disabled_persist_{}_{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(db.clone());
+
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&four_formula_model()))
+            .expect("seed the store");
+        let mut app = ImprovApp::load(&db).expect("load");
+        let (qkey, _) = q_and_rev_keys();
+
+        // Give Tax a real description too, so the round trip must preserve BOTH
+        // the user's text and the disabled bit.
+        Arc::make_mut(&mut app.model)
+            .measures
+            .get_mut(&MeasureId(103))
+            .expect("Tax")
+            .description = Some("rate applied to revenue".into());
+        app.set_formula_enabled(MeasureId(103), false)
+            .expect("disable Tax");
+
+        // Reload from the store: a fresh app, nothing carried in memory.
+        let reloaded = ImprovApp::load(&db).expect("reload");
+        assert!(
+            !reloaded.formula_enabled(MeasureId(103)),
+            "the disabled bit did not survive the round trip"
+        );
+        // The FORMULA itself survived (that is why the marker rides alongside it
+        // rather than replacing it), and so did the user's own description text.
+        let tax = &reloaded.model.measures[&MeasureId(103)];
+        assert!(
+            tax.is_derived(),
+            "a disabled measure stays derived, keeping its formula"
+        );
+        assert_eq!(
+            split_marker(tax.description.as_deref()).1,
+            Some("rate applied to revenue"),
+            "the user's description must survive the toggle"
+        );
+        // The reloaded ENGINE honors it: Tax blank, and Net — which depends on
+        // Tax — recomputed away with it.
+        assert_eq!(reloaded.values_for(MeasureId(103)).get(&qkey), None);
+        assert_eq!(reloaded.values_for(MeasureId(104)).get(&qkey), None);
+        // The list still shows it, unchecked rather than hidden.
+        let rows = reloaded.formula_rows();
+        let tax_row = rows
+            .iter()
+            .find(|r| r.measure == MeasureId(103))
+            .expect("a disabled formula is still listed");
+        assert!(!tax_row.enabled);
+        assert_eq!(tax_row.text, "Revenue * Rate", "its formula is still shown");
+
+        // And re-enabling in the reloaded app restores the original values.
+        let mut reloaded = reloaded;
+        reloaded
+            .set_formula_enabled(MeasureId(103), true)
+            .expect("re-enable");
+        assert_eq!(
+            reloaded.values_for(MeasureId(104)).get(&qkey),
+            Some(&900.0),
+            "re-enabling after a reload must restore the exact formula"
+        );
+    }
+
+    /// **Step 2 acceptance, part 5:** a formula that does not build shows its
+    /// error INLINE on its own row, rather than vanishing or silently listing as
+    /// fine. (A cell-type mismatch: `Revenue * Label` where `Label` is Text.)
+    #[test]
+    fn a_formula_that_fails_to_build_shows_its_error_inline() {
+        let mut model = four_formula_model();
+        model.add_measure(Measure {
+            id: MeasureId(120),
+            name: Name("Label".into()),
+            value_type: ValueType::Text,
+            categories: vec![CategoryId(2)],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        // Broken = Revenue * Label — a type error the compiler rejects.
+        model.add_measure(Measure {
+            id: MeasureId(121),
+            name: Name("Broken".into()),
+            value_type: ValueType::Number,
+            categories: vec![CategoryId(1), CategoryId(2)],
+            kind: MeasureKind::Derived(Formula::new(Expr::BinaryOp(
+                BinaryOp::Mul,
+                Box::new(Expr::Ref(MeasureId(102), DimensionSpec::default())),
+                Box::new(Expr::Ref(MeasureId(120), DimensionSpec::default())),
+            ))),
+            description: None,
+            format: None,
+        });
+        let app = build_app(model);
+        let rows = app.formula_rows();
+
+        // It is LISTED, with its text, and carries an inline error.
+        let broken = rows
+            .iter()
+            .find(|r| r.measure == MeasureId(121))
+            .expect("a broken formula is still listed");
+        assert_eq!(broken.text, "Revenue * Label");
+        let err = broken
+            .error
+            .as_deref()
+            .expect("a formula that does not build must show an error inline");
+        assert!(
+            err.to_lowercase().contains("type"),
+            "the inline error must say what is wrong, got {err:?}"
+        );
+        // The SOUND formulas do not borrow its error.
+        for r in rows.iter().filter(|r| r.measure != MeasureId(121)) {
+            assert_eq!(r.error, None, "{r:?} must not report an error");
+        }
+        // Its status indicator is Improv's error cross; the others check.
+        let mut app = app;
+        let mut desk = Desk::new();
+        let labels: Vec<String> = accesskit_nodes(&mut app, &mut desk)
+            .iter()
+            .filter_map(|(_, n)| n.label().map(str::to_owned))
+            .filter(|l| l.starts_with("Formula "))
+            .collect();
+        assert!(
+            labels.contains(&"Formula Broken has an error".to_owned()),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"Formula Revenue checks".to_owned()),
+            "{labels:?}"
+        );
+    }
+
+    /// A formula with no editable spelling says so inline, because the editor
+    /// above shows that row read-only — the list must not imply it is editable.
+    #[test]
+    fn a_formula_with_no_editable_spelling_says_so_inline() {
+        let mut model = four_formula_model();
+        // An empty measure name is the one thing `ident` cannot spell (`''` is a
+        // parse error), so Revenue's formula loses its DSL and CNL spellings.
+        model.measures.get_mut(&MeasureId(100)).unwrap().name = Name(String::new());
+        let app = build_app(model);
+        let rows = app.formula_rows();
+        let rev = rows
+            .iter()
+            .find(|r| r.measure == MeasureId(102))
+            .expect("still listed");
+        assert_eq!(
+            rev.error.as_deref(),
+            Some("no editable spelling (shown as description)"),
+            "the list must admit this row is not editable"
+        );
+        assert!(!rev.text.is_empty(), "it still shows a description");
+    }
+
+    /// The disabled marker is a *reserved* description line, so it must not be
+    /// confused with a user description that merely looks like it, and toggling
+    /// must be an exact round trip in both directions.
+    #[test]
+    fn the_disabled_marker_never_eats_a_user_description() {
+        // A description that starts with the marker's characters but is not it.
+        let lookalike = format!("{DISABLED_MARKER}ish notes");
+        assert_eq!(
+            split_marker(Some(lookalike.as_str())),
+            (false, Some(lookalike.as_str()))
+        );
+        // The marker alone, and the marker with text after it.
+        assert_eq!(split_marker(Some(DISABLED_MARKER)), (true, None));
+        let with_text = format!("{DISABLED_MARKER}{MARKER_SEP}keep me");
+        assert_eq!(split_marker(Some(&with_text)), (true, Some("keep me")));
+        // No description at all.
+        assert_eq!(split_marker(None), (false, None));
+        // join_marker inverts split_marker for each of those.
+        for (disabled, user) in [
+            (false, None),
+            (false, Some("plain")),
+            (true, None),
+            (true, Some("keep me")),
+        ] {
+            let joined = join_marker(disabled, user);
+            assert_eq!(
+                split_marker(joined.as_deref()),
+                (disabled, user),
+                "join/split must round-trip ({disabled}, {user:?})"
+            );
+        }
+
+        // End to end: a measure whose description is the lookalike is NOT
+        // treated as disabled, and toggling it keeps that text.
+        let mut model = four_formula_model();
+        model.measures.get_mut(&MeasureId(103)).unwrap().description = Some(lookalike.clone());
+        let mut app = build_app(model);
+        assert!(app.formula_enabled(MeasureId(103)), "not actually disabled");
+        app.set_formula_enabled(MeasureId(103), false).expect("off");
+        app.set_formula_enabled(MeasureId(103), true).expect("on");
+        assert_eq!(
+            app.model.measures[&MeasureId(103)].description.as_deref(),
+            Some(&*lookalike),
+            "a disable/enable cycle must restore the description exactly"
+        );
+    }
+
+    /// Toggling a formula is undoable on the same terms as a formula edit: it
+    /// goes through `publish`, so it is an undo point, and a failed save
+    /// keeps it, unsaved (H3).
+    #[test]
+    fn toggling_a_formula_is_undoable_and_atomic() {
+        let mut app = build_app(four_formula_model());
+        let (qkey, _) = q_and_rev_keys();
+        app.set_formula_enabled(MeasureId(103), false).expect("off");
+        assert!(app.can_undo(), "a toggle must be an undo point");
+        app.undo().expect("undo the toggle");
+        assert!(app.formula_enabled(MeasureId(103)), "undo re-enabled it");
+        assert_eq!(
+            app.values_for(MeasureId(104)).get(&qkey),
+            Some(&900.0),
+            "undo restored the dependent's value too"
+        );
+        // An unwritable store fails the toggle and changes nothing.
+        let mut app = build_app(four_formula_model());
+        app.db = std::env::temp_dir()
+            .join(format!("improv_gui_no_dir_{}", std::process::id()))
+            .join("model.db")
+            .to_string_lossy()
+            .into_owned();
+        let err = app
+            .set_formula_enabled(MeasureId(103), false)
+            .expect_err("an unwritable store must fail the toggle's save");
+        assert!(err.starts_with("save failed:"), "got {err:?}");
+        assert!(!app.formula_enabled(MeasureId(103)), "kept, unsaved");
+        assert!(app.dirty && app.unsaved.structure);
+        assert!(app.can_undo());
+    }
+
+    /// Toggling is a no-op (not an error) where there is no formula to toggle,
+    /// and disabling EVERY formula is a valid model that simply computes
+    /// nothing — no engine, no panic, inputs still readable.
+    #[test]
+    fn toggling_without_a_formula_is_a_no_op_and_all_off_is_valid() {
+        let mut app = build_app(four_formula_model());
+        // An input measure and an unknown id: both no-ops.
+        app.set_formula_enabled(MeasureId(101), false)
+            .expect("input measure");
+        app.set_formula_enabled(MeasureId(9999), false)
+            .expect("unknown id");
+        assert!(!app.can_undo(), "a no-op must not create an undo point");
+        assert!(app.formula_enabled(MeasureId(101)));
+
+        for id in [102u32, 103, 104, 105] {
+            app.set_formula_enabled(MeasureId(id), false)
+                .unwrap_or_else(|e| panic!("disable {id}: {e}"));
+        }
+        assert!(app.engine.is_none(), "nothing left to compute");
+        let (qkey, _) = q_and_rev_keys();
+        assert_eq!(app.values_for(MeasureId(102)).get(&qkey), None);
+        // Inputs still read fine, and every row is still listed.
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("100"));
+        assert_eq!(app.formula_rows().len(), 4);
+        assert!(app.formula_rows().iter().all(|r| !r.enabled));
+    }
+
+    /// The pane renders in a real frame without panicking, at a realistic size
+    /// and squeezed flat — the same headless-frame discipline Step 1 established.
+    #[test]
+    fn the_formula_pane_lays_out_at_every_window_size() {
+        for (w, h) in [
+            (1200.0, 800.0),
+            (800.0, 400.0),
+            (300.0, 200.0),
+            (60.0, 40.0),
+        ] {
+            let mut app = build_app(four_formula_model());
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            for i in 0..4 {
+                let raw = egui::RawInput {
+                    time: Some(f64::from(i) / 60.0),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, h),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.test_ui(raw, |ui| {
+                    app.sync_axis_state();
+                    app.canvas_panel(ui);
+                });
+            }
+            // Still listing every formula after the frames.
+            assert_eq!(app.formula_rows().len(), 4, "{w}x{h}");
+        }
+    }
+    // -- STEP 3: N matrices on a canvas
+    // (docs/reviews/2026-09-22-gui-reconstruction-plan.md)
+
+    /// A canvas with TWO matrices over `grid_2x2_model()`: matrix 0 shows
+    /// `Quantity` (an input), matrix 1 shows `Revenue = Price * Quantity` (its
+    /// dependent). The shape the Quantrix reference has — several matrices side
+    /// by side, each its own pivot — and the shape that makes "an edit in one
+    /// recomputes the other" a real assertion.
+    fn two_matrix_app() -> ImprovApp {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity on matrix 0
+        let i = app.add_matrix(Some(MeasureId(102))); // Revenue on matrix 1
+        assert_eq!(i, 1);
+        app.set_focus(0);
+        app.sync_axis_state();
+        app
+    }
+
+    /// **Step 3 acceptance, part 1:** two matrices exist on one canvas at once,
+    /// and each is INDEPENDENTLY pivotable — pivoting one leaves the other's axis
+    /// state exactly as it was.
+    ///
+    /// Asserted on per-matrix axis state, because that is what "independently
+    /// pivotable" means: before the refactor there was one `axis_order` for the
+    /// whole app, so this could not even be expressed.
+    #[test]
+    fn two_matrices_are_independently_pivotable() {
+        let mut app = two_matrix_app();
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        assert_eq!(app.matrix_count(), 2);
+
+        // Both start on their measure's natural axes: Time on rows, Product on
+        // columns.
+        for mi in 0..2 {
+            let m = &app.matrices[mi];
+            assert_eq!(m.row_cats(&app.model), vec![t], "matrix {mi} rows");
+            assert_eq!(m.col_cats(&app.model), vec![p], "matrix {mi} cols");
+        }
+        assert_eq!(app.matrices[0].measure, Some(MeasureId(101)));
+        assert_eq!(app.matrices[1].measure, Some(MeasureId(102)));
+
+        // Pivot matrix 1 only (the focused matrix is 0, so this must go through
+        // the matrix itself — exactly as a click in matrix 1 does).
+        let model = (*app.model).clone();
+        app.matrices[1].pivot_rotate(&model);
+
+        assert_eq!(
+            app.matrices[1].row_cats(&app.model),
+            vec![p],
+            "matrix 1 pivoted: Product on rows"
+        );
+        assert_eq!(app.matrices[1].col_cats(&app.model), vec![t]);
+        assert_eq!(
+            app.matrices[0].row_cats(&app.model),
+            vec![t],
+            "matrix 0 must be untouched by matrix 1's pivot"
+        );
+        assert_eq!(app.matrices[0].col_cats(&app.model), vec![p]);
+
+        // And stacking on one matrix does not stack on the other.
+        app.matrices[0].set_axis(&model, p, Axis::Rows);
+        assert_eq!(app.matrices[0].row_cats(&app.model), vec![t, p]);
+        assert!(app.matrices[0].col_cats(&app.model).is_empty());
+        assert_eq!(
+            app.matrices[1].row_cats(&app.model),
+            vec![p],
+            "matrix 1 still has its own layout"
+        );
+
+        // Filters are per matrix too: hiding an item in one does not hide it in
+        // the other.
+        app.matrices[0].toggle_filter_item(&model, t, ItemId(11));
+        assert_eq!(app.matrices[0].sorted_items(&app.model, t).len(), 1);
+        assert_eq!(
+            app.matrices[1].sorted_items(&app.model, t).len(),
+            2,
+            "a filter is presentation on ONE matrix, not the model"
+        );
+        // ...and so are cursors.
+        app.matrices[1].move_cursor(&model, 5, 5);
+        assert_eq!(
+            (app.matrices[0].cursor_row, app.matrices[0].cursor_col),
+            (0, 0),
+            "matrix 0's cursor must not follow matrix 1's"
+        );
+
+        // Finally: the two layouts are not merely *stored* separately, they are
+        // RENDERED separately. A real headless frame, then each matrix's own
+        // record of what its grid was drawn with (see `Matrix::rendered_axes`).
+        // Without this a renderer that ignored its matrix index and drew the
+        // focused matrix's pivot twice would pass everything above.
+        let _ = layout_all(&mut app);
+        let drew = |app: &ImprovApp, mi: usize| {
+            app.matrices[mi]
+                .rendered_axes
+                .clone()
+                .unwrap_or_else(|| panic!("matrix {mi} never rendered"))
+        };
+        assert_eq!(
+            drew(&app, 0),
+            (vec![t, p], vec![]),
+            "matrix 0 must be drawn with ITS stacked rows"
+        );
+        assert_eq!(
+            drew(&app, 1),
+            (vec![p], vec![t]),
+            "matrix 1 must be drawn with ITS pivot, not matrix 0's"
+        );
+        assert_ne!(
+            drew(&app, 0),
+            drew(&app, 1),
+            "two matrices with different pivots must render differently"
+        );
+    }
+
+    /// **Step 3 acceptance, part 2:** an edit in ONE matrix recomputes a
+    /// dependent measure displayed in ANOTHER. The canvas is a view over one
+    /// shared engine, so `Quantity` edited on matrix 0 must change what matrix 1
+    /// (`Revenue = Price * Quantity`) draws at that coordinate.
+    ///
+    /// Asserted through `cell_text` at matrix 1's own cursor key — the string the
+    /// second matrix actually renders — not through the snapshot, so a canvas
+    /// that rendered stale values from a per-matrix cache would fail here.
+    #[test]
+    fn an_edit_in_one_matrix_recomputes_a_dependent_in_another() {
+        let mut app = two_matrix_app();
+        // Both matrices sit on [2025, WidgetA] (cursor 0,0). Quantity = 100,
+        // Price = 10, so Revenue = 1000.
+        let qkey = app.matrices[0]
+            .cursor_key(&app.model)
+            .expect("matrix 0 addresses a cell");
+        let rkey = app.matrices[1]
+            .cursor_key(&app.model)
+            .expect("matrix 1 addresses a cell");
+        assert_eq!(qkey, rkey, "both matrices are on the same coordinate");
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("100"));
+        assert_eq!(
+            app.cell_text(MeasureId(102), &rkey).as_deref(),
+            Some("1000")
+        );
+
+        // Edit Quantity through matrix 0's cell editor path.
+        app.commit_cell_text(MeasureId(101), qkey.clone(), "250")
+            .expect("commit the edit");
+
+        assert_eq!(
+            app.cell_text(MeasureId(101), &qkey).as_deref(),
+            Some("250"),
+            "matrix 0 shows the edit"
+        );
+        assert_eq!(
+            app.cell_text(MeasureId(102), &rkey).as_deref(),
+            Some("2500"),
+            "matrix 1's dependent measure must recompute: 10 * 250"
+        );
+        // The other coordinates of Revenue are untouched (an incremental
+        // recompute, not a wholesale reset).
+        let mut other: CoordKey = improv_engine::smallvec::smallvec![(1u32, 11u32), (2, 20)];
+        other.sort();
+        assert_eq!(
+            app.cell_text(MeasureId(102), &other).as_deref(),
+            Some("1200"),
+            "an unrelated coordinate must keep its value"
+        );
+    }
+
+    /// **Step 3 acceptance, part 3a:** saving and reloading round-trips the whole
+    /// multi-matrix canvas — every matrix's measure, pivot, filters, page pins
+    /// and geometry — through `storage_mentat` and back.
+    #[test]
+    fn save_reload_round_trips_a_multi_matrix_canvas() {
+        let db = temp_db("multi_matrix");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&sales_3d_model()))
+            .expect("seed the store");
+
+        let mut app = ImprovApp::load(&db).expect("load");
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        // Matrix 0: pivoted, its page dimension advanced one item.
+        let model = (*app.model).clone();
+        app.matrices[0].pivot_rotate(&model);
+        app.matrices[0].set_page(&model, 0, 1);
+        app.matrices[0].rect = CanvasRect {
+            x: 12.0,
+            y: 34.0,
+            w: 500.0,
+            h: 300.0,
+        };
+        // Matrix 1: the same measure, with its column category STACKED onto its
+        // row axis instead, placed elsewhere.
+        //
+        // Which category that is, is read from the matrix rather than hardcoded:
+        // `load_measure_categories` queries datalog, which does not promise an
+        // order, so a measure's declared category order after a reload is not
+        // fixed. Naming a category id here made this test pass or fail depending
+        // on which one happened to land on the column axis.
+        app.add_matrix(Some(MeasureId(200)));
+        app.sync_axis_state();
+        let stack = app.matrices[1].col_cats(&app.model)[0];
+        app.matrices[1].set_axis(&model, stack, Axis::Rows);
+        assert_eq!(app.matrices[1].n_rows, 2, "the fixture must really stack");
+        app.matrices[1].rect = CanvasRect {
+            x: 600.0,
+            y: 40.0,
+            w: 420.0,
+            h: 260.0,
+        };
+        let want: Vec<MatrixPlacement> = app
+            .matrices
+            .iter()
+            .map(|m| m.to_placement(&app.model).expect("placement"))
+            .collect();
+
+        let id = app.save_view("Canvas A").expect("saved");
+        // The view holds BOTH matrices: the primary flat fields plus one extra.
+        let stored = app.model.views.get(&id).expect("view stored");
+        assert_eq!(
+            stored.placements.len(),
+            1,
+            "one EXTRA matrix beyond primary"
+        );
+        assert_eq!(stored.matrices(), want, "the view describes both matrices");
+
+        // Reload from the store and apply the view: the canvas comes back.
+        let mut reloaded = ImprovApp::load(&db).expect("reload");
+        // H1-34: it opens on its first saved view, this canvas.
+        assert_eq!(reloaded.current_view, Some(id));
+        assert_eq!(reloaded.matrix_count(), 2, "a reload opens its first view");
+        assert!(reloaded.status.is_empty(), "opening is not news");
+        let v = reloaded.model.views[&id].clone();
+        reloaded.apply_view(&v);
+        reloaded.sync_axis_state(); // must not clobber the applied layout
+
+        assert_eq!(reloaded.matrix_count(), 2, "both matrices restored");
+        let got: Vec<MatrixPlacement> = reloaded
+            .matrices
+            .iter()
+            .map(|m| m.to_placement(&reloaded.model).expect("placement"))
+            .collect();
+        assert_eq!(got, want, "every matrix round-tripped exactly");
+
+        // Spot-check the parts that are easy to lose, against what the live
+        // canvas had rather than against absolute category ids: the store does
+        // not promise to preserve a measure's DECLARED category order, so
+        // "Time ends up on rows" is not a property of this round trip. That each
+        // matrix comes back with the pivot, page pin and geometry IT had is.
+        for (mi, w) in want.iter().enumerate() {
+            let got = &reloaded.matrices[mi];
+            assert_eq!(
+                got.row_cats(&reloaded.model),
+                w.axis_order[..w.n_rows].to_vec(),
+                "matrix {mi}'s row stack"
+            );
+            assert_eq!(
+                got.col_cats(&reloaded.model),
+                w.axis_order[w.n_rows..w.n_rows + w.n_cols].to_vec(),
+                "matrix {mi}'s column stack"
+            );
+            assert_eq!(
+                got.pinned_pages(&reloaded.model),
+                w.page_items,
+                "matrix {mi}'s page pin"
+            );
+        }
+        // The two matrices really do differ, so the loop above is not comparing
+        // one layout with itself: matrix 1 has two categories stacked on rows.
+        assert_eq!(reloaded.matrices[0].n_rows, 1);
+        assert_eq!(reloaded.matrices[1].n_rows, 2);
+        assert!(
+            reloaded.matrices[1]
+                .row_cats(&reloaded.model)
+                .contains(&stack),
+            "matrix 1's stacked category came back on its row axis"
+        );
+        assert_eq!(reloaded.matrices[0].rect.x, 12.0, "geometry per matrix");
+        assert_eq!(reloaded.matrices[1].rect.x, 600.0);
+    }
+
+    /// **Step 3 acceptance, part 3b:** a LEGACY single-matrix view — one written
+    /// before canvases, with no `placements` and no geometry — still loads
+    /// correctly, and loads as exactly one matrix with its saved pivot.
+    ///
+    /// The view here is built the pre-canvas way (flat fields only, `placements`
+    /// empty, `rect` defaulted), which is what `serde` produces for an old stored
+    /// blob; `storage_mentat` has its own test that such a blob deserializes, and
+    /// this is the GUI honoring it.
+    #[test]
+    fn a_legacy_single_matrix_view_still_loads() {
+        let (time, product) = (CategoryId(1), CategoryId(2));
+        // Exactly the shape a pre-canvas save produced.
+        let legacy = View {
+            id: ViewId(7),
+            name: Name("Legacy".into()),
+            measure: MeasureId(101),
+            axis_order: vec![product, time],
+            n_rows: 1,
+            n_cols: 1,
+            page_items: vec![],
+            filters: vec![Filter {
+                category: product,
+                items: vec![ItemId(20)],
+            }],
+            rect: CanvasRect::default(),
+            placements: vec![],
+        };
+        assert!(
+            legacy.placements.is_empty(),
+            "the fixture must be a pre-canvas view, or it proves nothing"
+        );
+
+        // Apply it to a canvas that currently has TWO matrices: a one-matrix view
+        // must reduce the canvas to one, not leave a stray matrix behind.
+        let mut app = two_matrix_app();
+        assert_eq!(app.matrix_count(), 2);
+        app.apply_view(&legacy);
+        app.sync_axis_state();
+
+        assert_eq!(
+            app.matrix_count(),
+            1,
+            "a legacy view is a ONE-matrix canvas"
+        );
+        let m = &app.matrices[0];
+        assert_eq!(m.measure, Some(MeasureId(101)));
+        assert_eq!(
+            m.row_cats(&app.model),
+            vec![product],
+            "saved pivot restored"
+        );
+        assert_eq!(m.col_cats(&app.model), vec![time]);
+        assert_eq!(m.filters, legacy.filters, "saved filter restored");
+        // H1-14: no geometry saved -> right of the menu, so the menu does not
+        // cover its row labels, and sized to its grid as a fresh window is
+        // (one filtered row by two columns: the minimum size).
+        assert_eq!(
+            m.rect,
+            CanvasRect {
+                x: MENU_CLEAR,
+                y: 0.0,
+                w: 360.0,
+                h: 330.0,
+            },
+            "no geometry saved -> a fresh window's place and size"
+        );
+        // The filter really is in effect on the restored matrix.
+        assert_eq!(
+            m.sorted_items(&app.model, product)
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![ItemId(20)]
+        );
+        // And re-saving it yields the same one-matrix shape (no phantom extras).
+        let again = app.build_view(ViewId(8), "again").expect("view");
+        assert!(
+            again.placements.is_empty(),
+            "a one-matrix canvas must still save as a one-matrix view"
+        );
+        assert_eq!(again.measure, MeasureId(101));
+    }
+
+    /// A view whose measure is gone is refused and leaves the canvas alone; a
+    /// view where only SOME matrices' measures are gone loads the rest and says
+    /// so, rather than showing a blank matrix.
+    #[test]
+    fn a_view_with_a_missing_measure_is_handled_not_shown_blank() {
+        let mut app = two_matrix_app();
+        let two = app.build_view(ViewId(1), "two").expect("view");
+        // Drop the measure the EXTRA matrix shows.
+        Arc::make_mut(&mut app.model)
+            .measures
+            .remove(&MeasureId(102));
+        app.apply_view(&two);
+        assert_eq!(app.matrix_count(), 1, "the dead matrix was dropped");
+        assert_eq!(app.matrices[0].measure, Some(MeasureId(101)));
+        assert!(app.status.contains("skipped"), "got {:?}", app.status);
+
+        // Now drop the primary one too: nothing is applicable, so nothing moves.
+        let before = app.matrices.clone();
+        Arc::make_mut(&mut app.model)
+            .measures
+            .remove(&MeasureId(101));
+        app.apply_view(&two);
+        assert_eq!(app.matrix_count(), before.len());
+        assert_eq!(app.status, "view's measure no longer exists");
+    }
+
+    /// **Step 3 acceptance, part 4:** only the FOCUSED matrix consumes grid
+    /// shortcuts. An arrow key must move one cursor, not every cursor on the
+    /// canvas — driven through `handle_grid_keys` in a real frame, per matrix
+    /// index, which is how the canvas calls it.
+    #[test]
+    fn only_the_focused_matrix_consumes_grid_shortcuts() {
+        let mut app = two_matrix_app();
+        app.set_focus(0);
+        assert_eq!(app.focus_index(), 0);
+
+        use egui::Key;
+        // Deliver the keys AT matrix 0 (the focused one): its cursor moves.
+        frame_with_keys_for(&mut app, 0, &[Key::ArrowDown, Key::ArrowRight], None);
+        assert_eq!(
+            (app.matrices[0].cursor_row, app.matrices[0].cursor_col),
+            (1, 1),
+            "the focused matrix must take the keystroke"
+        );
+        assert_eq!(
+            (app.matrices[1].cursor_row, app.matrices[1].cursor_col),
+            (0, 0),
+            "the unfocused matrix must not move"
+        );
+
+        // Deliver the SAME keys at matrix 1 while matrix 0 still has the focus:
+        // nothing happens at all (the gate is focus, not which Ui rendered).
+        //
+        // Matrix 0's cursor is put back to the top-left first, so this also
+        // catches the subtler bug: a handler that ignored `mi` and simply drove
+        // "the focused matrix" would move matrix 0 from (0,0) here. (Asserting
+        // against (1,1) could not see that — the 2x2 grid clamps there.)
+        app.matrices[0].cursor_row = 0;
+        app.matrices[0].cursor_col = 0;
+        frame_with_keys_for(&mut app, 1, &[Key::ArrowDown, Key::ArrowRight], None);
+        assert_eq!(
+            (app.matrices[1].cursor_row, app.matrices[1].cursor_col),
+            (0, 0),
+            "an unfocused matrix must ignore keys aimed at it"
+        );
+        assert_eq!(
+            (app.matrices[0].cursor_row, app.matrices[0].cursor_col),
+            (0, 0),
+            "...and must not forward them to the focused matrix either"
+        );
+        // Put it back where the first delivery left it for the rest of the test.
+        app.matrices[0].cursor_row = 1;
+        app.matrices[0].cursor_col = 1;
+
+        // Move the focus: now matrix 1 takes them, and matrix 0 stops.
+        app.set_focus(1);
+        frame_with_keys_for(&mut app, 1, &[Key::ArrowDown], None);
+        assert_eq!(
+            (app.matrices[1].cursor_row, app.matrices[1].cursor_col),
+            (1, 0),
+            "the newly focused matrix takes the keystroke"
+        );
+        assert_eq!(
+            (app.matrices[0].cursor_row, app.matrices[0].cursor_col),
+            (1, 1),
+            "the previously focused matrix froze where it was"
+        );
+
+        // Enter opens the cell editor on the focused matrix ONLY. Matrix 1 shows
+        // derived Revenue, so focus matrix 0 (input Quantity) for this.
+        app.set_focus(0);
+        // Enter aimed at the UNFOCUSED matrix opens nothing anywhere.
+        frame_with_keys_for(&mut app, 1, &[Key::Enter], None);
+        assert!(
+            app.matrices[0].editing.is_none() && app.matrices[1].editing.is_none(),
+            "Enter aimed at an unfocused matrix must open no editor at all"
+        );
+        // Aimed at the focused one it opens that one's editor, and only that one's.
+        frame_with_keys_for(&mut app, 0, &[Key::Enter], None);
+        assert!(
+            app.matrices[0].editing.is_some(),
+            "Enter must open the focused matrix's editor"
+        );
+        assert!(
+            app.matrices[1].editing.is_none(),
+            "...and no other matrix's"
+        );
+    }
+
+    /// **Step 3 acceptance, part 5:** each matrix's margin gutters frame ITS OWN
+    /// table — Step 1's invariant, now per matrix, asserted on the rects a real
+    /// headless frame recorded.
+    ///
+    /// Two matrices means two independent framed regions: this fails if the
+    /// canvas renders one set of gutters, or if the second matrix's gutters land
+    /// on the first matrix's table.
+    #[test]
+    fn every_matrix_on_the_canvas_frames_its_own_table() {
+        let mut app = two_matrix_app();
+        // Place them far apart so overlapping rects cannot make the assertion
+        // accidentally true.
+        app.matrices[0].rect = CanvasRect {
+            x: 0.0,
+            y: 0.0,
+            w: 460.0,
+            h: 300.0,
+        };
+        app.matrices[1].rect = CanvasRect {
+            x: 0.0,
+            y: 340.0,
+            w: 460.0,
+            h: 300.0,
+        };
+        let all = layout_all(&mut app);
+        assert_eq!(all.len(), 2, "one gutter set per matrix");
+
+        for (i, g) in all.iter().enumerate() {
+            assert!(
+                gutters_have_room(g),
+                "matrix {i} must have room at this size: {g:?}"
+            );
+            assert!(
+                gutters_frame_table(g),
+                "matrix {i}'s gutters must frame ITS table: {g:?}"
+            );
+            // Step 1's two headline adjacencies, spelled out per matrix.
+            assert!(
+                (g.left.max.x - g.table.min.x).abs() <= EDGE_EPS,
+                "matrix {i}: row gutter must adjoin its table's left edge: {g:?}"
+            );
+            assert!(
+                (g.top.max.y - g.table.min.y).abs() <= EDGE_EPS,
+                "matrix {i}: column gutter must adjoin its table's top edge: {g:?}"
+            );
+        }
+        // The two framed regions are genuinely distinct: matrix 1's table is
+        // below matrix 0's, not the same rect reported twice.
+        assert!(
+            all[1].table.min.y > all[0].table.min.y + 100.0,
+            "the second matrix must frame a DIFFERENT table: {all:?}"
+        );
+        assert_ne!(all[0].top, all[1].top, "each matrix has its own gutters");
+    }
+
+    /// The workspace must not creep either: with N worksheet windows, the
+    /// geometry has to settle and stay put frame after frame (Step 1's
+    /// `gutters_do_not_creep_across_frames_or_repivots` discipline applied to
+    /// the windows; a single-frame assertion cannot see a ratchet).
+    #[test]
+    fn the_canvas_does_not_creep_across_frames() {
+        let mut app = two_matrix_app();
+        let (ctx, mut pass) = layout_harness();
+        // Settle (a panel reads its extent from the previous frame), then assert
+        // the settled geometry is genuinely stationary.
+        let settled = settle(&ctx, &mut app, &mut pass);
+        for i in 0..10 {
+            let now = pass(&ctx, &mut app);
+            assert_eq!(now, settled, "the canvas drifted on frame {i}");
+        }
+        // Every matrix's geometry is stationary, not just the focused one's.
+        let first: Vec<GutterRects> = app.matrices.iter().filter_map(|m| m.gutters).collect();
+        assert_eq!(first.len(), 2);
+        for _ in 0..5 {
+            let _ = pass(&ctx, &mut app);
+        }
+        let again: Vec<GutterRects> = app.matrices.iter().filter_map(|m| m.gutters).collect();
+        assert_eq!(first, again, "some matrix's geometry drifted");
+    }
+
+    /// The canvas lays out at every window size without panicking, and the
+    /// per-frame framing `debug_assert!` inside `gutter_frame` runs on every
+    /// matrix at every size (the Step 1 discipline, extended to N matrices).
+    #[test]
+    fn the_canvas_lays_out_at_every_window_size() {
+        for (w, h) in [
+            (1400.0, 900.0),
+            (1000.0, 700.0),
+            (600.0, 400.0),
+            (200.0, 150.0),
+            (40.0, 30.0),
+        ] {
+            let mut app = two_matrix_app();
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            for i in 0..6 {
+                let raw = egui::RawInput {
+                    time: Some(f64::from(i) / 60.0),
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(w, h),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.test_ui(raw, |ui| {
+                    app.sync_axis_state();
+                    app.status_bar(ui);
+                    let ws = app.canvas_panel(ui);
+                    app.menu_bar(&ui.ctx().clone(), ws);
+                });
+            }
+            assert_eq!(app.matrix_count(), 2, "{w}x{h}: both matrices survive");
+        }
+    }
+
+    /// Adding and removing matrices is canvas layout, never a model change:
+    /// nothing becomes an undo point, and the last matrix cannot be removed.
+    ///
+    /// **The undo decision** (recorded here because a test is the only place it
+    /// cannot rot): undo/redo snapshots `Model`, and canvas layout lives in the
+    /// `View`, not the `Model` — so placing, moving, resizing or removing a
+    /// matrix is deliberately NOT undoable. Saving the canvas as a view IS a
+    /// model change and IS undoable, which is what makes a layout recoverable:
+    /// save the canvas, and Ctrl+Z reaches it like any other model edit.
+    #[test]
+    fn canvas_layout_is_not_an_undo_point_but_saving_it_is() {
+        let mut app = build_app(grid_2x2_model());
+        assert!(!app.can_undo());
+
+        app.add_matrix(Some(MeasureId(101)));
+        assert_eq!(app.matrix_count(), 2);
+        assert!(
+            !app.can_undo(),
+            "placing a matrix is layout, not a model change"
+        );
+
+        // Moving and resizing likewise.
+        app.matrices[1].rect.x += 40.0;
+        app.matrices[1].rect.w += 60.0;
+        assert!(!app.can_undo());
+
+        assert!(app.remove_matrix(1));
+        assert_eq!(app.matrix_count(), 1);
+        assert!(!app.can_undo(), "removing a matrix is layout too");
+
+        // The last matrix is never removed: there would be nowhere to show a
+        // measure, and `focused()` must always have a matrix to return.
+        assert!(!app.remove_matrix(0), "the last matrix must stay");
+        assert_eq!(app.matrix_count(), 1);
+        assert!(!app.remove_matrix(9), "an out-of-range index is a no-op");
+
+        // Saving the canvas as a view IS a model change, so it IS undoable —
+        // which is how a layout becomes recoverable.
+        app.add_matrix(Some(MeasureId(102)));
+        let id = app.save_view("Canvas").expect("saved");
+        assert!(app.can_undo(), "saving a view must be an undo point");
+        app.undo().expect("undo the save");
+        assert!(
+            !app.model.views.contains_key(&id),
+            "undo removed the saved view"
+        );
+        assert_eq!(
+            app.matrix_count(),
+            2,
+            "undoing the SAVE does not tear down the canvas it described"
+        );
+    }
+
+    // -- NeXTSTEP spec step 3: worksheet windows on a workspace
+
+    /// Matrix `mi`'s window id.
+    fn win_id(app: &ImprovApp, mi: usize) -> egui::Id {
+        matrix_window_id(app.matrices[mi].uid)
+    }
+
+    /// Matrix `mi`'s window rect, as nxwin stores it.
+    fn win_rect(ctx: &egui::Context, app: &ImprovApp, mi: usize) -> egui::Rect {
+        crate::nxwin::stored_rect(ctx, win_id(app, mi))
+            .unwrap_or_else(|| panic!("window {mi} was never shown"))
+    }
+
+    fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Whole-app frames on one context at 1200x800, `events` per frame.
+    struct Desk {
+        ctx: egui::Context,
+        time: f64,
+    }
+
+    impl Desk {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            Desk { ctx, time: 0.0 }
+        }
+
+        fn frame(&mut self, app: &mut ImprovApp, events: Vec<egui::Event>) -> egui::FullOutput {
+            self.time += 1.0 / 60.0;
+            let size = egui::vec2(1200.0, 800.0);
+            full_frame_with(&self.ctx, app, size, self.time, events, |_| ())
+        }
+
+        fn settle(&mut self, app: &mut ImprovApp) {
+            for _ in 0..6 {
+                let _ = self.frame(app, Vec::new());
+            }
+        }
+
+        fn click(&mut self, app: &mut ImprovApp, at: egui::Pos2) {
+            let _ = self.frame(
+                app,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    press(at, true),
+                    press(at, false),
+                ],
+            );
+            let _ = self.frame(app, Vec::new());
+        }
+
+        /// Press at `from`, move to `to` in steps, release, settle.
+        fn drag(&mut self, app: &mut ImprovApp, from: egui::Pos2, to: egui::Pos2) {
+            let _ = self.frame(app, vec![egui::Event::PointerMoved(from)]);
+            let _ = self.frame(app, vec![press(from, true)]);
+            for t in [0.25, 0.5, 0.75, 1.0] {
+                let _ = self.frame(app, vec![egui::Event::PointerMoved(from.lerp(to, t))]);
+            }
+            let _ = self.frame(app, vec![press(to, false)]);
+            self.settle(app);
+        }
+    }
+
+    /// (a) Two matrices are two NxWindows with distinct ids, each titled
+    /// `<matrix> - Worksheet - <file>`.
+    #[test]
+    fn each_matrix_is_its_own_worksheet_window() {
+        let mut app = two_matrix_app();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert_ne!(win_id(&app, 0), win_id(&app, 1));
+        assert_ne!(win_rect(&desk.ctx, &app, 0), win_rect(&desk.ctx, &app, 1));
+        let titles: Vec<String> = shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text().contains(" - Worksheet - ") => {
+                    Some(t.galley.text().to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "Quantity - Worksheet - Untitled",
+                "Revenue - Worksheet - Untitled"
+            ],
+            "one title per window, in memory = Untitled"
+        );
+        app.db = "/tmp/models/demo.db".into();
+        assert_eq!(app.window_title(1), "Revenue - Worksheet - demo");
+    }
+
+    /// (b) Dragging a window's title bar moves the matrix, and the move
+    /// survives save_view -> apply_view (which in turn moves the window).
+    #[test]
+    fn dragging_a_window_title_moves_the_matrix_into_the_view() {
+        let mut app = two_matrix_app();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let before = app.matrices[0].rect;
+        let win = win_rect(&desk.ctx, &app, 0);
+        let grab = egui::pos2(win.center().x, win.top() + 12.0);
+        desk.drag(&mut app, grab, grab + egui::vec2(60.0, 40.0));
+        let moved = app.matrices[0].rect;
+        assert_eq!((moved.x, moved.y), (before.x + 60.0, before.y + 40.0));
+        assert_eq!((moved.w, moved.h), (before.w, before.h));
+        assert_eq!(
+            app.matrices[1].rect,
+            two_matrix_app().matrices[1].rect,
+            "window 1 stays"
+        );
+
+        let id = app.save_view("Moved").expect("saved");
+        let view = app.model.views[&id].clone();
+        app.matrices[0].rect = before;
+        desk.settle(&mut app);
+        app.apply_view(&view);
+        assert_eq!(app.matrices[0].rect, moved, "the view kept the drag");
+        desk.settle(&mut app);
+        assert_eq!(
+            win_rect(&desk.ctx, &app, 0),
+            win.translate(egui::vec2(60.0, 40.0)),
+            "and the window follows the view"
+        );
+    }
+
+    /// H1-28: View ▸ New View puts the new window beside the last one, then below
+    /// it, on the desk and covering no window; with no room it cascades
+    /// past the last one's title bar, still on the desk.
+    #[test]
+    fn add_matrix_places_the_new_window_clear_of_the_old() {
+        let (mut app, mut desk) = grid_desk();
+        let area =
+            |r: CanvasRect| egui::Rect::from_min_size(egui::pos2(r.x, r.y), egui::vec2(r.w, r.h));
+        let first = app.matrices[0].rect;
+        app.run_command(&desk.ctx, Command::AddMatrix);
+        let beside = app.matrices[1].rect;
+        assert_eq!(
+            (beside.x, beside.y),
+            (first.x + first.w + WINDOW_GAP, first.y)
+        );
+        assert_eq!((beside.w, beside.h), (first.w, first.h), "the same size");
+        app.add_matrix(Some(MeasureId(101)));
+        let below = app.matrices[2].rect;
+        assert_eq!(
+            (below.x, below.y),
+            (beside.x, beside.y + beside.h + WINDOW_GAP)
+        );
+        for (i, a) in app.matrices.iter().enumerate() {
+            for b in &app.matrices[i + 1..] {
+                assert!(!area(a.rect).intersects(area(b.rect)), "{a:?} {b:?}");
+            }
+        }
+        // No room beside or below: a cascade past the title bar...
+        app.add_matrix(Some(MeasureId(101)));
+        let cascade = app.matrices[3].rect;
+        assert_eq!(
+            (cascade.x, cascade.y),
+            (below.x + CASCADE, below.y + CASCADE)
+        );
+        // ...kept on the desk at its bottom-right corner.
+        app.matrices[3].rect.x = app.desk.x - cascade.w;
+        app.matrices[3].rect.y = app.desk.y - cascade.h;
+        app.add_matrix(Some(MeasureId(101)));
+        let corner = app.matrices[4].rect;
+        assert_eq!(
+            (corner.x + corner.w, corner.y + corner.h),
+            (app.desk.x, app.desk.y)
+        );
+        desk.settle(&mut app);
+        let ws = egui::Rect::from_min_size(egui::Pos2::ZERO, app.desk);
+        for m in &app.matrices {
+            assert!(
+                ws.contains_rect(area(m.rect)),
+                "{:?} on {:?}",
+                m.rect,
+                app.desk
+            );
+        }
+        // Shown where placed: the first two windows do not overlap on screen.
+        let (w0, w1) = (win_rect(&desk.ctx, &app, 0), win_rect(&desk.ctx, &app, 1));
+        assert!(!w0.intersects(w1), "{w0:?} {w1:?}");
+    }
+
+    /// (c) Clicking window 2 focuses matrix 1.
+    #[test]
+    fn clicking_a_window_focuses_its_matrix() {
+        let mut app = two_matrix_app();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        assert_eq!(app.focus_index(), 0);
+        let win = win_rect(&desk.ctx, &app, 1);
+        // Its bottom-right, clear of window 0 (cascaded up-left of it).
+        desk.click(&mut app, win.max - egui::vec2(20.0, 20.0));
+        assert_eq!(app.focus_index(), 1);
+        assert!(crate::nxwin::is_key(&desk.ctx, win_id(&app, 1)));
+    }
+
+    // -- NeXTSTEP spec step 6: ruled grid, header highlight, range selection
+
+    /// A one-matrix desk on Quantity (an input over Time x Product), settled.
+    fn grid_desk() -> (ImprovApp, Desk) {
+        let mut app = build_app(grid_2x2_model());
+        app.matrices[0].measure = Some(MeasureId(101));
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        (app, desk)
+    }
+
+    /// E3: the white grid field fills the worksheet's whole table area, not
+    /// just the content-sized table (no gray right of / below the grid).
+    #[test]
+    fn the_white_field_fills_the_table_area() {
+        let (mut app, mut desk) = grid_desk();
+        let out = desk.frame(&mut app, Vec::new());
+        let last = cell_rect(&desk, &app, 0, 1);
+        let at = egui::pos2(last.right() + 20.0, last.center().y);
+        let win = win_rect(&desk.ctx, &app, 0);
+        assert!(win.contains(at), "{at:?} inside the window {win:?}");
+        let white = out.shapes.iter().any(|c| {
+            c.clip_rect.contains(at)
+                && matches!(&c.shape, egui::Shape::Rect(r)
+                    if r.fill == crate::theme::WHITE && r.rect.contains(at)
+                        && win.contains_rect(r.rect.shrink(1.0)))
+        });
+        assert!(white, "{at:?}, right of the grid, sits on the white field");
+    }
+
+    /// E2: the grid's vertical scroller is always there, a 19 px TROUGH strip
+    /// beside the data rows, inside the worksheet window (spec §4.8).
+    #[test]
+    fn the_grid_shows_a_gray_trough() {
+        let (mut app, mut desk) = grid_desk();
+        let out = desk.frame(&mut app, Vec::new());
+        let win = win_rect(&desk.ctx, &app, 0);
+        let cell = cell_rect(&desk, &app, 0, 1);
+        let trough = fills(&out).into_iter().any(|(r, c)| {
+            c == crate::theme::TROUGH
+                && (r.width() - 19.0).abs() < 1.0
+                && r.left() >= cell.right() - 1.0
+                && r.y_range().contains(cell.center().y)
+                && win.contains_rect(r)
+        });
+        assert!(trough, "no 19 px TROUGH strip in {win:?}");
+    }
+
+    /// E2: the trough color does not leak into text edits inside a scroller:
+    /// the formula list's new-formula field is still WHITE.
+    #[test]
+    fn text_edits_in_a_scroller_stay_white() {
+        let mut app = build_app(revenue_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        let out = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.1);
+        let field = ctx
+            .viewport(|v| {
+                let w = v.prev_pass.widgets.get(egui::Id::unique("formula_new"));
+                w.map(|w| w.rect)
+            })
+            .expect("formula_new shown");
+        let at = field.center();
+        let under: Vec<_> = fills(&out)
+            .into_iter()
+            .filter(|(r, _)| r.contains(at) && field.contains_rect(r.shrink(1.0)))
+            .collect();
+        assert!(
+            under.iter().any(|(_, c)| *c == crate::theme::WHITE),
+            "{field:?}: {under:?}"
+        );
+        assert!(under.iter().all(|(_, c)| *c != crate::theme::TROUGH));
+    }
+
+    /// Data cell `(ri, ci)`'s rect in the last pass.
+    fn cell_rect(desk: &Desk, app: &ImprovApp, ri: usize, ci: usize) -> egui::Rect {
+        let id = egui::Id::unique(("cell", app.matrices[0].uid, ri, ci));
+        desk.ctx
+            .viewport(|v| v.prev_pass.widgets.get(id).map(|w| w.rect))
+            .unwrap_or_else(|| panic!("cell ({ri},{ci}) was never shown"))
+    }
+
+    /// Every filled (non-transparent) rect painted this frame, with its fill.
+    fn fills(out: &egui::FullOutput) -> Vec<(egui::Rect, egui::Color32)> {
+        fn walk(s: &egui::Shape, acc: &mut Vec<(egui::Rect, egui::Color32)>) {
+            match s {
+                egui::Shape::Rect(r) if r.fill.a() > 0 => acc.push((r.rect, r.fill)),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, acc)),
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut acc));
+        acc
+    }
+
+    /// Header-sized LIGHT_GRAY rects in `cell`'s column (above it) and row (left
+    /// of it): `(column headers, row headers)`.
+    fn lit_headers(fills: &[(egui::Rect, egui::Color32)], cell: egui::Rect) -> (usize, usize) {
+        let lit = fills.iter().filter(|(r, c)| {
+            *c == crate::theme::LIGHT_GRAY && r.width() < 200.0 && r.height() < 100.0
+        });
+        let col = lit
+            .clone()
+            .filter(|(r, _)| {
+                r.width() <= cell.width() + 2.0
+                    && cell.x_range().contains(r.center().x)
+                    && (cell.top() - 10.0..=cell.top() + 1.0).contains(&r.bottom())
+            })
+            .count();
+        let row = lit
+            .filter(|(r, _)| {
+                r.height() <= cell.height() + 2.0
+                    && cell.y_range().contains(r.center().y)
+                    && (cell.left() - 10.0..=cell.left() + 1.0).contains(&r.right())
+            })
+            .count();
+        (col, row)
+    }
+
+    /// (a) Cells are plain: the cursor cell fills LIGHT_GRAY, the others WHITE.
+    #[test]
+    fn the_cursor_cell_is_gray_and_the_rest_white() {
+        let (mut app, mut desk) = grid_desk();
+        let out = desk.frame(&mut app, Vec::new());
+        let f = fills(&out);
+        let fill_of = |r: egui::Rect| f.iter().rev().find(|(x, _)| *x == r).map(|(_, c)| *c);
+        assert_eq!(
+            fill_of(cell_rect(&desk, &app, 0, 0)),
+            Some(crate::theme::LIGHT_GRAY)
+        );
+        assert_eq!(
+            fill_of(cell_rect(&desk, &app, 0, 1)),
+            Some(crate::theme::WHITE)
+        );
+        assert_eq!(
+            fill_of(cell_rect(&desk, &app, 1, 0)),
+            Some(crate::theme::WHITE)
+        );
+    }
+
+    /// (b) The cursor's row and column headers are lit; the other headers are not.
+    #[test]
+    fn the_cursor_lights_its_row_and_column_headers() {
+        let (mut app, mut desk) = grid_desk();
+        let out = desk.frame(&mut app, Vec::new());
+        let f = fills(&out);
+        let (c00, c11) = (cell_rect(&desk, &app, 0, 0), cell_rect(&desk, &app, 1, 1));
+        assert_eq!(lit_headers(&f, c00), (1, 1), "cursor's headers lit");
+        assert_eq!(lit_headers(&f, c11), (0, 0), "the others are not");
+    }
+
+    /// (c) A single click moves the cursor; a double-click opens the editor.
+    #[test]
+    fn double_click_edits_and_single_click_selects() {
+        let (mut app, mut desk) = grid_desk();
+        let at = cell_rect(&desk, &app, 1, 1).center();
+        desk.click(&mut app, at);
+        assert_eq!(
+            (app.matrices[0].cursor_row, app.matrices[0].cursor_col),
+            (1, 1)
+        );
+        assert!(app.matrices[0].editing.is_none(), "one click only selects");
+        desk.click(&mut app, at);
+        assert!(app.matrices[0].editing.is_some(), "a double-click edits");
+    }
+
+    /// One key press (with `modifiers`) as a desk frame.
+    fn key(desk: &mut Desk, app: &mut ImprovApp, key: egui::Key, modifiers: egui::Modifiers) {
+        let ev = egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let _ = desk.frame(app, vec![ev]);
+    }
+
+    /// A 1x3 Quantity grid (Product on columns, Time paged) holding 1, 2, 4.
+    fn three_wide() -> (ImprovApp, Desk) {
+        let mut model = grid_2x2_model();
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        model.add_item(ItemId(22), p, "WidgetC");
+        let c = |pairs: &[(CategoryId, ItemId)]| {
+            improv_core_model::Coordinate::from_pairs(pairs.iter().copied())
+        };
+        for (pi, q) in [(ItemId(20), 1.0), (ItemId(21), 2.0), (ItemId(22), 4.0)] {
+            model.set_input(
+                MeasureId(101),
+                c(&[(t, ItemId(10)), (p, pi)]),
+                Value::Number(q),
+            );
+        }
+        let mut app = build_app(model);
+        app.matrices[0].measure = Some(MeasureId(101));
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        // Time on rows (2 lines), Product on columns (3 lines): row 0 = 2025.
+        assert_eq!(app.matrices[0].grid_dims(&app.model), (2, 3));
+        (app, desk)
+    }
+
+    /// (d) Shift+Right twice from (0,0) selects 3 cells and Sum adds them; (e) a
+    /// plain arrow collapses the range to one cell.
+    #[test]
+    fn shift_arrows_select_a_range_and_a_plain_arrow_collapses_it() {
+        let (mut app, mut desk) = three_wide();
+        assert_eq!(app.selection_sum(), Some(1.0));
+        for _ in 0..2 {
+            key(
+                &mut desk,
+                &mut app,
+                egui::Key::ArrowRight,
+                egui::Modifiers::SHIFT,
+            );
+        }
+        assert_eq!(app.focused().selection_keys(&app.model).len(), 3);
+        assert_eq!(app.selection_sum(), Some(7.0), "1 + 2 + 4");
+        key(
+            &mut desk,
+            &mut app,
+            egui::Key::ArrowDown,
+            egui::Modifiers::NONE,
+        );
+        assert_eq!(app.focused().selection_keys(&app.model).len(), 1);
+        assert_eq!((app.focused().cursor_row, app.focused().cursor_col), (1, 2));
+    }
+
+    /// (f) Every selected column's header is lit, and the row's header.
+    #[test]
+    fn a_range_lights_every_selected_column_header() {
+        let (mut app, mut desk) = three_wide();
+        key(
+            &mut desk,
+            &mut app,
+            egui::Key::ArrowRight,
+            egui::Modifiers::SHIFT,
+        );
+        let f = fills(&desk.frame(&mut app, Vec::new()));
+        for ci in 0..2 {
+            assert_eq!(
+                lit_headers(&f, cell_rect(&desk, &app, 0, ci)),
+                (1, 1),
+                "col {ci}"
+            );
+        }
+        assert_eq!(lit_headers(&f, cell_rect(&desk, &app, 1, 2)), (0, 0));
+    }
+
+    /// Shift+click extends; a plain click collapses; a drag selects its span.
+    #[test]
+    fn shift_click_and_drag_select_ranges() {
+        let (mut app, mut desk) = three_wide();
+        let at = |desk: &Desk, app: &ImprovApp, r, c| cell_rect(desk, app, r, c).center();
+        let p = at(&desk, &app, 1, 2);
+        let shift_click = vec![
+            egui::Event::PointerMoved(p),
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::SHIFT,
+            },
+        ];
+        let _ = desk.frame(&mut app, shift_click);
+        let _ = desk.frame(&mut app, Vec::new());
+        assert_eq!(app.focused().selection_keys(&app.model).len(), 6);
+        let p = at(&desk, &app, 0, 1);
+        desk.click(&mut app, p);
+        assert_eq!(app.focused().selection_keys(&app.model).len(), 1);
+        let (from, to) = (at(&desk, &app, 0, 0), at(&desk, &app, 1, 1));
+        desk.drag(&mut app, from, to);
+        assert_eq!(app.focused().selection(), (0..=1, 0..=1));
+    }
+
+    /// (d) add_matrix focuses the new matrix, and its window becomes key.
+    #[test]
+    fn a_new_matrix_window_is_key() {
+        let mut app = build_app(grid_2x2_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        assert!(crate::nxwin::is_key(&desk.ctx, win_id(&app, 0)));
+        app.add_matrix(Some(MeasureId(102)));
+        let _ = desk.frame(&mut app, Vec::new());
+        assert!(crate::nxwin::is_key(&desk.ctx, win_id(&app, 1)));
+        assert!(!crate::nxwin::is_key(&desk.ctx, win_id(&app, 0)));
+        assert_eq!(app.focus_index(), 1);
+    }
+
+    /// (e) With two matrices each window has a close box that removes its
+    /// matrix; the last one has none.
+    #[test]
+    fn the_close_box_removes_a_matrix_but_never_the_last() {
+        let close_box =
+            |r: egui::Rect| egui::pos2(r.right() - 1.0 - 4.0 - 7.5, r.top() + 1.0 + 11.5);
+        let has_close = |ctx: &egui::Context, win: egui::Id| {
+            ctx.viewport(|v| v.prev_pass.widgets.get(win.with("close")).is_some())
+        };
+        let mut app = two_matrix_app();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        assert!(
+            has_close(&desk.ctx, win_id(&app, 0)),
+            "two matrices: closable"
+        );
+        let at = close_box(win_rect(&desk.ctx, &app, 1));
+        desk.click(&mut app, at);
+        assert_eq!(app.matrix_count(), 1);
+        assert_eq!(
+            app.matrices[0].measure,
+            Some(MeasureId(101)),
+            "window 1 closed"
+        );
+        desk.settle(&mut app);
+        assert!(
+            !has_close(&desk.ctx, win_id(&app, 0)),
+            "the last matrix has no close box"
+        );
+        let at = close_box(win_rect(&desk.ctx, &app, 0));
+        desk.click(&mut app, at);
+        assert_eq!(app.matrix_count(), 1);
+    }
+
+    /// Windows are keyed by matrix, not position: closing window 0 of three
+    /// leaves the other two showing under the ids (and at the rects) they had.
+    #[test]
+    fn closing_a_window_keeps_the_other_window_ids() {
+        let mut app = two_matrix_app();
+        app.add_matrix(Some(MeasureId(101)));
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let ids = [win_id(&app, 1), win_id(&app, 2)];
+        let rects = ids.map(|id| crate::nxwin::stored_rect(&desk.ctx, id));
+        let r = win_rect(&desk.ctx, &app, 0);
+        desk.click(
+            &mut app,
+            egui::pos2(r.right() - 1.0 - 4.0 - 7.5, r.top() + 1.0 + 11.5),
+        );
+        assert_eq!(app.matrix_count(), 2, "window 0 closed");
+        desk.settle(&mut app);
+        assert_eq!([win_id(&app, 0), win_id(&app, 1)], ids);
+        let shown = |id: egui::Id| {
+            desk.ctx
+                .viewport(|v| v.prev_pass.widgets.get(id.with("title")).is_some())
+        };
+        assert!(
+            ids.iter().all(|&id| shown(id)),
+            "still shown under their ids"
+        );
+        assert_eq!(
+            ids.map(|id| crate::nxwin::stored_rect(&desk.ctx, id)),
+            rects
+        );
+    }
+
+    /// Left of its left notch, the resize bar drags the bottom-left corner; pushed
+    /// far right it stops at the minimum width and the right edge stays put.
+    #[test]
+    fn left_resize_stops_at_the_minimum_width() {
+        let mut app = build_app(grid_2x2_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let before = app.matrices[0].rect;
+        let win = win_rect(&desk.ctx, &app, 0);
+        let at = egui::pos2(win.left() + 20.0, win.bottom() - 5.0);
+        desk.drag(&mut app, at, at + egui::vec2(1000.0, 0.0));
+        let r = app.matrices[0].rect;
+        assert_eq!(r.w, MATRIX_MIN_W);
+        assert_eq!(r.x + r.w, before.x + before.w, "right edge moved");
+        assert_eq!(win_rect(&desk.ctx, &app, 0).right(), win.right());
+    }
+
+    /// Windows stay on the workspace: a title dragged up stops at its top,
+    /// the top of the app now that no formula bar sits above it.
+    #[test]
+    fn a_window_cannot_be_dragged_above_the_workspace() {
+        let mut app = build_app(grid_2x2_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let win = win_rect(&desk.ctx, &app, 0);
+        let grab = egui::pos2(win.center().x, win.top() + 12.0);
+        desk.drag(&mut app, grab, grab - egui::vec2(0.0, 300.0));
+        assert_eq!(app.matrices[0].rect.y, 0.0);
+        assert!(egui::containers::panel::PanelState::load(
+            &desk.ctx,
+            egui::Id::unique("formula_bar")
+        )
+        .is_none());
+        assert!(win_rect(&desk.ctx, &app, 0).top() >= 0.0);
+    }
+
+    /// Resizing a window persists into its matrix, and never below the
+    /// minimum the gutters need.
+    #[test]
+    fn resizing_a_window_resizes_its_matrix_down_to_a_minimum() {
+        let mut app = build_app(grid_2x2_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let before = app.matrices[0].rect;
+        let bar = |r: egui::Rect| egui::pos2(r.right() - 20.0, r.bottom() - 5.0);
+        let at = bar(win_rect(&desk.ctx, &app, 0));
+        desk.drag(&mut app, at, at + egui::vec2(50.0, 30.0));
+        let r = app.matrices[0].rect;
+        assert_eq!((r.w, r.h), (before.w + 50.0, before.h + 30.0));
+        let at = bar(win_rect(&desk.ctx, &app, 0));
+        desk.drag(&mut app, at, at - egui::vec2(1000.0, 1000.0));
+        let r = app.matrices[0].rect;
+        assert_eq!((r.w, r.h), (MATRIX_MIN_W, MATRIX_MIN_H));
+        assert_eq!(win_rect(&desk.ctx, &app, 0).size(), egui::vec2(r.w, r.h));
+    }
+
+    /// Dragging a tile from the row gutter to the column gutter of a
+    /// worksheet window re-pivots that matrix, with real pointer events.
+    #[test]
+    fn a_tile_drag_inside_a_window_repivots() {
+        let mut app = gutter_app();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let time = CategoryId(1);
+        assert_eq!(app.row_cats(), vec![time]);
+        let tile = desk
+            .ctx
+            .viewport(|v| {
+                v.prev_pass
+                    .widgets
+                    .get(egui::Id::unique(("tile", app.matrices[0].uid, time.0)))
+                    .copied()
+            })
+            .expect("the Time tile")
+            .rect;
+        let g = app.focused().gutters.expect("laid out");
+        assert!(g.well.contains_rect(tile), "Time starts bottom-left: {g:?}");
+        // Drop on the column zone: the top strip's right part, tile height.
+        desk.drag(
+            &mut app,
+            tile.center(),
+            egui::pos2(g.top.right() - 10.0, g.top.top() + TILE_H / 2.0 + 2.0),
+        );
+        assert!(
+            app.col_cats().contains(&time),
+            "Time moved to columns: {:?}",
+            app.col_cats()
+        );
+        assert!(!app.row_cats().contains(&time));
+    }
+
+    /// The browser labels each measure `input` or `formula`, to the right of
+    /// its name.
+    #[test]
+    fn browser_labels_measures_input_or_formula() {
+        let mut app = build_app(revenue_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let size = egui::vec2(1400.0, 900.0);
+        let mut out = full_frame(&ctx, &mut app, size, 0.0);
+        for i in 1..4 {
+            out = full_frame(&ctx, &mut app, size, f64::from(i) / 60.0);
+        }
+        let name = text_at(&out.shapes, "Revenue").expect("Revenue listed");
+        let kind = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "formula" => {
+                    Some((t.galley.rect.translate(t.pos.to_vec2()), c.clip_rect))
+                }
+                _ => None,
+            })
+            .find(|(r, _)| (r.center().y - name.center().y).abs() < 4.0)
+            .expect("formula label on Revenue's row");
+        assert!(kind.0.min.x > name.max.x, "right of the name");
+        assert!(
+            kind.1.shrink(4.0).contains_rect(kind.0),
+            "{kind:?} touches its clip edge"
+        );
+        assert!(text_at(&out.shapes, "input").is_some(), "Price is an input");
+    }
+
+    /// A model whose one measure is `rows` × `cols` items (Row × Col).
+    fn grid_model(rows: u32, cols: u32) -> Model {
+        let mut m = Model::new();
+        let (r, c) = (CategoryId(1), CategoryId(2));
+        m.add_category(r, "Row");
+        m.add_category(c, "Col");
+        for i in 0..rows {
+            m.add_item(ItemId(100 + i), r, format!("r{i}"));
+        }
+        for i in 0..cols {
+            m.add_item(ItemId(200 + i), c, format!("c{i}"));
+        }
+        m.add_measure(Measure {
+            id: MeasureId(1),
+            name: Name("Grid".into()),
+            value_type: ValueType::Number,
+            categories: vec![r, c],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        m
+    }
+
+    /// E6: a fresh worksheet window is sized to its grid, within bounds.
+    #[test]
+    fn a_fresh_matrix_fits_its_grid() {
+        let small = grid_model(4, 2);
+        let m = Matrix::new(&small, Some(MeasureId(1)));
+        assert_eq!(
+            product_len(&m.axis_item_lists(&small, &m.col_cats(&small))),
+            2
+        );
+        assert_eq!(
+            product_len(&m.axis_item_lists(&small, &m.row_cats(&small))),
+            4
+        );
+        assert!((360.0..=900.0).contains(&m.rect.w), "w {}", m.rect.w);
+        assert!((300.0..=700.0).contains(&m.rect.h), "h {}", m.rect.h);
+        let wide = grid_model(4, 12);
+        assert!(Matrix::new(&wide, Some(MeasureId(1))).rect.w > m.rect.w);
+    }
+
+    /// E1: the first worksheet window opens clear of the application menu.
+    #[test]
+    fn the_first_worksheet_window_clears_the_menu() {
+        let mut app = build_app(revenue_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let size = egui::vec2(1400.0, 900.0);
+        for i in 0..4 {
+            let _ = full_frame(&ctx, &mut app, size, f64::from(i) / 60.0);
+        }
+        let menu = ctx
+            .memory(|m| m.area_rect(crate::menu::menu_id()))
+            .expect("menu shown");
+        let win = crate::nxwin::stored_rect(&ctx, matrix_window_id(app.matrices[0].uid))
+            .expect("window shown");
+        assert!(
+            !menu.intersects(win),
+            "menu {menu:?} overlaps window {win:?}"
+        );
+    }
+
+    /// A status message is drawn, then gone once [`STATUS_TTL`] has passed.
+    #[test]
+    fn status_messages_fade_after_a_few_seconds() {
+        let mut app = build_app(grid_2x2_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let size = egui::vec2(1400.0, 900.0);
+        let _ = full_frame(&ctx, &mut app, size, 10.0);
+        app.status = "recalculated".into();
+        let out = full_frame(&ctx, &mut app, size, 10.1);
+        assert!(text_at(&out.shapes, "recalculated").is_some(), "drawn");
+        let out = full_frame(&ctx, &mut app, size, 13.0);
+        assert!(text_at(&out.shapes, "recalculated").is_some(), "still up");
+        let out = full_frame(&ctx, &mut app, size, 16.2);
+        assert!(text_at(&out.shapes, "recalculated").is_none(), "faded");
+        assert!(app.status.is_empty());
+    }
+
+    /// The screen rect of the first painted text exactly equal to `label`.
+    fn text_at(shapes: &[egui::epaint::ClippedShape], label: &str) -> Option<egui::Rect> {
+        shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text() == label => {
+                Some(t.galley.rect.translate(t.pos.to_vec2()))
+            }
+            _ => None,
+        })
+    }
+
+    /// A page tile's item field shows the current item, and picking another
+    /// item from it re-slices the grid (`page_idx`).
+    #[test]
+    fn choosing_a_page_item_in_its_field_pages_the_grid() {
+        let mut app = gutter_app();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        assert_eq!(app.page_cats(), vec![CategoryId(3)]);
+        assert_eq!(app.focused().page_idx, vec![0]);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let field = text_at(&shapes, "North").expect("the field shows North");
+        desk.click(&mut app, field.center());
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let south = text_at(&shapes, "South").expect("the popup lists South");
+        desk.click(&mut app, south.center());
+        assert_eq!(app.focused().page_idx, vec![1]);
+    }
+
+    /// Gutters size to their tiles: an empty axis paints no placeholder.
+    #[test]
+    fn an_empty_axis_paints_no_placeholder() {
+        let mut app = gutter_app();
+        app.set_axis(CategoryId(3), Axis::Rows);
+        assert!(app.page_cats().is_empty());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(!shapes.iter().any(|c| matches!(&c.shape,
+            egui::Shape::Text(t) if t.galley.text().contains("(drop"))));
+    }
+
+    /// The last-frame rect of matrix 0's tile for category `c`.
+    fn tile_rect(desk: &Desk, app: &ImprovApp, c: CategoryId) -> egui::Rect {
+        desk.ctx
+            .viewport(|v| {
+                v.prev_pass
+                    .widgets
+                    .get(egui::Id::unique(("tile", app.matrices[0].uid, c.0)))
+                    .copied()
+            })
+            .expect("the tile")
+            .rect
+    }
+
+    /// Tiles are the NeXT 17 px chips, and right-clicking one offers
+    /// "Move to …" (the drag-free way to re-pivot).
+    #[test]
+    fn a_tile_context_menu_moves_it() {
+        let mut app = gutter_app();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let time = CategoryId(1);
+        let tile = tile_rect(&desk, &app, time);
+        assert!((tile.height() - TILE_H).abs() < 0.5, "{tile:?}");
+        let at = tile.center();
+        let right = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = desk.frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        let _ = desk.frame(&mut app, vec![right(true), right(false)]);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let item = shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Move to Columns" => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .expect("the context menu is open");
+        desk.click(&mut app, item.center());
+        assert!(app.col_cats().contains(&time), "{:?}", app.col_cats());
+        assert!(!app.row_cats().contains(&time));
+    }
+
+    // -- NeXTSTEP spec step 3, second half: model browser and Info panel
+
+    /// Right-click matrix 0's tile for `c`, leaving its context menu open.
+    fn open_tile_menu(desk: &mut Desk, app: &mut ImprovApp, c: CategoryId) {
+        let at = tile_rect(desk, app, c).center();
+        let right = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = desk.frame(app, vec![egui::Event::PointerMoved(at)]);
+        let _ = desk.frame(app, vec![right(true), right(false)]);
+    }
+
+    /// The LAST painted text equal to `label` (a popup paints after the grid,
+    /// so this is the menu's copy of a label the grid also shows).
+    fn last_text_at(shapes: &[egui::epaint::ClippedShape], label: &str) -> Option<egui::Rect> {
+        shapes.iter().rev().find_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text() == label => {
+                Some(t.galley.rect.translate(t.pos.to_vec2()))
+            }
+            _ => None,
+        })
+    }
+
+    /// E4: filtering lives on the tile's menu, not a "Filters" shelf.
+    /// Unchecking an item hides its row; "Show all" brings it back; a
+    /// filtered tile reads `Name*`.
+    #[test]
+    fn a_tile_menu_filters_its_category() {
+        let (mut app, mut desk) = grid_desk();
+        let (time, y2026) = (CategoryId(1), ItemId(11));
+        assert_eq!(app.row_cats(), vec![time]);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(text_at(&shapes, "Filters").is_none(), "no filter shelf");
+        let row_shown = |desk: &Desk, app: &ImprovApp, ri: usize| {
+            let id = egui::Id::unique(("cell", app.matrices[0].uid, ri, 0_usize));
+            desk.ctx.viewport(|v| v.prev_pass.widgets.get(id).is_some())
+        };
+        assert!(row_shown(&desk, &app, 1), "2026's row is shown");
+
+        open_tile_menu(&mut desk, &mut app, time);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let item = last_text_at(&shapes, "2026").expect("the menu lists 2026");
+        desk.click(&mut app, item.center());
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert_eq!(app.matrices[0].grid_dims(&app.model).0, 1);
+        assert!(!row_shown(&desk, &app, 1), "2026's row is hidden");
+        assert!(app.matrices[0]
+            .filters
+            .iter()
+            .any(|f| f.category == time && !f.items.contains(&y2026)));
+        assert!(
+            text_at(&shapes, "Time*").is_some(),
+            "filtered tile reads Time*"
+        );
+
+        let all = last_text_at(&shapes, "Show all").expect("the menu is still open");
+        desk.click(&mut app, all.center());
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(app.matrices[0].filters.is_empty());
+        assert!(row_shown(&desk, &app, 1), "2026's row is back");
+        assert!(text_at(&shapes, "Time").is_some(), "tile reads Time again");
+    }
+
+    /// The NxWindow id of the model browser (`"browser"`) or Info panel
+    /// (`"info"`).
+    fn panel_win(name: &str) -> egui::Id {
+        crate::nxwin::NxWindow::new(name, "").id()
+    }
+
+    /// Window `win`'s close box as laid out last frame, if it was shown.
+    fn close_box_of(ctx: &egui::Context, win: egui::Id) -> Option<egui::Rect> {
+        ctx.viewport(|v| v.prev_pass.widgets.get(win.with("close")).map(|w| w.rect))
+    }
+
+    /// (a) With no side panels, the workspace spans the whole window width at
+    /// 1400x900, from the top down to the bottom panels, even with the
+    /// Info panel open.
+    #[test]
+    fn the_workspace_spans_the_full_window_width() {
+        let mut app = build_app(grid_2x2_model());
+        app.show_inspector = true;
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let size = egui::vec2(1400.0, 900.0);
+        let mut shapes = Vec::new();
+        for i in 0..6 {
+            shapes = full_frame(&ctx, &mut app, size, f64::from(i) / 60.0).shapes;
+        }
+        let ws = shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) if r.fill == crate::theme::DARK_GRAY => Some(r.rect),
+                _ => None,
+            })
+            .max_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("the workspace is painted");
+        assert_eq!((ws.left(), ws.right()), (0.0, 1400.0), "{ws:?}");
+        assert!(ws.top() == 0.0 && ws.bottom() < 900.0, "{ws:?}");
+        assert!(close_box_of(&ctx, panel_win("info")).is_some());
+        assert!(close_box_of(&ctx, panel_win("browser")).is_some());
+    }
+
+    /// (b) The browser is a window titled `<file> - Model`, and clicking a
+    /// measure in it selects that measure.
+    #[test]
+    fn clicking_a_measure_in_the_browser_selects_it() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let text_rect = |label: &str| {
+            shapes.iter().find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == label => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                _ => None,
+            })
+        };
+        let titles: Vec<&str> = shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text().ends_with("- Model") => {
+                    Some(t.galley.text())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, ["Untitled - Model"]);
+        let at = text_rect("Price").expect("Price is listed").center();
+        let browser = egui::LayerId::new(egui::Order::Middle, panel_win("browser"));
+        assert_eq!(desk.ctx.layer_id_at(at), Some(browser), "in the window");
+        desk.click(&mut app, at);
+        assert_eq!(app.selected(), Some(MeasureId(100)));
+    }
+
+    /// The rect of the first painted text exactly `label`.
+    fn painted(shapes: &[egui::epaint::ClippedShape], label: &str) -> Option<egui::Rect> {
+        shapes.iter().find_map(|c| match &c.shape {
+            egui::Shape::Text(t) if t.galley.text() == label => {
+                Some(t.galley.rect.translate(t.pos.to_vec2()))
+            }
+            _ => None,
+        })
+    }
+
+    /// E5 (spec §4.2): the browser lists saved views as `Name - Worksheet`
+    /// rows; a single click selects one (shown in the description) without
+    /// opening it, a double-click opens it.
+    #[test]
+    fn browser_lists_views_click_selects_double_click_opens() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        let a = app.save_view("A").expect("saved A");
+        select(&mut app, MeasureId(102));
+        let b = app.save_view("B").expect("saved B");
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(painted(&shapes, "B - Worksheet").is_some(), "B listed");
+        let at = painted(&shapes, "A - Worksheet")
+            .expect("A listed")
+            .center();
+        let browser = egui::LayerId::new(egui::Order::Middle, panel_win("browser"));
+        assert_eq!(desk.ctx.layer_id_at(at), Some(browser), "in the window");
+
+        desk.click(&mut app, at);
+        assert_eq!(app.browser_sel, Some(a), "single click selects A");
+        assert_eq!(app.current_view, Some(b), "...without opening it");
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(
+            painted(&shapes, &app.view_description(&app.model.views[&a])).is_some(),
+            "the description shows A"
+        );
+
+        desk.click(&mut app, at);
+        desk.click(&mut app, at);
+        assert_eq!(app.current_view, Some(a), "double-click opens A");
+        assert_eq!(app.matrices[0].measure, Some(MeasureId(101)));
+    }
+
+    /// H1-34: a model opens on its first saved view (in id order), else on
+    /// its first measure in id order, input or derived.
+    #[test]
+    fn a_model_opens_on_its_first_view_else_its_first_measure() {
+        let db = temp_db("h1_34");
+        let _cleanup = Cleanup(db.clone());
+        let mut model = grid_2x2_model();
+        let save = |m: &Model| Store::open(&db).and_then(|mut s| s.save_model(m));
+        save(&model).expect("seed");
+        let app = ImprovApp::load(&db).expect("load");
+        assert_eq!(app.selected(), Some(MeasureId(100)), "Price, not Revenue");
+        assert_eq!(app.current_view, None);
+        // Two views, saved out of id order: the lower id opens.
+        for (id, name, measure) in [(5, "Later", MeasureId(101)), (2, "First", MeasureId(102))] {
+            let p = MatrixPlacement::new(measure);
+            model.add_view(View::from_matrices(
+                ViewId(id),
+                Name(name.into()),
+                p,
+                vec![],
+            ));
+        }
+        save(&model).expect("views");
+        let app = ImprovApp::load(&db).expect("reload");
+        assert_eq!(app.current_view, Some(ViewId(2)));
+        assert_eq!(app.selected(), Some(MeasureId(102)));
+        assert_eq!(app.matrix_title(0), "Revenue");
+        assert!(app.status.is_empty(), "{}", app.status);
+        // Like a fresh window: right of the menu, sized to its grid.
+        let fresh = Matrix::new(&app.model, Some(MeasureId(102))).rect;
+        assert_eq!(app.matrices[0].rect, fresh);
+        // A first view with a matrix whose measure is gone says so.
+        let gone = MatrixPlacement::new(MeasureId(999));
+        let p = MatrixPlacement::new(MeasureId(101));
+        model.add_view(View::from_matrices(
+            ViewId(1),
+            Name("Odd".into()),
+            p,
+            vec![gone],
+        ));
+        save(&model).expect("a view with a dead matrix");
+        let app = ImprovApp::load(&db).expect("reload");
+        assert_eq!(app.current_view, Some(ViewId(1)));
+        assert!(app.status.contains("skipped"), "{}", app.status);
+    }
+
+    /// A view's description names its measure and categories.
+    #[test]
+    fn view_description_names_the_measure() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+        let id = app.save_view("Rev").expect("saved");
+        let d = app.view_description(&app.model.views[&id]);
+        assert!(d.starts_with("Revenue by "), "{d}");
+        assert!(d.contains(" \u{d7} "), "rows × columns: {d}");
+    }
+
+    /// With no saved views the description reads `(no saved views)`.
+    #[test]
+    fn browser_without_views_says_so() {
+        let mut app = build_app(grid_2x2_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(painted(&shapes, "(no saved views)").is_some());
+    }
+
+    /// H1-23: Help ▸ Keys… shows the key equivalents (read from the menu)
+    /// and the grid keys, and closes from its box; Help ▸ User Guide asks
+    /// the platform to open the published guide.
+    #[test]
+    fn help_lists_the_keys_and_opens_the_user_guide() {
+        let mut app = build_app(grid_2x2_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let keys = panel_win("keys");
+        assert!(close_box_of(&desk.ctx, keys).is_none(), "closed at start");
+        app.run_command(&desk.ctx, Command::Keys);
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let chord = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
+        for text in [
+            format!("{chord}+z"),
+            "Edit: Undo".into(),
+            format!("{chord}+Shift+z"),
+            format!("{chord}+y"),
+            "Quit".into(),
+            "Arrows, h j k l".into(),
+            "n, Shift+n".into(),
+            "function help, anywhere".into(),
+        ] {
+            assert!(painted(&shapes, &text).is_some(), "{text} listed");
+        }
+        assert!(painted(&shapes, &format!("{chord}+p")).is_some(), "Print…");
+        // Every row is inside the window, the last one included.
+        let win = crate::nxwin::stored_rect(&desk.ctx, keys).expect("shown");
+        let last = painted(&shapes, "pick from a formula's completion list").expect("last row");
+        assert!(win.contains_rect(last), "{last:?} in {win:?}");
+        let font = egui::TextStyle::Body.resolve(&desk.ctx.global_style());
+        desk.ctx.fonts_mut(|f| {
+            for (_, item, _) in menu::key_equivalents() {
+                assert!(f.has_glyphs(&font, &item), "missing glyph in {item:?}");
+            }
+        });
+        let close = close_box_of(&desk.ctx, keys).expect("the Keys window is shown");
+        desk.click(&mut app, close.center());
+        assert!(!app.show_keys);
+        app.run_command(&desk.ctx, Command::Keys);
+        app.run_command(&desk.ctx, Command::Keys);
+        assert!(!app.show_keys, "Help ▸ Keys… toggles it");
+
+        let out = desk.ctx.test_pass(egui::RawInput::default(), |ctx| {
+            app.run_command(ctx, Command::UserGuide);
+        });
+        let urls: Vec<&str> = out
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::OpenUrl(u) => Some(u.url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urls, ["https://gburd.github.io/improv/"]);
+        assert!(app.status.contains(USER_GUIDE), "{}", app.status);
+    }
+
+    /// H1-22: Format ▸ sets the selected measure's decimals and thousands
+    /// separators. Cells, the screen reader's label, the Sum and the Info
+    /// panel show it; the editor still opens on the value as typed. One
+    /// undo step each; autosaved; a text measure has nothing to format.
+    #[test]
+    fn the_format_menu_formats_the_selected_measure() {
+        let db = temp_db("h1_22");
+        let _cleanup = Cleanup(db.clone());
+        let mut model = grid_2x2_model();
+        let at = improv_core_model::Coordinate::from_pairs([
+            (CategoryId(1), ItemId(10)),
+            (CategoryId(2), ItemId(20)),
+        ]);
+        model.set_input(MeasureId(101), at.clone(), Value::Number(1234.5));
+        Store::open(&db).unwrap().save_model(&model).unwrap();
+        let mut app = ImprovApp::load(&db).expect("load");
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        let ctx = egui::Context::default();
+        let key = encode_coord(&at);
+        let shown = |app: &ImprovApp| app.cell_shown(MeasureId(101), &key).unwrap();
+        assert_eq!(shown(&app), "1234.5", "General");
+        assert!(!app.command_checked(Command::Grouping));
+        assert!(app.command_checked(Command::Decimals(None)));
+
+        app.run_command(&ctx, Command::Decimals(Some(2)));
+        assert_eq!(app.status, "Quantity: 2 decimals");
+        assert_eq!(shown(&app), "1234.50");
+        app.run_command(&ctx, Command::Grouping);
+        assert_eq!(shown(&app), "1,234.50");
+        assert!(app.command_checked(Command::Decimals(Some(2))));
+        assert!(app.command_checked(Command::Grouping));
+        assert!(!app.command_checked(Command::Decimals(None)));
+        app.run_command(&ctx, Command::Decimals(Some(0)));
+        assert_eq!(shown(&app), "1,235", "half away from zero");
+        assert_eq!(app.selection_readout(), "Sum 1,235");
+        assert_eq!(
+            app.cell_text(MeasureId(101), &key).as_deref(),
+            Some("1234.5")
+        );
+        let d = app.inspector_data(MeasureId(101)).unwrap();
+        assert_eq!(d.format.unwrap().to_string(), "0 decimals grouped");
+        app.run_command(&ctx, Command::Decimals(Some(0)));
+        assert_eq!(app.status, "Quantity is unchanged");
+
+        // German separators.
+        app.locale = improv_core_model::Locale::de();
+        assert_eq!(shown(&app), "1.235");
+        app.locale = improv_core_model::Locale::en();
+
+        // Saved as it changed: a fresh load has it.
+        let saved = Store::open(&db).unwrap().load_model().unwrap();
+        assert_eq!(
+            saved.measures[&MeasureId(101)].format.unwrap().to_string(),
+            "0 decimals grouped"
+        );
+
+        // Each change is one undo step; back to General is no format.
+        app.run_command(&ctx, Command::Undo);
+        app.run_command(&ctx, Command::Undo);
+        assert_eq!(shown(&app), "1234.50");
+        app.run_command(&ctx, Command::Undo);
+        assert_eq!(shown(&app), "1234.5");
+        assert_eq!(app.model.measures[&MeasureId(101)].format, None);
+        app.run_command(&ctx, Command::Redo);
+        assert_eq!(shown(&app), "1234.50");
+        app.run_command(&ctx, Command::Decimals(None));
+        assert_eq!(app.model.measures[&MeasureId(101)].format, None, "General");
+        assert_eq!(app.status, "Quantity: general");
+        let saved = Store::open(&db).unwrap().load_model().unwrap();
+        assert_eq!(saved.measures[&MeasureId(101)].format, None);
+
+        // A derived measure formats too; a text one has no numbers.
+        select(&mut app, MeasureId(102));
+        assert!(app.command_enabled(Command::Grouping));
+        app.run_command(&ctx, Command::Grouping);
+        assert_eq!(
+            app.number_format(MeasureId(102)).unwrap().to_string(),
+            "general grouped"
+        );
+        let mut t = build_app(typed_model());
+        select(&mut t, MeasureId(2));
+        assert!(!t.command_enabled(Command::Decimals(Some(2))));
+        assert!(!t.command_checked(Command::Decimals(None)));
+        assert!(t
+            .set_number_format(Some(Some(2)))
+            .unwrap_err()
+            .contains("no numbers"));
+        t.matrices[0].measure = None;
+        assert_eq!(
+            t.set_number_format(None).unwrap_err(),
+            "select a measure first"
+        );
+    }
+
+    /// (c) Info ▸ Info Panel… opens the Info window; its close box closes it.
+    #[test]
+    fn the_info_panel_opens_from_the_menu_and_closes_from_its_box() {
+        let mut app = build_app(grid_2x2_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let info = panel_win("info");
+        assert!(close_box_of(&desk.ctx, info).is_none(), "closed at start");
+        app.run_command(&desk.ctx, Command::InfoPanel);
+        desk.settle(&mut app);
+        let close = close_box_of(&desk.ctx, info).expect("the Info window is shown");
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(
+            shapes.iter().any(|c| matches!(&c.shape,
+                egui::Shape::Text(t) if t.galley.text() == "name: Price")),
+            "it shows the selected measure"
+        );
+        desk.click(&mut app, close.center());
+        assert!(!app.show_inspector);
+        desk.settle(&mut app);
+        assert!(close_box_of(&desk.ctx, info).is_none(), "closed again");
+    }
+
+    /// (d) File ▸ Model Browser… toggles the browser window.
+    #[test]
+    fn the_model_browser_command_toggles_the_browser() {
+        let mut app = build_app(grid_2x2_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let browser = panel_win("browser");
+        assert!(close_box_of(&desk.ctx, browser).is_some(), "open at start");
+        app.run_command(&desk.ctx, Command::ModelBrowser);
+        desk.settle(&mut app);
+        assert!(!app.show_browser);
+        assert!(close_box_of(&desk.ctx, browser).is_none());
+        app.run_command(&desk.ctx, Command::ModelBrowser);
+        desk.settle(&mut app);
+        assert!(close_box_of(&desk.ctx, browser).is_some());
+    }
+
+    /// Removing a matrix never leaves the focus dangling: `focused()` must keep
+    /// returning a real matrix, whichever one went away.
+    #[test]
+    fn focus_survives_removing_matrices() {
+        let mut app = build_app(grid_2x2_model());
+        app.add_matrix(Some(MeasureId(101)));
+        app.add_matrix(Some(MeasureId(102)));
+        assert_eq!(app.matrix_count(), 3);
+        assert_eq!(app.focus_index(), 2, "a new matrix takes the focus");
+
+        // Remove the focused (last) one: focus falls back inside the range.
+        app.remove_matrix(2);
+        assert_eq!(app.focus_index(), 1);
+        assert_eq!(app.focused().measure, app.matrices[1].measure);
+
+        // Remove an EARLIER one while focused on a later one.
+        app.set_focus(1);
+        app.remove_matrix(0);
+        assert_eq!(app.matrix_count(), 1);
+        assert_eq!(app.focus_index(), 0);
+        // set_focus clamps rather than panicking on a bogus index.
+        app.set_focus(99);
+        assert_eq!(app.focus_index(), 0);
+    }
+
+    /// The formula editor, inspector and chart all follow the FOCUSED matrix: they
+    /// are single-measure surfaces, and on a canvas "the selected measure" can
+    /// only mean "the one with the keyboard".
+    #[test]
+    fn single_measure_surfaces_follow_the_focus() {
+        let mut app = two_matrix_app();
+        app.set_focus(0);
+        assert_eq!(app.selected(), Some(MeasureId(101)), "Quantity");
+        assert_eq!(
+            app.inspector_data(app.selected().unwrap()).unwrap().name,
+            "Quantity"
+        );
+        // Quantity is an input measure: no chart-worthy formula, but a chart.
+        let q_chart = app.chart_series(crate::chart::ParseBy::Columns);
+
+        app.set_focus(1);
+        assert_eq!(app.selected(), Some(MeasureId(102)), "Revenue");
+        let d = app.inspector_data(app.selected().unwrap()).unwrap();
+        assert_eq!(d.name, "Revenue");
+        assert!(d.is_derived, "the inspector moved to the derived measure");
+        assert_eq!(
+            app.formula_source(MeasureId(102)).as_deref(),
+            Some("Price * Quantity")
+        );
+        // The chart followed too: different measure, different numbers.
+        let r_chart = app.chart_series(crate::chart::ParseBy::Columns);
+        assert_ne!(
+            q_chart.series[0].points, r_chart.series[0].points,
+            "the chart must plot the focused matrix's measure"
+        );
+    }
+
+    // -- STEP 5: chrome (title bars, selection readout, document tabs)
+
+    /// **Step 5:** each matrix has its own title bar naming its measure, and —
+    /// like the reference's `Property Financials: Virginia Ave` — the slice it
+    /// shows, i.e. its pinned page items.
+    #[test]
+    fn each_matrix_has_its_own_title_naming_its_slice() {
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200)); // Sales[Time, Product, Region]
+        app.sync_axis_state();
+        // One page dim (Region) pinned to North.
+        assert_eq!(app.matrix_title(0), "Sales: North");
+
+        // Page to South: the title follows the slice, which is the point of
+        // putting it there.
+        let model = (*app.model).clone();
+        app.matrices[0].set_page(&model, 0, 1);
+        assert_eq!(app.matrix_title(0), "Sales: South");
+
+        // A second matrix on the same measure, pinned differently, gets its own
+        // title — two matrices are two slices, and the title bars say which.
+        app.add_matrix(Some(MeasureId(200)));
+        app.sync_axis_state();
+        assert_eq!(app.matrix_title(1), "Sales: North");
+        assert_eq!(app.matrix_title(0), "Sales: South");
+
+        // With no page dimension there is no slice to name, so the title is just
+        // the measure.
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        assert_eq!(app.matrix_title(0), "Quantity");
+        assert_eq!(app.matrix_title(99), "", "an out-of-range index is empty");
+    }
+
+    /// **Step 5:** the status bar's selection-aggregate readout (the reference's
+    /// bottom-right `Sum`), computed from the FOCUSED matrix's selection.
+    ///
+    /// Selection is one cell today, so the sum is that cell's number; a
+    /// non-numeric or absent cell reads `Sum —` rather than a fabricated 0.
+    #[test]
+    fn the_status_bar_reads_out_the_focused_selection_sum() {
+        let mut app = two_matrix_app();
+        // Matrix 0 = Quantity, cursor on [2025, WidgetA] = 100.
+        app.set_focus(0);
+        assert_eq!(app.selection_sum(), Some(100.0));
+        assert_eq!(app.selection_readout(), "Sum 100");
+
+        // Move that matrix's cursor: the readout follows it.
+        let model = (*app.model).clone();
+        app.matrices[0].move_cursor(&model, 1, 0); // [2026, WidgetA] = 120
+        assert_eq!(app.selection_readout(), "Sum 120");
+
+        // Focus the OTHER matrix: the readout switches to its selection, which is
+        // a derived cell (Revenue[2025, WidgetA] = 10 * 100 = 1000).
+        app.set_focus(1);
+        assert_eq!(app.selection_sum(), Some(1000.0));
+        assert_eq!(app.selection_readout(), "Sum 1000");
+
+        // An empty cell has nothing to sum.
+        let at = decode(&app.cursor_key().unwrap());
+        Arc::make_mut(&mut app.model)
+            .inputs
+            .remove(&(MeasureId(101), at));
+        app.rebuild_engine();
+        assert_eq!(app.selection_sum(), None);
+        assert_eq!(app.selection_readout(), "Sum \u{2014}");
+    }
+
+    /// A non-numeric selection reads `Sum —`: the aggregate is a SUM, and text
+    /// does not sum. (Its cell still renders its text in the grid — see
+    /// `typed_input_cells_render_their_values`.)
+    #[test]
+    fn a_non_numeric_selection_has_no_sum() {
+        let mut app = build_app(typed_model());
+        select(&mut app, MeasureId(2)); // Label (Text)
+        app.sync_axis_state();
+        assert_eq!(
+            app.cell_text(MeasureId(2), &typed_key()).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(app.selection_sum(), None, "text has no sum");
+        assert_eq!(app.selection_readout(), "Sum \u{2014}");
+    }
+
+    /// **Step 5:** one entry per saved view (the reference's `Welcome /
+    /// Concepts / P&L Canvas`), listed in the application menu's View submenu,
+    /// and picking one switches CANVASES — not just a measure.
+    #[test]
+    fn document_tabs_switch_between_saved_canvases() {
+        let mut app = build_app(grid_2x2_model());
+        assert!(app.document_tabs().is_empty(), "no views, no tabs");
+
+        // Canvas A: one matrix, Quantity.
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        let a = app.save_view("Canvas A").expect("saved A");
+        // Canvas B: two matrices, the second showing Revenue pivoted.
+        app.add_matrix(Some(MeasureId(102)));
+        app.sync_axis_state();
+        let model = (*app.model).clone();
+        app.matrices[1].pivot_rotate(&model);
+        let b = app.save_view("Canvas B").expect("saved B");
+
+        // Both tabs are listed, in id order, with B current (just saved).
+        let tabs = app.document_tabs();
+        assert_eq!(
+            tabs.iter().map(|(_, n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["Canvas A", "Canvas B"]
+        );
+        assert_eq!(
+            tabs.iter()
+                .filter(|(_, _, cur)| *cur)
+                .map(|(id, _, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![b],
+            "the just-saved view is the current tab"
+        );
+
+        // Pick view A from the View menu: the canvas becomes A's — ONE matrix.
+        let ctx = egui::Context::default();
+        app.run_command(&ctx, Command::OpenView(0));
+        app.sync_axis_state();
+        assert_eq!(app.matrix_count(), 1, "Canvas A has one matrix");
+        assert_eq!(app.matrices[0].measure, Some(MeasureId(101)));
+        assert!(
+            app.document_tabs()
+                .iter()
+                .any(|(id, _, cur)| *id == a && *cur),
+            "tab A is now current"
+        );
+
+        // Pick view B: two matrices again, with the pivot B was saved with.
+        app.run_command(&ctx, Command::OpenView(1));
+        app.sync_axis_state();
+        assert_eq!(app.matrix_count(), 2, "Canvas B has two matrices");
+        assert_eq!(
+            app.matrices[1].row_cats(&app.model),
+            vec![CategoryId(2)],
+            "B's second matrix came back pivoted"
+        );
+
+        // An unknown id is a no-op, not a panic or an empty canvas.
+        let before = app.matrix_count();
+        app.open_view(ViewId(999));
+        assert_eq!(app.matrix_count(), before);
+        app.run_command(&ctx, Command::OpenView(99));
+        assert_eq!(app.matrix_count(), before, "a stale menu index is a no-op");
+    }
+
+    // -- Application menu (docs/reviews/2026-10-03-nextstep-visual-spec.md §4.1)
+
+    #[test]
+    fn menu_undo_restores_an_edited_cell() {
+        let mut app = build_app(grid_2x2_model());
+        let (qkey, _) = q_and_rev_keys();
+        let ctx = egui::Context::default();
+        assert!(!app.command_enabled(Command::Undo), "nothing to undo yet");
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(200.0))
+            .expect("edit");
+        assert!(app.command_enabled(Command::Undo));
+        app.run_command(&ctx, Command::Undo);
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("100"));
+        assert!(app.command_enabled(Command::Redo));
+        app.run_command(&ctx, Command::Redo);
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn menu_adds_and_removes_matrices() {
+        let mut app = build_app(grid_2x2_model());
+        let ctx = egui::Context::default();
+        assert!(
+            !app.command_enabled(Command::RemoveMatrix),
+            "keep the last one"
+        );
+        app.run_command(&ctx, Command::AddMatrix);
+        assert_eq!(app.matrix_count(), 2);
+        assert!(app.command_enabled(Command::RemoveMatrix));
+        app.run_command(&ctx, Command::RemoveMatrix);
+        assert_eq!(app.matrix_count(), 1);
+    }
+
+    #[test]
+    fn menu_saves_a_view_and_toggles_panels() {
+        let mut app = build_app(grid_2x2_model());
+        let ctx = egui::Context::default();
+        app.run_command(&ctx, Command::SaveView);
+        assert_eq!(app.model.views.len(), 1);
+        assert_eq!(app.document_tabs()[0].1, "view 1");
+        assert!(app.document_tabs()[0].2, "the saved view is current");
+
+        assert!(!app.show_inspector, "the Info panel opens on demand");
+        app.run_command(&ctx, Command::InfoPanel);
+        assert!(app.show_inspector);
+        app.run_command(&ctx, Command::InfoPanel);
+        assert!(!app.show_inspector);
+
+        app.run_command(&ctx, Command::NewGraph);
+        assert!(app.show_chart);
+        app.run_command(&ctx, Command::NewGraph);
+        assert!(
+            app.show_chart,
+            "New Graph brings the window back, never closes it"
+        );
+        app.run_command(&ctx, Command::ToggleCsv);
+        assert!(app.show_csv_wizard);
+    }
+
+    /// One frame of [`ImprovApp::handle_command_keys`] with Ctrl/Cmd+`key`
+    /// pressed, and `focus` (an egui id) holding keyboard focus if given.
+    fn press_command_key(
+        app: &mut ImprovApp,
+        key: egui::Key,
+        focus: Option<&str>,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        command_key_frame(&ctx, app, key, focus)
+    }
+
+    /// One frame of a Ctrl/Cmd+`key` press on `ctx` through
+    /// `handle_command_keys`. egui flags it a repeat while `key` is still down
+    /// from an earlier frame on the same context.
+    fn command_key_frame(
+        ctx: &egui::Context,
+        app: &mut ImprovApp,
+        key: egui::Key,
+        focus: Option<&str>,
+    ) -> egui::FullOutput {
+        let raw = egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::COMMAND),
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+            ],
+            ..Default::default()
+        };
+        ctx.test_pass(raw, |ctx| {
+            if let Some(id) = focus {
+                ctx.memory_mut(|m| m.request_focus(egui::Id::unique(id)));
+            }
+            app.handle_command_keys(ctx);
+        })
+    }
+
+    /// Whether `out` asks the window to close.
+    fn closes(out: &egui::FullOutput) -> bool {
+        out.viewport_output
+            .values()
+            .any(|v| v.commands.contains(&egui::ViewportCommand::Close))
+    }
+
+    /// An in-memory model has no store: Ctrl+S must not report "saved model".
+    /// It asks for a path instead (H1-7).
+    #[test]
+    fn ctrl_s_on_an_in_memory_model_does_not_claim_saved() {
+        let mut app = build_app(grid_2x2_model());
+        assert!(app.db.is_empty());
+        assert!(app.command_enabled(Command::SaveModel));
+        assert!(!app.command_enabled(Command::RevertToSaved));
+        let _ = press_command_key(&mut app, egui::Key::S, None);
+        assert_ne!(app.status, "saved model");
+        assert_eq!(app.file_panel, Some(Command::SaveAs));
+    }
+
+    /// H1-7: File ▸ Save on an in-memory model asks for a path, writes the
+    /// model there and switches to it: the title names the file, later edits
+    /// autosave to it, undo still works, and Quit no longer warns. Save As
+    /// does the same from a stored model, and refuses a store that holds one.
+    #[test]
+    fn save_writes_an_in_memory_model_to_a_new_file() {
+        let (db, other) = (temp_db("h1_7_saved"), temp_db("h1_7_other"));
+        let _cleanup = (Cleanup(db.clone()), Cleanup(other.clone()));
+        let mut app = build_app(grid_2x2_model());
+        let k: CoordKey = improv_engine::smallvec::smallvec![(1, 10), (2, 20)];
+        app.set_cell(MeasureId(101), k.clone(), Value::Number(7.0))
+            .expect("an in-memory edit");
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        app.run_command(&ctx, Command::SaveModel);
+        assert_eq!(app.file_panel, Some(Command::SaveAs));
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        let shapes = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0).shapes;
+        assert!(text_at(&shapes, "Save As").is_some(), "the panel's title");
+        assert!(text_at(&shapes, "The in-memory model's edits will be lost.").is_none());
+        focused_frame(
+            &ctx,
+            &mut app,
+            "file_path",
+            vec![egui::Event::Text(db.clone())],
+        );
+        focused_frame(&ctx, &mut app, "file_path", vec![enter()]);
+        assert_eq!(app.status, format!("saved to {db}"));
+        assert_eq!((app.db.as_str(), app.file_panel), (db.as_str(), None));
+        assert!(!app.dirty && app.can_undo());
+        assert!(app.native_title().ends_with(&app.file_name().to_owned()));
+        let stored = || {
+            Store::open(&db)
+                .and_then(|mut s| s.load_model())
+                .expect("reload")
+        };
+        assert_eq!(stored(), *app.model, "the whole model, cells and all");
+        app.set_cell(MeasureId(101), k.clone(), Value::Number(8.0))
+            .expect("an autosaved edit");
+        assert_eq!(
+            stored().input(MeasureId(101), &decode(&k)),
+            Some(&Value::Number(8.0))
+        );
+        app.undo().expect("undo");
+        assert_eq!(
+            stored().input(MeasureId(101), &decode(&k)),
+            Some(&Value::Number(7.0))
+        );
+        assert!(app.quit_allowed(), "nothing to lose now");
+
+        // Save As onto a store holding a model is refused; the panel stays.
+        app.run_command(&ctx, Command::SaveAs);
+        app.file_path = db.clone();
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        app.db = other.clone();
+        focused_frame(&ctx, &mut app, "file_path", vec![enter()]);
+        assert!(
+            app.status.contains("already holds a model"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.file_panel, Some(Command::SaveAs));
+        app.db = db.clone();
+        assert_eq!(
+            app.save_as(""),
+            Err("type a model file or postgres:// URL".into())
+        );
+        assert_eq!(app.save_as(&db), Ok(()), "the current store just saves");
+        assert_eq!(app.save_as(&other), Ok(()));
+        assert_eq!(app.db, other);
+        assert_eq!(
+            Store::open(&other)
+                .and_then(|mut s| s.load_model())
+                .expect("reload"),
+            *app.model
+        );
+        let dir = std::env::temp_dir().join("improv-no-such-dir").join("m.db");
+        let err = app
+            .save_as(&dir.to_string_lossy())
+            .expect_err("no such directory");
+        assert!(err.starts_with("save failed"), "{err}");
+        assert_eq!(app.db, other, "a failed Save As changes nothing");
+    }
+
+    /// Quitting an edited in-memory model takes two Quits; any other command
+    /// in between disarms the first. A clean model quits at once.
+    #[test]
+    fn quit_on_an_unsaved_in_memory_model_needs_confirming() {
+        let mut app = build_app(grid_2x2_model());
+        assert!(closes(&press_command_key(&mut app, egui::Key::Q, None)));
+
+        app.record_history((*app.model).clone());
+        assert!(!closes(&press_command_key(&mut app, egui::Key::Q, None)));
+        assert_eq!(app.status, "unsaved in-memory model: Quit again to discard");
+        assert!(closes(&press_command_key(&mut app, egui::Key::Q, None)));
+
+        app.quit_armed = false;
+        assert!(!closes(&press_command_key(&mut app, egui::Key::Q, None)));
+        let _ = press_command_key(&mut app, egui::Key::H, None);
+        assert!(
+            !closes(&press_command_key(&mut app, egui::Key::Q, None)),
+            "Hide disarmed it"
+        );
+    }
+
+    /// The native title names the document; an in-memory edit adds ` •`.
+    #[test]
+    fn native_title_marks_an_unsaved_in_memory_edit() {
+        let title = |out: &egui::FullOutput| {
+            out.viewport_output.values().find_map(|v| {
+                v.commands.iter().find_map(|c| match c {
+                    egui::ViewportCommand::Title(t) => Some(t.clone()),
+                    _ => None,
+                })
+            })
+        };
+        let mut app = build_app(grid_2x2_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let size = egui::vec2(1400.0, 900.0);
+        let out = full_frame(&ctx, &mut app, size, 0.0);
+        assert_eq!(title(&out).as_deref(), Some("Improv \u{2014} Untitled"));
+        let out = full_frame(&ctx, &mut app, size, 0.1);
+        assert_eq!(title(&out), None, "an unchanged title is not resent");
+
+        app.record_history((*app.model).clone());
+        let out = full_frame(&ctx, &mut app, size, 0.2);
+        let t = title(&out).expect("the edit retitles the window");
+        assert!(t.ends_with(" \u{2022}"), "{t}");
+    }
+
+    /// Ctrl+S saves the model to its store; a text field's focus blocks it.
+    #[test]
+    fn ctrl_s_saves_the_model_unless_a_field_has_focus() {
+        let db = temp_db("ctrl_s");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed the store");
+        let mut app = ImprovApp::load(&db).expect("load");
+        Arc::make_mut(&mut app.model)
+            .measures
+            .get_mut(&MeasureId(101))
+            .expect("Quantity")
+            .description = Some("saved by ctrl+s".into());
+        let described = |db: &str| {
+            ImprovApp::load(db).expect("reload").model.measures[&MeasureId(101)]
+                .description
+                .clone()
+        };
+
+        let _ = press_command_key(&mut app, egui::Key::S, Some("formula_edit"));
+        assert_eq!(described(&db), None, "Ctrl+S fired while typing in a field");
+        let _ = press_command_key(&mut app, egui::Key::S, None);
+        assert_eq!(app.status, "saved model");
+        assert_eq!(described(&db).as_deref(), Some("saved by ctrl+s"));
+    }
+
+    /// The menu opens on the workspace, clear of the first worksheet's title.
+    #[test]
+    fn menu_starts_on_the_workspace() {
+        let mut app = build_app(grid_2x2_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        let menu = ctx
+            .memory(|m| m.area_rect(menu::menu_id()))
+            .expect("menu shown");
+        assert!(menu.top() >= 0.0, "{menu:?}");
+        let win = win_rect(&ctx, &app, 0);
+        let title = egui::Rect::from_min_size(win.min, egui::vec2(win.width(), 23.0));
+        assert!(!menu.intersects(title), "{menu:?} over {title:?}");
+    }
+
+    /// Holding Ctrl+S saves once: the auto-repeat events that follow are
+    /// ignored, so a later edit isn't written by them.
+    #[test]
+    fn ctrl_s_auto_repeat_does_not_save_again() {
+        let db = temp_db("ctrl_s_repeat");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed the store");
+        let mut app = ImprovApp::load(&db).expect("load");
+        let ctx = egui::Context::default();
+        let _ = command_key_frame(&ctx, &mut app, egui::Key::S, None);
+        assert_eq!(app.status, "saved model");
+        app.status.clear();
+        Arc::make_mut(&mut app.model)
+            .measures
+            .get_mut(&MeasureId(101))
+            .expect("Quantity")
+            .description = Some("edited after the save".into());
+        // S is still down: egui delivers this press as an auto-repeat.
+        let _ = command_key_frame(&ctx, &mut app, egui::Key::S, None);
+        assert_eq!(app.status, "", "a repeat ran Save");
+        let reloaded = ImprovApp::load(&db).expect("reload");
+        assert_eq!(reloaded.model.measures[&MeasureId(101)].description, None);
+    }
+
+    /// The menu is drawn by a whole-app frame, over the panels, and a selected
+    /// list row (the browser's measure) gets a white face, unlike a hovered
+    /// one, which stays on the panel gray.
+    #[test]
+    fn selected_list_rows_have_a_white_face() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut shapes = Vec::new();
+        for i in 0..6 {
+            shapes = full_frame(
+                &ctx,
+                &mut app,
+                egui::vec2(1280.0, 800.0),
+                f64::from(i) / 60.0,
+            )
+            .shapes;
+        }
+        let text_rect = |label: &str| {
+            shapes.iter().find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == label => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                _ => None,
+            })
+        };
+        let fill_under = |label: &str| {
+            let r = text_rect(label).unwrap_or_else(|| panic!("{label:?} not drawn"));
+            // The row's own face is the tightest rect behind its text (the
+            // panel, and the floating menu where it overlaps, are larger).
+            shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Rect(s) if s.rect.contains_rect(r) => {
+                        Some((s.rect.area(), s.fill))
+                    }
+                    _ => None,
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, fill)| fill)
+        };
+        assert_eq!(fill_under("Quantity"), Some(crate::theme::WHITE));
+        assert_ne!(fill_under("Price"), Some(crate::theme::WHITE));
+        assert!(text_rect("Worksheet").is_some(), "the menu is drawn");
+    }
+
+    /// A unique temp-db path for a store-backed test.
+    fn temp_db(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "improv_gui_{tag}_{}_{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Delete a temp db when the test ends, pass or panic.
+    struct Cleanup(String);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// One whole-app frame on `ctx` with `id` focused, delivering `events`.
+    fn focused_frame(ctx: &egui::Context, app: &mut ImprovApp, id: &str, events: Vec<egui::Event>) {
+        ctx.memory_mut(|m| m.request_focus(egui::Id::unique(id)));
+        let _ = full_frame_with(ctx, app, egui::vec2(1200.0, 800.0), 0.0, events, |_| ());
+    }
+
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// The formula list's last line adds a measure from `Name = formula`.
+    #[test]
+    fn typing_name_equals_formula_adds_a_measure() {
+        let mut app = build_app(revenue_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        let text = egui::Event::Text("Margin = Revenue - 1".into());
+        focused_frame(&ctx, &mut app, "formula_new", vec![text]);
+        focused_frame(&ctx, &mut app, "formula_new", vec![enter()]);
+        let (&id, _) = app
+            .model
+            .measures
+            .iter()
+            .find(|(_, m)| m.name.0 == "Margin")
+            .unwrap_or_else(|| panic!("Margin not added: {}", app.status));
+        assert_eq!(app.status, "added Margin");
+        assert_eq!(app.selected(), Some(id));
+        assert!(app.new_formula_line.is_empty());
+        assert_eq!(
+            app.values_for(id).get([(1, 10), (2, 20)].as_slice()),
+            Some(&69.0)
+        );
+    }
+
+    fn key_event(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// F1 opens the function help, even from a formula edit; a search
+    /// filters it, and Insert puts `NAME(` into that edit at its caret and
+    /// gives it the keyboard back.
+    #[test]
+    fn the_function_help_inserts_at_the_caret() {
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(102));
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        app.formula_buf = "Price * ".into();
+        set_caret(&ctx, egui::Id::unique("formula_edit"), &app.formula_buf, 8);
+        focused_frame(
+            &ctx,
+            &mut app,
+            "formula_edit",
+            vec![key_event(egui::Key::F1)],
+        );
+        assert!(app.fn_help.open, "F1 opened it");
+        assert_eq!(app.formula_target, FormulaEditor::Row);
+        // The search line has focus: type into it.
+        let size = egui::vec2(1200.0, 800.0);
+        let _ = full_frame(&ctx, &mut app, size, 0.1);
+        let out = full_frame_with(
+            &ctx,
+            &mut app,
+            size,
+            0.2,
+            vec![egui::Event::Text("pmt".into())],
+            |_| (),
+        );
+        assert_eq!(app.fn_help.query, "pmt");
+        assert_eq!(app.fn_help.selected.map(|d| d.name), Some("PMT"));
+        let texts = texts_of(&out);
+        assert!(texts.iter().any(|t| t == "Financial"), "{texts:?}");
+        assert!(texts
+            .iter()
+            .any(|t| t == "PMT(rate, nper, pv, [fv=0], [type=0])"));
+        let insert = painted(&out.shapes, "Insert")
+            .expect("Insert shown")
+            .center();
+        let mut t = 0.3;
+        for e in [
+            vec![egui::Event::PointerMoved(insert)],
+            vec![press(insert, true)],
+            vec![press(insert, false)],
+        ] {
+            let _ = full_frame_with(&ctx, &mut app, size, t, e, |_| ());
+            t += 0.1;
+        }
+        assert_eq!(app.formula_buf, "Price * PMT(");
+        let id = egui::Id::unique("formula_edit");
+        assert_eq!(caret_byte(&ctx, id, &app.formula_buf), 12);
+        let _ = full_frame(&ctx, &mut app, size, t);
+        assert!(ctx.memory(|m| m.has_focus(id)), "the edit has the keyboard");
+        // Help ▸ Functions… closes it again.
+        app.run_command(&ctx, Command::FunctionHelp);
+        assert!(!app.fn_help.open);
+    }
+
+    /// One frame on `ctx` with the formula editor `id` focused, delivering
+    /// `events`; the output.
+    fn edit_frame(
+        ctx: &egui::Context,
+        app: &mut ImprovApp,
+        id: &str,
+        t: &mut f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        *t += 0.05;
+        // Only when it is not focused: a fresh request resets the edit's
+        // key filter, as a click would, and Tab would move the focus.
+        let id = egui::Id::unique(id);
+        if !ctx.memory(|m| m.has_focus(id)) {
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
+        full_frame_with(ctx, app, egui::vec2(1200.0, 800.0), *t, events, |_| ())
+    }
+
+    /// Typing `PM` in a formula editor offers PMT with its signature, the
+    /// rest trails the caret as ghost text, and Tab makes it `PMT(` with
+    /// the caret after the `(`; inside the call the tooltip marks the
+    /// argument. Up/Down move the selection, Esc closes the list, and with
+    /// it closed Enter commits.
+    #[test]
+    fn typing_pm_then_tab_completes_pmt() {
+        let mut app = build_app(revenue_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut t = 0.0;
+        for id in ["formula_new", "formula_edit"] {
+            select(&mut app, MeasureId(102));
+            let _ = edit_frame(&ctx, &mut app, id, &mut t, Vec::new());
+            let prefix = if id == "formula_new" { "X = " } else { "" };
+            let text = format!("{prefix}PM");
+            let buf = |app: &ImprovApp| {
+                if id == "formula_new" {
+                    app.new_formula_line.clone()
+                } else {
+                    app.formula_buf.clone()
+                }
+            };
+            if id == "formula_edit" {
+                app.formula_buf.clear();
+            }
+            let _ = edit_frame(
+                &ctx,
+                &mut app,
+                id,
+                &mut t,
+                vec![egui::Event::Text(text.clone())],
+            );
+            let out = edit_frame(&ctx, &mut app, id, &mut t, Vec::new());
+            let texts = texts_of(&out);
+            assert_eq!(buf(&app), text);
+            for want in [
+                "PMT(rate, nper, pv, [fv=0], [type=0])",
+                "T(rate, nper, pv, [fv=0], [type=0])",
+            ] {
+                assert!(
+                    texts.iter().any(|s| s == want),
+                    "{id}: no {want:?} in {texts:?}"
+                );
+            }
+            let _ = edit_frame(&ctx, &mut app, id, &mut t, vec![key_event(egui::Key::Tab)]);
+            assert_eq!(buf(&app), format!("{prefix}PMT("), "{id}");
+            let eid = egui::Id::unique(id);
+            assert_eq!(caret_byte(&ctx, eid, &buf(&app)), prefix.len() + 4);
+            assert!(ctx.memory(|m| m.has_focus(eid)), "{id}: Tab kept the focus");
+            // In the call: the ghost of what is left and the signature.
+            let typed = egui::Event::Text("0.05, ".into());
+            let _ = edit_frame(&ctx, &mut app, id, &mut t, vec![typed]);
+            let out = edit_frame(&ctx, &mut app, id, &mut t, Vec::new());
+            let texts = texts_of(&out);
+            assert!(
+                texts.iter().any(|s| s == "nper, pv, [fv=0], [type=0])"),
+                "{texts:?}"
+            );
+            assert!(texts
+                .iter()
+                .any(|s| s == "PMT(rate, nper, pv, [fv=0], [type=0])"));
+        }
+
+        // Up/Down select, Esc closes and Enter then commits.
+        select(&mut app, MeasureId(102));
+        app.formula_buf.clear();
+        let id = "formula_edit";
+        let _ = edit_frame(
+            &ctx,
+            &mut app,
+            id,
+            &mut t,
+            vec![egui::Event::Text("Qua".into())],
+        );
+        let _ = edit_frame(
+            &ctx,
+            &mut app,
+            id,
+            &mut t,
+            vec![key_event(egui::Key::Enter)],
+        );
+        assert_eq!(
+            app.formula_buf, "Quantity",
+            "Enter accepts while the list is up"
+        );
+        assert_eq!(app.status, "", "and does not commit");
+        let typed = egui::Event::Text(" * S".into());
+        let _ = edit_frame(&ctx, &mut app, id, &mut t, vec![typed]);
+        let _ = edit_frame(
+            &ctx,
+            &mut app,
+            id,
+            &mut t,
+            vec![key_event(egui::Key::ArrowDown)],
+        );
+        let _ = edit_frame(
+            &ctx,
+            &mut app,
+            id,
+            &mut t,
+            vec![key_event(egui::Key::ArrowUp)],
+        );
+        let _ = edit_frame(
+            &ctx,
+            &mut app,
+            id,
+            &mut t,
+            vec![key_event(egui::Key::ArrowDown)],
+        );
+        let _ = edit_frame(
+            &ctx,
+            &mut app,
+            id,
+            &mut t,
+            vec![key_event(egui::Key::Escape)],
+        );
+        assert_eq!(app.formula_buf, "Quantity * S", "Esc only closed the list");
+        let second = crate::completion::offer(&app.model, "Quantity * S", 12)[1]
+            .insert
+            .clone();
+        let _ = edit_frame(
+            &ctx,
+            &mut app,
+            id,
+            &mut t,
+            vec![key_event(egui::Key::Backspace)],
+        );
+        let typed = egui::Event::Text("S".into());
+        let _ = edit_frame(&ctx, &mut app, id, &mut t, vec![typed]);
+        let _ = edit_frame(
+            &ctx,
+            &mut app,
+            id,
+            &mut t,
+            vec![key_event(egui::Key::ArrowDown)],
+        );
+        let _ = edit_frame(&ctx, &mut app, id, &mut t, vec![key_event(egui::Key::Tab)]);
+        assert_eq!(
+            app.formula_buf,
+            format!("Quantity * {second}"),
+            "Down chose the second"
+        );
+        app.formula_buf = "Quantity * 2".into();
+        let _ = edit_frame(
+            &ctx,
+            &mut app,
+            id,
+            &mut t,
+            vec![key_event(egui::Key::Enter)],
+        );
+        assert_eq!(app.status, "formula updated");
+    }
+
+    /// A bad `Name = formula` line keeps its text, and its error is located
+    /// in the line (past `Name = `) and explained, under it.
+    #[test]
+    fn the_new_formula_line_errors_inline() {
+        let mut app = build_app(revenue_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        let line = "Margin = Prise - 1";
+        let text = egui::Event::Text(line.into());
+        focused_frame(&ctx, &mut app, "formula_new", vec![text]);
+        focused_frame(&ctx, &mut app, "formula_new", vec![enter()]);
+        let d = app.new_formula_error.clone().expect("an inline error");
+        assert_eq!(d.span.map(|r| &line[r]), Some("Prise"));
+        assert_eq!(d.hint.as_deref(), Some("did you mean Price?"));
+        assert_eq!(app.new_formula_line, line, "the text is kept");
+        // The error lines scroll into view (egui animates the scroll).
+        let mut out = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        for t in 1..20 {
+            out = full_frame(
+                &ctx,
+                &mut app,
+                egui::vec2(1200.0, 800.0),
+                f64::from(t) / 10.0,
+            );
+        }
+        let texts = texts_of(&out);
+        assert!(
+            texts.iter().any(|t| t == "did you mean Price?"),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "⚠ unknown measure: Prise"));
+        // A compile error is placed at the measure it names; typing clears it.
+        // (Frames run on from the scroll's time: egui 0.37 drops input
+        // whose time runs backwards.)
+        let at = |ctx: &egui::Context, app: &mut ImprovApp, t: f64, ev: Vec<egui::Event>| {
+            ctx.memory_mut(|m| m.request_focus(egui::Id::unique("formula_new")));
+            let _ = full_frame_with(ctx, app, egui::vec2(1200.0, 800.0), t, ev, |_| ());
+        };
+        app.new_formula_line = "Margin = Quantity + LEN(Price)".into();
+        at(&ctx, &mut app, 3.0, Vec::new());
+        at(&ctx, &mut app, 3.1, vec![enter()]);
+        let d = app.new_formula_error.clone().expect("an inline error");
+        assert_eq!(d.span.map(|r| &app.new_formula_line[r]), Some("LEN"));
+        at(&ctx, &mut app, 3.2, vec![egui::Event::Text("x".into())]);
+        assert_eq!(app.new_formula_error, None);
+    }
+
+    /// H1-8: after a failed commit, in either formula editor, the keyboard
+    /// stays in the field with the caret at the error: the next keys fix
+    /// the formula, and `n` does not switch the worksheet's measure.
+    #[test]
+    fn a_failed_formula_keeps_the_keyboard_at_the_error() {
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(102));
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let size = egui::vec2(1200.0, 800.0);
+        let mut t = 0.0;
+        let mut frame = |app: &mut ImprovApp, focus: Option<&str>, ev: Vec<egui::Event>| {
+            if let Some(id) = focus {
+                ctx.memory_mut(|m| m.request_focus(egui::Id::unique(id)));
+            }
+            t += 0.1;
+            let _ = full_frame_with(&ctx, app, size, t, ev, |_| ());
+        };
+        let n = || vec![key_event(egui::Key::N), egui::Event::Text("n".into())];
+        frame(&mut app, None, Vec::new());
+        app.formula_buf = "Prise * Quantity".into();
+        frame(&mut app, Some("formula_edit"), vec![enter()]);
+        assert!(app.formula_error.is_some(), "{}", app.status);
+        frame(&mut app, None, n());
+        assert_eq!(app.selected(), Some(MeasureId(102)), "n stayed in the row");
+        assert_eq!(app.formula_buf, "nPrise * Quantity", "typed at the error");
+
+        let line = "Margin = Revenue - Cots";
+        frame(
+            &mut app,
+            Some("formula_new"),
+            vec![egui::Event::Text(line.into())],
+        );
+        frame(&mut app, Some("formula_new"), vec![enter()]);
+        assert!(app.new_formula_error.is_some(), "{}", app.status);
+        frame(&mut app, None, n());
+        assert_eq!(app.selected(), Some(MeasureId(102)), "n stayed in the line");
+        assert_eq!(app.new_formula_line, "Margin = Revenue - nCots");
+        // A refusal with no place puts the caret at the end.
+        app.new_formula_line = "no equals sign".into();
+        frame(&mut app, Some("formula_new"), vec![enter()]);
+        assert_eq!(app.status, "type Name = formula");
+        frame(&mut app, None, n());
+        assert_eq!(app.new_formula_line, "no equals signn");
+    }
+
+    /// The selected row is the editor: Enter commits a good formula, and a
+    /// bad one errors inline and leaves the model alone.
+    #[test]
+    fn editing_the_selected_row_commits_and_errors_inline() {
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(102));
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        assert_eq!(app.formula_buf, "Price * Quantity");
+        app.formula_buf = "Price + Quantity".into();
+        focused_frame(&ctx, &mut app, "formula_edit", vec![enter()]);
+        assert_eq!(app.status, "formula updated");
+        let key: CoordKey = improv_engine::smallvec::smallvec![(1, 10), (2, 20)];
+        assert_eq!(app.values_for(MeasureId(102)).get(&key), Some(&17.0));
+        let before = app.model.measures[&MeasureId(102)].kind.clone();
+        app.formula_buf = "Price *".into();
+        focused_frame(&ctx, &mut app, "formula_edit", vec![enter()]);
+        assert!(app.formula_error.is_some(), "{}", app.status);
+        assert_eq!(app.model.measures[&MeasureId(102)].kind, before);
+    }
+
+    /// No formula bar across the top: the workspace starts at the menu.
+    #[test]
+    fn no_top_formula_bar() {
+        let mut app = build_app(revenue_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        assert!(
+            egui::containers::panel::PanelState::load(&ctx, egui::Id::unique("formula_bar"))
+                .is_none()
+        );
+    }
+
+    // -- branch coverage: pure Matrix / app logic ---------------------------
+
+    #[test]
+    fn from_placement_restores_valid_page_pins_and_ignores_stale_ones() {
+        let model = sales_3d_model();
+        let (region, south) = (CategoryId(3), ItemId(31));
+        let mut p = MatrixPlacement::new(MeasureId(200));
+        p.page_items = vec![(region, south)];
+        let m = Matrix::from_placement(&model, &p).expect("measure exists");
+        // An empty saved order falls back to the measure's natural order.
+        assert_eq!(m.axis_order, vec![CategoryId(1), CategoryId(2), region]);
+        assert_eq!(m.page_idx, vec![1], "South is the second Region item");
+        for stale in [(region, ItemId(999)), (CategoryId(9), south)] {
+            p.page_items = vec![stale];
+            let m = Matrix::from_placement(&model, &p).unwrap();
+            assert_eq!(m.page_idx, vec![0], "{stale:?} falls back to the first");
+        }
+        p.axis_order = vec![region, CategoryId(2), CategoryId(1)];
+        let m = Matrix::from_placement(&model, &p).unwrap();
+        assert_eq!(m.page_cats(&model), vec![CategoryId(1)]);
+        assert!(Matrix::from_placement(&model, &MatrixPlacement::new(MeasureId(9))).is_none());
+    }
+
+    #[test]
+    fn axis_and_page_ops_ignore_what_the_matrix_cannot_address() {
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        let before = app.focused().axis_order.clone();
+        app.set_axis(CategoryId(77), Axis::Rows);
+        assert_eq!(app.focused().axis_order, before, "not a dimension: no-op");
+
+        app.set_page(5, 0); // no such page dimension
+        assert_eq!(app.focused().page_idx, vec![0]);
+        app.focused_mut().page_idx.clear(); // stale length is resized
+        app.set_page(0, 1);
+        assert_eq!(app.focused().page_idx, vec![1]);
+
+        hide_all_items(&mut app, CategoryId(3)); // the page has no item
+        app.set_page(0, 0);
+        app.page_first(1);
+        assert_eq!(app.focused().page_idx, vec![1], "nothing to page to");
+        assert!(app.focused().selection_keys(&app.model).is_empty());
+
+        // A matrix with no categories at all has nothing to pivot or page.
+        let model = Model::new();
+        let mut m = Matrix::new(&model, None);
+        m.pivot_rotate(&model);
+        m.page_first(&model, 1);
+        assert!(m.axis_order.is_empty() && m.page_idx.is_empty());
+    }
+
+    #[test]
+    fn a_filter_holding_a_stale_item_is_kept_even_at_full_length() {
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        let region = CategoryId(3);
+        app.focused_mut().filters = vec![Filter {
+            category: region,
+            items: vec![ItemId(999)],
+        }];
+        app.toggle_filter_item(region, ItemId(30));
+        // Two items like the category, but not ITS two: still a filter.
+        assert_eq!(
+            app.focused().filters[0].items,
+            vec![ItemId(999), ItemId(30)]
+        );
+    }
+
+    #[test]
+    fn a_scalar_row_axis_still_addresses_the_cursor_cell() {
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(100)); // Price[Product]
+        app.sync_axis_state();
+        app.set_axis(CategoryId(2), Axis::Columns);
+        assert!(app.row_cats().is_empty());
+        assert_eq!(
+            app.cursor_key(),
+            Some(improv_engine::smallvec::smallvec![(2, 20)])
+        );
+    }
+
+    #[test]
+    fn matrix_list_guards_and_an_empty_canvas() {
+        let mut app = ImprovApp::load("").expect("in-memory model");
+        assert!(app.model.measures.is_empty());
+        assert_eq!(app.save_view("v"), None, "no measure: nothing to save");
+        app.begin_edit_cursor();
+        app.cycle_measure(1);
+        assert_eq!(
+            (app.selected(), app.focused().editing.clone()),
+            (None, None)
+        );
+
+        let mut app = build_app(revenue_model());
+        app.add_matrix(Some(MeasureId(100)));
+        assert!(!app.remove_matrix(5));
+        assert_eq!(app.matrix_count(), 2);
+        app.matrices.clear();
+        app.sync_axis_state();
+        assert_eq!(app.matrix_count(), 1, "the canvas is never empty");
+    }
+
+    #[test]
+    fn blank_view_name_and_no_op_formula_toggles_leave_no_undo_point() {
+        let mut app = build_app(revenue_model());
+        assert_eq!(app.save_view("  "), None);
+        assert_eq!(app.status, "view name is required");
+        app.set_formula_enabled(MeasureId(100), false).unwrap(); // an input
+        app.set_formula_enabled(MeasureId(102), true).unwrap(); // already on
+        assert!(!app.can_undo());
+        app.undo_with_status();
+        assert_eq!(app.status, "nothing to undo");
+        app.redo_with_status();
+        assert_eq!(app.status, "nothing to redo");
+    }
+
+    #[test]
+    fn csv_wizard_keeps_a_typed_measure_id() {
+        let mut app = build_app(revenue_model());
+        app.import_form.measure_id = "42".into();
+        app.toggle_csv_wizard();
+        assert!(app.show_csv_wizard);
+        assert_eq!(app.import_form.measure_id, "42");
+        app.toggle_csv_wizard();
+        assert!(!app.show_csv_wizard);
+    }
+
+    #[test]
+    fn quit_warns_once_only_for_an_edited_in_memory_model() {
+        let mut app = build_app(revenue_model());
+        assert!(app.quit_allowed(), "nothing to lose");
+        app.undo_stack
+            .push(Step::Model(Box::new((*app.model).clone())));
+        app.db = "/some/file.db".into();
+        assert!(app.quit_allowed(), "a file-backed model is saved");
+        app.db.clear();
+        assert!(!app.quit_allowed());
+        assert!(app.status.contains("Quit again"));
+        assert!(app.quit_allowed(), "the second Quit closes");
+    }
+
+    #[test]
+    fn literals_without_a_dsl_token_are_refused() {
+        assert_eq!(literal_dsl(&Value::Number(f64::INFINITY)), None);
+        assert_eq!(literal_dsl(&Value::Number(-1.0)), None);
+        assert_eq!(literal_dsl(&Value::Number(1e-10)).as_deref(), Some("1e-10"));
+        assert_eq!(
+            literal_dsl(&Value::Boolean(false)).as_deref(),
+            Some("FALSE")
+        );
+        // A `"` is doubled, and parses back to itself.
+        let quoted = literal_dsl(&Value::Text("say \"hi\"".into())).unwrap();
+        assert_eq!(quoted, "\"say \"\"hi\"\"\"");
+        assert_eq!(
+            parser::parse_expr(&Model::new(), &quoted).unwrap().expr,
+            Expr::Literal(Value::Text("say \"hi\"".into()))
+        );
+        assert_eq!(literal_dsl(&Value::Text("a\\b".into())), None);
+        assert_eq!(
+            literal_dsl(&Value::Text("ok".into())).as_deref(),
+            Some("\"ok\"")
+        );
+        // A literal of the wrong type is no boolean.
+        let en = improv_core_model::Locale::en();
+        assert!(parse_typed(&Model::new(), &en, ValueType::Boolean, "1").is_err());
+    }
+
+    #[test]
+    fn view_descriptions_name_rows_columns_and_pages() {
+        let app = build_app(revenue_model());
+        let mut v = View::from_matrices(
+            ViewId(1),
+            Name("v".into()),
+            MatrixPlacement::new(MeasureId(101)),
+            vec![],
+        );
+        assert_eq!(app.view_description(&v), "Quantity by Time \u{d7} Product");
+        v.n_rows = 0;
+        v.n_cols = 0;
+        assert_eq!(app.view_description(&v), "Quantity; pages: Time, Product");
+        v.measure = MeasureId(999);
+        assert_eq!(app.view_description(&v), "v: measure no longer exists");
+    }
+
+    // -- branch coverage: UI paths ------------------------------------------
+
+    /// One frame delivering `key` (held with `modifiers`) to the focused
+    /// matrix's `handle_grid_keys`.
+    fn grid_key(app: &mut ImprovApp, key: egui::Key, modifiers: egui::Modifiers) {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        };
+        let mi = app.focus_index();
+        let _ = ctx.test_ui(raw, |ctx_ui| {
+            egui::CentralPanel::default().show(ctx_ui, |ui| app.handle_grid_keys(ui, mi));
+        });
+    }
+
+    #[test]
+    fn every_grid_key_binding_moves_edits_pages_or_cycles() {
+        use egui::{Key, Modifiers as M};
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        let cur = |app: &ImprovApp| (app.focused().cursor_row, app.focused().cursor_col);
+        for (k, want) in [
+            (Key::J, (1, 0)),
+            (Key::K, (0, 0)),
+            (Key::L, (0, 1)),
+            (Key::H, (0, 0)),
+            (Key::ArrowDown, (1, 0)),
+            (Key::ArrowRight, (1, 1)),
+            (Key::ArrowUp, (0, 1)),
+            (Key::ArrowLeft, (0, 0)),
+        ] {
+            grid_key(&mut app, k, M::NONE);
+            assert_eq!(cur(&app), want, "{k:?}");
+        }
+        grid_key(&mut app, Key::J, M::COMMAND);
+        assert_eq!(cur(&app), (0, 0), "a chord is not a grid key");
+        grid_key(&mut app, Key::ArrowDown, M::SHIFT);
+        assert_eq!(app.focused().selection(), (0..=1, 0..=0));
+        grid_key(&mut app, Key::F2, M::NONE);
+        assert!(app.focused().editing.is_some(), "F2 edits");
+        app.focused_mut().editing = None;
+        grid_key(&mut app, Key::N, M::NONE);
+        assert_eq!(app.selected(), Some(MeasureId(102)));
+        grid_key(&mut app, Key::N, M::SHIFT);
+        assert_eq!(app.selected(), Some(MeasureId(101)));
+
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        let page = |app: &ImprovApp| app.focused().page_idx[0];
+        grid_key(&mut app, Key::PageDown, M::NONE);
+        assert_eq!(page(&app), 1);
+        grid_key(&mut app, Key::PageUp, M::NONE);
+        assert_eq!(page(&app), 0);
+        grid_key(&mut app, Key::OpenBracket, M::NONE);
+        assert_eq!(page(&app), 1, "paging wraps");
+    }
+
+    /// What a user types, as one frame of text events.
+    fn type_text(desk: &mut Desk, app: &mut ImprovApp, text: &str) {
+        let _ = desk.frame(app, vec![egui::Event::Text(text.into())]);
+    }
+
+    /// H1-1: Enter, F2 and a double-click open the editor with the old value
+    /// selected, so the next key replaces it (was: 80 then 9 stored 809).
+    #[test]
+    fn opening_a_cell_editor_selects_the_old_value() {
+        use egui::{Key, Modifiers as M};
+        let (mut app, mut desk) = grid_desk();
+        let at = cell_rect(&desk, &app, 1, 1).center();
+        let k: CoordKey = improv_engine::smallvec::smallvec![(1, 11), (2, 21)];
+        desk.click(&mut app, at);
+        for (open, typed) in [(Key::Enter, "9"), (Key::F2, "7")] {
+            key(&mut desk, &mut app, open, M::NONE);
+            assert_eq!(
+                app.matrices[0].edit_buf,
+                app.cell_text(MeasureId(101), &k).unwrap()
+            );
+            type_text(&mut desk, &mut app, typed);
+            key(&mut desk, &mut app, Key::Enter, M::NONE);
+            assert_eq!(app.cell_text(MeasureId(101), &k).as_deref(), Some(typed));
+        }
+        desk.time += 1.0;
+        desk.click(&mut app, at);
+        desk.click(&mut app, at);
+        assert!(app.matrices[0].editing.is_some(), "a double-click edits");
+        type_text(&mut desk, &mut app, "42");
+        key(&mut desk, &mut app, Key::Enter, M::NONE);
+        assert_eq!(app.cell_text(MeasureId(101), &k).as_deref(), Some("42"));
+    }
+
+    /// H1-1: a printable key on a selected input cell opens its editor
+    /// holding just that key; the grid's own keys still drive the grid, and
+    /// a derived cell says it is computed.
+    #[test]
+    fn typing_on_a_cell_replaces_its_value() {
+        use egui::{Key, Modifiers as M};
+        let (mut app, mut desk) = grid_desk();
+        let at = cell_rect(&desk, &app, 0, 0).center();
+        desk.click(&mut app, at);
+        let j = vec![key_event(Key::J), egui::Event::Text("j".into())];
+        let _ = desk.frame(&mut app, j);
+        assert_eq!(app.matrices[0].cursor_row, 1, "j moves the cursor");
+        assert!(app.matrices[0].editing.is_none(), "and edits nothing");
+        type_text(&mut desk, &mut app, "-");
+        assert_eq!(app.matrices[0].edit_buf, "-");
+        type_text(&mut desk, &mut app, "2.5");
+        key(&mut desk, &mut app, Key::Enter, M::NONE);
+        let k: CoordKey = improv_engine::smallvec::smallvec![(1, 11), (2, 20)];
+        assert_eq!(app.cell_text(MeasureId(101), &k).as_deref(), Some("-2.5"));
+        // A key and Enter in one frame commit at once.
+        let _ = desk.frame(
+            &mut app,
+            vec![egui::Event::Text("3".into()), key_event(Key::Enter)],
+        );
+        assert_eq!(app.cell_text(MeasureId(101), &k).as_deref(), Some("3"));
+
+        app.matrices[0].measure = Some(MeasureId(102));
+        desk.settle(&mut app);
+        type_text(&mut desk, &mut app, "5");
+        assert!(app.matrices[0].editing.is_none());
+        assert_eq!(app.status, "derived cells are computed, not editable");
+    }
+
+    /// The budget tutorial's GUI step, as written (docs/src/tutorial-budget.md
+    /// §7): click a Spent cell, type a new number and press Enter. The value
+    /// is stored, Left follows, and the file has it without File ▸ Save.
+    #[test]
+    fn the_budget_tutorial_edit_works_as_written() {
+        use egui::{Key, Modifiers as M};
+        let db = temp_db("tutorial7");
+        let _cleanup = Cleanup(db.clone());
+        let (month, line) = (CategoryId(1), CategoryId(2));
+        let mut model = Model::new();
+        model.add_category(month, "Month");
+        model.add_category(line, "Line");
+        for (id, name) in [(10, "Jan"), (11, "Feb"), (12, "Mar")] {
+            model.add_item(ItemId(id), month, name);
+        }
+        for (id, name) in [
+            (20, "Rent"),
+            (21, "Groceries"),
+            (22, "Utilities"),
+            (23, "Fun"),
+        ] {
+            model.add_item(ItemId(id), line, name);
+        }
+        for (id, name, cats) in [
+            (100, "Budget", vec![line]),
+            (101, "Spent", vec![month, line]),
+        ] {
+            model.add_measure(Measure {
+                id: MeasureId(id),
+                name: Name(name.into()),
+                value_type: ValueType::Number,
+                categories: cats,
+                kind: MeasureKind::Input,
+                description: None,
+                format: None,
+            });
+        }
+        let at = |m: u32, l: u32| {
+            improv_core_model::Coordinate::from_pairs([(month, ItemId(m)), (line, ItemId(l))])
+        };
+        let fun = improv_core_model::Coordinate::from_pairs([(line, ItemId(23))]);
+        model.set_input(MeasureId(100), fun, Value::Number(300.0));
+        model.set_input(MeasureId(101), at(11, 23), Value::Number(300.0));
+        let placement = MatrixPlacement {
+            measure: MeasureId(101),
+            axis_order: vec![line, month],
+            n_rows: 1,
+            n_cols: 1,
+            page_items: Vec::new(),
+            filters: Vec::new(),
+            rect: CanvasRect {
+                x: MENU_CLEAR,
+                ..CanvasRect::default()
+            },
+        };
+        let view = View::from_matrices(ViewId(1), Name("Spending".into()), placement, Vec::new());
+        model.views.insert(ViewId(1), view);
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&model))
+            .expect("seed the store");
+        let mut app = ImprovApp::load(&db).expect("load");
+        let left = app
+            .add_derived_measure("Left", "Budget - Spent")
+            .expect("Left");
+        app.open_view(ViewId(1));
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+
+        // Feb (column 1) of Fun (row 3): 300.
+        let cell = cell_rect(&desk, &app, 3, 1).center();
+        desk.click(&mut app, cell);
+        for c in ["3", "5", "0"] {
+            type_text(&mut desk, &mut app, c);
+        }
+        key(&mut desk, &mut app, Key::Enter, M::NONE);
+        assert_eq!(app.status, "cell updated");
+        let feb_fun: CoordKey = improv_engine::smallvec::smallvec![(1, 11), (2, 23)];
+        assert_eq!(
+            app.cell_text(MeasureId(101), &feb_fun).as_deref(),
+            Some("350")
+        );
+        assert_eq!(app.values_for(left).get(&feb_fun), Some(&-50.0));
+        let stored = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert_eq!(
+            stored.input(MeasureId(101), &at(11, 23)),
+            Some(&Value::Number(350.0))
+        );
+    }
+
+    /// H1-27: a number cell takes the locale's group separator and a
+    /// leading currency sign (`Locale::parse_number`, tested in core_model).
+    #[test]
+    fn number_entry_takes_group_separators_and_a_currency_sign() {
+        let de = improv_core_model::Locale::de();
+        // Through the grid: $1,500 is stored as 1500.
+        let (mut app, mut desk) = grid_desk();
+        let at = cell_rect(&desk, &app, 0, 0).center();
+        desk.click(&mut app, at);
+        type_text(&mut desk, &mut app, "$1,500");
+        key(&mut desk, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(app.status, "cell updated");
+        let k: CoordKey = improv_engine::smallvec::smallvec![(1, 10), (2, 20)];
+        assert_eq!(app.cell_text(MeasureId(101), &k).as_deref(), Some("1500"));
+        // A refusal says what is taken, in the locale's spelling.
+        app.locale = de;
+        let e = app
+            .commit_cell_text(MeasureId(101), k, "1,50,0")
+            .unwrap_err();
+        assert_eq!(
+            e,
+            "not a number: \"1,50,0\" (type 1500, 1.500,25 or €1.500)"
+        );
+    }
+
+    /// H1-16: a refused entry keeps the editor open with the text, the caret
+    /// at its end, and says why; Esc then leaves the cell as it was.
+    #[test]
+    fn a_refused_entry_keeps_the_editor_and_its_text() {
+        use egui::{Key, Modifiers as M};
+        let (mut app, mut desk) = grid_desk();
+        let at = cell_rect(&desk, &app, 0, 0).center();
+        desk.click(&mut app, at);
+        type_text(&mut desk, &mut app, "1,50");
+        key(&mut desk, &mut app, Key::Enter, M::NONE);
+        assert_eq!(
+            app.status,
+            "edit error: not a number: \"1,50\" (type 1500, 1,500.25 or $1,500)"
+        );
+        desk.settle(&mut app);
+        assert_eq!(app.matrices[0].edit_buf, "1,50");
+        assert!(app.matrices[0].editing.is_some(), "still open");
+        type_text(&mut desk, &mut app, "0");
+        assert_eq!(app.matrices[0].edit_buf, "1,500", "typed at the end");
+        key(&mut desk, &mut app, Key::Escape, M::NONE);
+        assert!(app.matrices[0].editing.is_none());
+        let k: CoordKey = improv_engine::smallvec::smallvec![(1, 10), (2, 20)];
+        assert_eq!(app.cell_text(MeasureId(101), &k).as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn a_cell_edit_cancels_on_escape_and_commits_on_enter() {
+        use egui::{Key, Modifiers as M};
+        let (mut app, mut desk) = grid_desk();
+        let at = cell_rect(&desk, &app, 1, 1).center();
+        desk.click(&mut app, at);
+        desk.click(&mut app, at);
+        assert!(app.matrices[0].editing.is_some());
+        key(&mut desk, &mut app, Key::Escape, M::NONE);
+        assert!(app.matrices[0].editing.is_none());
+        assert_eq!(app.status, "edit cancelled");
+
+        desk.time += 1.0; // a fresh double-click, not a triple
+        desk.click(&mut app, at);
+        desk.click(&mut app, at);
+        assert!(app.matrices[0].editing.is_some());
+        app.matrices[0].edit_buf = "9".into();
+        key(&mut desk, &mut app, Key::Enter, M::NONE);
+        assert!(app.matrices[0].editing.is_none());
+        assert_eq!(app.status, "cell updated");
+        let k: CoordKey = improv_engine::smallvec::smallvec![(1, 11), (2, 21)];
+        assert_eq!(app.cell_text(MeasureId(101), &k).as_deref(), Some("9"));
+    }
+
+    #[test]
+    fn clicking_a_derived_cell_says_it_is_computed() {
+        let (mut app, mut desk) = grid_desk();
+        app.matrices[0].measure = Some(MeasureId(102));
+        desk.settle(&mut app);
+        let at = cell_rect(&desk, &app, 0, 0).center();
+        desk.click(&mut app, at);
+        assert_eq!(app.status, "derived cells are computed, not editable");
+        assert!(app.matrices[0].editing.is_none());
+    }
+
+    #[test]
+    fn a_page_with_no_pinnable_item_renders_no_cells() {
+        let mut app = build_app(sales_3d_model());
+        select(&mut app, MeasureId(200));
+        app.sync_axis_state();
+        hide_all_items(&mut app, CategoryId(3));
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let id = egui::Id::unique(("cell", app.matrices[0].uid, 0usize, 0usize));
+        assert!(desk.ctx.viewport(|v| v.prev_pass.widgets.get(id).is_none()));
+    }
+
+    /// The fill of every rect painted this frame.
+    fn rect_fills(out: &egui::FullOutput) -> Vec<egui::Color32> {
+        fn walk(s: &egui::Shape, acc: &mut Vec<egui::Color32>) {
+            match s {
+                egui::Shape::Rect(r) => acc.push(r.fill),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, acc)),
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut acc));
+        acc
+    }
+
+    fn texts_of(out: &egui::FullOutput) -> Vec<String> {
+        fn walk(s: &egui::Shape, acc: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => acc.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, acc)),
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        out.shapes.iter().for_each(|c| walk(&c.shape, &mut acc));
+        acc
+    }
+
+    #[test]
+    fn the_info_panel_describes_inputs_scalars_and_erroring_formulas() {
+        let mut model = revenue_model();
+        model.add_measure(Measure {
+            id: MeasureId(103),
+            name: Name("Rate".into()),
+            value_type: ValueType::Number,
+            categories: vec![],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        let mut app = build_app(model);
+        app.show_inspector = true;
+        // One #ERR cell in Revenue's snapshot.
+        let mut snap = (*app.snapshot).clone();
+        let errs: improv_engine::session::MeasureValues = [(
+            improv_engine::smallvec::smallvec![(1, 10), (2, 20)],
+            CellValue::Err(0),
+        )]
+        .into();
+        snap.insert(MeasureId(102), std::sync::Arc::new(errs));
+        app.snapshot = std::sync::Arc::new(snap);
+        let mut desk = Desk::new();
+        let mut shown = |app: &mut ImprovApp, m: u32| {
+            select(app, MeasureId(m));
+            desk.settle(app);
+            texts_of(&desk.frame(app, Vec::new()))
+        };
+        let t = shown(&mut app, 100);
+        assert!(t.iter().any(|t| t == "kind: input"), "{t:?}");
+        assert!(t.iter().any(|t| t == "dimensions: Product"));
+        let t = shown(&mut app, 103);
+        assert!(t.iter().any(|t| t == "dimensions: (scalar)"), "{t:?}");
+        let t = shown(&mut app, 102);
+        assert!(t.iter().any(|t| t == "kind: derived"));
+        assert!(t.iter().any(|t| t.starts_with("depends on: ")));
+        assert!(t.iter().any(|t| t.starts_with("formula: ")));
+        assert!(t.iter().any(|t| t.contains("cell(s) have errors")), "{t:?}");
+    }
+
+    #[test]
+    fn an_empty_canvas_says_so_and_a_store_titles_the_window() {
+        let mut app = ImprovApp::load("").unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let out = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        // H1-13: it names the menus, right of the menu, not under it.
+        let hint = text_at(&out.shapes, EMPTY_HINT).expect("the empty-model hint");
+        assert!(hint.left() >= crate::menu::MENU_W + 4.0, "{hint:?}");
+
+        let mut app = build_app(revenue_model());
+        app.db = "/nowhere/sales.db".into();
+        app.undo_stack
+            .push(Step::Model(Box::new((*app.model).clone())));
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 1.0);
+        assert!(!app.dirty, "a store-backed model is not dirtied by history");
+        assert_eq!(app.last_title, "Improv \u{2014} sales");
+    }
+
+    /// Edit ▸ Copy writes the selection as tab-separated rows, the way the
+    /// cells show; Paste writes them back from the cursor as one undo step,
+    /// refuses text a number cell cannot take, and refuses a derived measure.
+    #[test]
+    fn copy_and_paste_move_cells_as_tab_separated_text() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101)); // Quantity[Time, Product]
+        app.sync_axis_state();
+        app.focused_mut().anchor = Some((0, 0));
+        app.focused_mut().cursor_row = 1;
+        app.focused_mut().cursor_col = 1;
+        let copied = app.copy_selection().expect("a measure");
+        assert_eq!(copied, "100\t50\n120\t80\n");
+        // Paste the first row over the second: one undoable step.
+        app.focused_mut().anchor = None;
+        app.focused_mut().cursor_row = 1;
+        app.focused_mut().cursor_col = 0;
+        let before = app.undo_stack.len();
+        assert_eq!(app.paste_cells("7\t8\r\n").as_deref(), Ok("pasted 2 cells"));
+        assert_eq!(app.undo_stack.len(), before + 1, "one step");
+        app.focused_mut().anchor = Some((0, 0));
+        app.focused_mut().cursor_col = 1;
+        assert_eq!(app.copy_selection().unwrap(), "100\t50\n7\t8\n");
+        // A bad cell refuses it all; past the grid's edge is clipped.
+        app.focused_mut().anchor = None;
+        app.focused_mut().cursor_col = 0;
+        let err = app.paste_cells("1\tlots").unwrap_err();
+        assert!(err.contains("lots"), "{err}");
+        app.focused_mut().anchor = Some((0, 1));
+        assert_eq!(app.copy_selection().unwrap(), "100\t50\n7\t8\n");
+        app.focused_mut().anchor = None;
+        app.focused_mut().cursor_col = 1;
+        assert_eq!(
+            app.paste_cells("9\t9\t9\n9\t9").as_deref(),
+            Ok("pasted 1 cell; 4 past the worksheet's edge were clipped")
+        );
+        app.undo().unwrap();
+        app.undo().unwrap();
+        app.focused_mut().anchor = Some((0, 0));
+        app.focused_mut().cursor_row = 1;
+        app.focused_mut().cursor_col = 1;
+        assert_eq!(copied, app.copy_selection().unwrap(), "undone to the start");
+        // Derived cells are computed.
+        select(&mut app, MeasureId(102));
+        assert!(app.paste_cells("1").unwrap_err().contains("derived"));
+    }
+
+    /// Edit ▸ Select All (Command-a) selects the whole grid, so Copy takes
+    /// it all and the status bar sums it.
+    #[test]
+    fn select_all_selects_the_whole_grid() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        let ctx = egui::Context::default();
+        app.run_command(&ctx, Command::SelectAll);
+        assert_eq!(app.copy_selection().unwrap(), "100\t50\n120\t80\n");
+        assert_eq!(app.selection_sum(), Some(350.0));
+    }
+
+    /// The worksheet takes egui's clipboard events: a copy event puts the
+    /// selection on the clipboard (an output command), a paste event writes
+    /// the cells.
+    #[test]
+    fn the_worksheet_takes_copy_and_paste_events() {
+        let (mut app, mut desk) = grid_desk(); // Quantity, cursor at (0, 0)
+        let out = desk.frame(&mut app, vec![egui::Event::Copy]);
+        let copied = out.platform_output.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(copied.as_deref(), Some("100\n"));
+        assert_eq!(app.status, "copied 1 row");
+        let _ = desk.frame(&mut app, vec![egui::Event::Paste("42".into())]);
+        assert_eq!(app.status, "pasted 1 cell");
+        assert_eq!(
+            app.cell_text(MeasureId(101), &app.cursor_key().unwrap())
+                .as_deref(),
+            Some("42")
+        );
+        // The Edit menu's rows ask the platform for the same events.
+        let out = desk.frame(&mut app, Vec::new());
+        let _ = out;
+        app.run_command(&desk.ctx, Command::Copy);
+        let out = desk.frame(&mut app, Vec::new());
+        assert!(out
+            .viewport_output
+            .values()
+            .any(|v| v.commands.contains(&egui::ViewportCommand::RequestCopy)));
+    }
+
+    /// Gap 8: Edit ▸ Cut (Ctrl+X, egui's cut event) copies the selection
+    /// and clears its input cells as one undo step; derived cells are
+    /// refused, and the menu row asks the platform for the event.
+    #[test]
+    fn cut_copies_and_clears_the_selection_as_one_undo_step() {
+        let (mut app, mut desk) = grid_desk(); // Quantity
+        app.run_command(&desk.ctx, Command::SelectAll);
+        let out = desk.frame(&mut app, vec![egui::Event::Cut]);
+        let copied = out.platform_output.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        });
+        assert_eq!(copied.as_deref(), Some("100\t50\n120\t80\n"));
+        assert_eq!(app.status, "cut 4 cells");
+        assert_eq!(app.selection_sum(), None, "the cells are empty");
+        assert_eq!(
+            app.values_for(MeasureId(102)).values().sum::<f64>(),
+            0.0,
+            "Revenue follows"
+        );
+        app.undo().unwrap();
+        assert_eq!(
+            app.selection_sum(),
+            Some(350.0),
+            "one undo brings all four back"
+        );
+        // Cutting empty cells copies and says so.
+        app.run_command(&desk.ctx, Command::SelectAll);
+        let _ = desk.frame(&mut app, vec![egui::Event::Cut]);
+        let (_, said) = app.cut_selection().unwrap();
+        assert_eq!(said, "copied; the cells were already empty");
+        // A derived measure's cells are computed.
+        select(&mut app, MeasureId(102));
+        assert!(app.cut_selection().unwrap_err().contains("derived"));
+        app.run_command(&desk.ctx, Command::Cut);
+        let out = desk.frame(&mut app, Vec::new());
+        assert!(out
+            .viewport_output
+            .values()
+            .any(|v| v.commands.contains(&egui::ViewportCommand::RequestCut)));
+    }
+
+    /// Gap 8: File ▸ Close (Ctrl+Shift+W) closes the model to an empty
+    /// desk; unsaved in-memory edits warn first, as Quit does, and a second
+    /// Close drops them.
+    #[test]
+    fn close_closes_the_model_after_the_quit_check() {
+        let mut app = build_app(grid_2x2_model());
+        let ctx = egui::Context::default();
+        app.record_history((*app.model).clone());
+        app.run_command(&ctx, Command::CloseModel);
+        assert_eq!(
+            app.status,
+            "unsaved in-memory model: Close again to discard"
+        );
+        assert!(!app.model.measures.is_empty(), "still open");
+        app.run_command(&ctx, Command::CloseModel);
+        assert_eq!(app.status, "closed Untitled");
+        assert!(app.model.measures.is_empty() && app.db.is_empty());
+        assert!(!app.can_undo());
+        // Nothing to lose: one Close does it; another command disarms.
+        let mut app = build_app(grid_2x2_model());
+        app.record_history((*app.model).clone());
+        app.run_command(&ctx, Command::CloseModel);
+        app.run_command(&ctx, Command::Keys);
+        app.run_command(&ctx, Command::CloseModel);
+        assert!(!app.model.measures.is_empty(), "Keys disarmed it");
+        assert_eq!(
+            menu::key_command(egui::Key::W, true),
+            Some(Command::CloseModel)
+        );
+    }
+
+    /// Gap 12: Info ▸ Point for Help sets the question-mark pointer; the
+    /// next click opens the page for what it lands on and does nothing else
+    /// (a cell click does not move the cursor). Tiles, the grid and the
+    /// formula pane have pages of their own.
+    #[test]
+    fn point_for_help_opens_the_page_for_what_is_clicked() {
+        let (mut app, mut desk) = grid_desk();
+        let point = |app: &mut ImprovApp, desk: &mut Desk, at: egui::Pos2| {
+            app.run_command(&desk.ctx, Command::PointForHelp);
+            let out = desk.frame(app, Vec::new());
+            assert_eq!(out.platform_output.cursor_icon, egui::CursorIcon::Help);
+            desk.click(app, at);
+            assert!(!app.pointing);
+            app.help.expect("a page").title
+        };
+        let cell = cell_rect(&desk, &app, 1, 1);
+        assert_eq!(point(&mut app, &mut desk, cell.center()), "Worksheet");
+        assert_eq!(app.focused().cursor_row, 0, "the click only asked");
+        let g = app.matrices[0].gutters.unwrap();
+        assert_eq!(
+            point(&mut app, &mut desk, g.well.center()),
+            "Category tiles"
+        );
+        let row = app.formula_row_rects[0].1;
+        assert_eq!(point(&mut app, &mut desk, row.center()), "Formulas");
+        let menu = desk.ctx.memory(|m| m.area_rect(menu::menu_id())).unwrap();
+        assert_eq!(point(&mut app, &mut desk, menu.center()), "The main menu");
+        let browser = crate::nxwin::stored_rect(&desk.ctx, panel_win("browser")).unwrap();
+        assert_eq!(
+            point(&mut app, &mut desk, browser.center()),
+            "Model Browser"
+        );
+        let texts = texts_of(&desk.frame(&mut app, Vec::new()));
+        assert!(
+            texts.iter().any(|t| t == "More in the User Guide"),
+            "{texts:?}"
+        );
+        // Esc cancels; the next click is an ordinary one.
+        app.run_command(&desk.ctx, Command::PointForHelp);
+        let esc = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = desk.frame(&mut app, vec![esc]);
+        assert!(!app.pointing);
+        desk.click(&mut app, cell.center());
+        assert_eq!(app.focused().cursor_row, 1, "a click again");
+        // Its close box closes the page.
+        let close = close_box_of(&desk.ctx, panel_win("help")).expect("shown");
+        desk.click(&mut app, close.center());
+        assert!(app.help.is_none());
+    }
+
+    /// Gap 12: Info ▸ Context Help… (Ctrl+?) opens the page for the window
+    /// in front: the last one raised.
+    #[test]
+    fn context_help_opens_the_page_for_the_window_in_front() {
+        let (mut app, mut desk) = grid_desk();
+        let help = egui::Event::Key {
+            key: egui::Key::Questionmark,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        };
+        let cell = cell_rect(&desk, &app, 0, 0);
+        desk.click(&mut app, cell.center());
+        let released = egui::Event::Key {
+            key: egui::Key::Questionmark,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        };
+        let _ = desk.frame(&mut app, vec![help.clone(), released]);
+        assert_eq!(app.help.expect("Ctrl+? opens it").title, "Worksheet");
+
+        app.run_command(&desk.ctx, Command::Inspector);
+        desk.settle(&mut app);
+        // Raised by a click on its title bar, as a user brings a window up.
+        let r = crate::nxwin::stored_rect(&desk.ctx, panel_win("inspector")).unwrap();
+        desk.click(&mut app, r.left_top() + egui::vec2(40.0, 8.0));
+        app.help = None;
+        let _ = desk.frame(&mut app, vec![help]);
+        assert_eq!(app.help.expect("shown again").title, "Inspector");
+        // Every window the app names has a page.
+        for n in crate::help::names() {
+            assert_ne!(crate::help::topic(n), crate::help::IMPROV, "{n}");
+        }
+    }
+
+    /// Gap 13: a click on an item's header selects the item and its cells,
+    /// across the other axis; Shift+click extends to another item. Select
+    /// Items Only keeps the names (Copy copies them, Cut only copies, Paste
+    /// and the Sum refuse); Select Cells Only keeps the cells.
+    #[test]
+    fn item_headers_select_items_and_their_cells() {
+        let (mut app, mut desk) = grid_desk(); // Quantity: Time rows, Product columns
+        let out = desk.frame(&mut app, Vec::new());
+        let header = |shapes: &[egui::epaint::ClippedShape], name: &str| {
+            text_at(shapes, name).unwrap_or_else(|| panic!("{name} drawn"))
+        };
+        desk.click(&mut app, header(&out.shapes, "WidgetB").center());
+        assert_eq!(app.focused().selection(), (0..=1, 1..=1), "the column");
+        assert_eq!(app.focused().part, SelPart::Both { rows: false });
+        assert_eq!(app.selection_sum(), Some(130.0), "its cells: 50 + 80");
+        let out = desk.frame(&mut app, Vec::new());
+        desk.click(&mut app, header(&out.shapes, "2026").center());
+        assert_eq!(app.focused().selection(), (1..=1, 0..=1), "the row");
+        assert_eq!(app.copy_selection().unwrap(), "120\t80\n");
+
+        // Items Only: the names; the cells are not lit, and Sum, Paste and
+        // Cut leave them alone.
+        let bracket = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let _ = desk.frame(&mut app, vec![bracket(egui::Key::OpenBracket)]);
+        assert_eq!(app.focused().part, SelPart::Items { rows: true });
+        assert_eq!(app.copy_selection().unwrap(), "2026\n");
+        assert_eq!(app.selection_sum(), None);
+        assert!(app
+            .paste_cells("1")
+            .unwrap_err()
+            .starts_with("paste into cells"));
+        let (_, said) = app.cut_selection().unwrap();
+        assert!(said.contains("cannot be cut"), "{said}");
+        assert_eq!(
+            app.cell_text(MeasureId(101), &app.cursor_key().unwrap())
+                .as_deref(),
+            Some("80")
+        );
+        desk.settle(&mut app);
+        let out = desk.frame(&mut app, Vec::new());
+        let cell = cell_rect(&desk, &app, 1, 0);
+        // A cell's own fill, not a panel's (both are light gray).
+        let lit = fills(&out).iter().any(|(r, f)| {
+            *f == crate::theme::LIGHT_GRAY && r.contains(cell.center()) && r.width() < 200.0
+        });
+        assert!(!lit, "an items-only selection leaves its cells white");
+        // Cells Only: the cells again; Paste and Sum work.
+        let _ = desk.frame(&mut app, vec![bracket(egui::Key::CloseBracket)]);
+        assert_eq!(app.focused().part, SelPart::Cells);
+        assert_eq!(app.selection_sum(), Some(200.0));
+        desk.settle(&mut app);
+        let out = desk.frame(&mut app, Vec::new());
+        let lit = fills(&out).iter().any(|(r, f)| {
+            *f == crate::theme::LIGHT_GRAY && r.contains(cell.center()) && r.width() < 200.0
+        });
+        assert!(lit, "the cells are lit again");
+        // A plain [ still pages: no measure here has a page category.
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("[".into())]);
+        assert_eq!(app.focused().part, SelPart::Cells);
+        // Select All is every item and cell.
+        app.run_command(&desk.ctx, Command::SelectAll);
+        app.run_command(&desk.ctx, Command::SelectItems);
+        assert_eq!(app.copy_selection().unwrap(), "2025\n2026\n");
+    }
+
+    /// Gap 13: on stacked rows, an outer item's header selects its group:
+    /// every row under it.
+    #[test]
+    fn an_outer_item_selects_its_group() {
+        let mut m = Matrix {
+            axis_order: vec![CategoryId(1), CategoryId(2), CategoryId(3)],
+            n_rows: 2,
+            n_cols: 1,
+            ..Matrix::default()
+        };
+        let mut model = Model::new();
+        for (c, name, items) in [(1, "Time", 3), (2, "Product", 2), (3, "Region", 2)] {
+            model.add_category(CategoryId(c), name);
+            for i in 0..items {
+                model.add_item(ItemId(c * 10 + i), CategoryId(c), format!("{name}{i}"));
+            }
+        }
+        model.add_measure(Measure {
+            id: MeasureId(1),
+            name: Name("Sales".into()),
+            value_type: ValueType::Number,
+            categories: vec![CategoryId(1), CategoryId(2), CategoryId(3)],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        m.measure = Some(MeasureId(1));
+        m.axis_for = m.measure;
+        assert_eq!(m.grid_dims(&model), (6, 2));
+        // Row 3 is Time1/Product1: its outer item Time1 spans rows 2..=3.
+        m.select_item(&model, true, 3, 0, false);
+        assert_eq!(m.selection(), (2..=3, 0..=1));
+        assert_eq!(
+            m.selected_item_names(&model, true),
+            ["Time1\tProduct0", "Time1\tProduct1"]
+        );
+        // The inner item alone; Shift+click on Time2's reaches row 5.
+        m.select_item(&model, true, 3, 1, false);
+        assert_eq!(m.selection(), (3..=3, 0..=1));
+        m.select_item(&model, true, 4, 0, true);
+        assert_eq!(m.selection(), (3..=5, 0..=1));
+        // A column: all six rows.
+        m.select_item(&model, false, 1, 0, false);
+        assert_eq!(m.selection(), (0..=5, 1..=1));
+    }
+
+    /// Gap 13: on a row-only worksheet (no column category), Shift+click
+    /// on a column item extends from the anchor's column; an item selection
+    /// of an axis with no category names nothing.
+    #[test]
+    fn shift_click_on_a_column_extends_and_an_empty_axis_names_nothing() {
+        let model = grid_2x2_model();
+        let mut m = Matrix::new(&model, Some(MeasureId(101)));
+        assert_eq!(m.grid_dims(&model), (2, 2));
+        m.select_item(&model, false, 0, 0, false);
+        assert_eq!(m.selection(), (0..=1, 0..=0));
+        m.select_item(&model, false, 1, 0, true);
+        assert_eq!(m.selection(), (0..=1, 0..=1), "extended from column 0");
+        assert_eq!(m.selected_item_names(&model, false), ["WidgetA", "WidgetB"]);
+        // From a later column back to an earlier one: the far end is kept.
+        m.select_item(&model, false, 1, 0, false);
+        m.select_item(&model, false, 0, 0, true);
+        assert_eq!(m.selection(), (0..=1, 0..=1));
+        // Both categories on rows: the column axis has none, so no names.
+        m.set_axis(&model, CategoryId(2), Axis::Rows);
+        assert!(m.col_cats(&model).is_empty());
+        assert!(m.selected_item_names(&model, false).is_empty());
+    }
+
+    /// A category is "named" by a formula that ranges over it, groups by
+    /// it, leaves it out (EXCEPT) or passes it, at any depth; Delete is
+    /// refused while one does.
+    #[test]
+    fn a_formula_names_a_category_by_by_over_except_or_position() {
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        let r = |by: Vec<CategoryId>, over: Vec<CategoryId>, except: Vec<CategoryId>| {
+            Expr::Ref(MeasureId(101), DimensionSpec { by, over, except })
+        };
+        let lit = Expr::Literal(Value::Number(1.0));
+        assert!(expr_names_category(&r(vec![t], vec![], vec![]), t));
+        assert!(expr_names_category(&r(vec![], vec![], vec![t]), t));
+        assert!(!expr_names_category(&r(vec![p], vec![p], vec![p]), t));
+        let add = |a: Expr, b: Expr| Expr::BinaryOp(BinaryOp::Add, Box::new(a), Box::new(b));
+        assert!(expr_names_category(
+            &add(r(vec![], vec![t], vec![]), lit.clone()),
+            t
+        ));
+        assert!(expr_names_category(&add(lit.clone(), Expr::Category(t)), t));
+        assert!(!expr_names_category(&add(lit.clone(), lit), t));
+
+        let mut model = grid_2x2_model();
+        model.add_category(CategoryId(3), "Region");
+        if let Some(m) = model.measures.get_mut(&MeasureId(102)) {
+            m.kind = MeasureKind::Derived(Formula::new(add(
+                r(vec![], vec![], vec![]),
+                r(vec![CategoryId(3)], vec![], vec![]),
+            )));
+        }
+        let app = build_app(model);
+        let why = app
+            .delete_blockers(Thing::Category(CategoryId(3)))
+            .expect("Revenue groups by Region");
+        assert!(why.contains("Revenue"), "{why}");
+    }
+
+    /// A window bound prints as Improv spells it; fractions and other
+    /// literals have no spelling.
+    #[test]
+    fn window_bounds_print_first_last_and_this_offsets() {
+        let num = |n: f64| Expr::Literal(Value::Number(n));
+        let text = |t: &str| Expr::Literal(Value::Text(t.into()));
+        assert_eq!(bound_dsl(&text("FIRST")).as_deref(), Some("FIRST"));
+        assert_eq!(bound_dsl(&text("LAST")).as_deref(), Some("LAST"));
+        assert_eq!(bound_dsl(&text("MIDDLE")), None);
+        assert_eq!(bound_dsl(&num(0.0)).as_deref(), Some("THIS"));
+        assert_eq!(bound_dsl(&num(2.0)).as_deref(), Some("THIS+2"));
+        assert_eq!(bound_dsl(&num(-3.0)).as_deref(), Some("THIS-3"));
+        assert_eq!(bound_dsl(&num(1.5)), None);
+        assert_eq!(bound_dsl(&num(-0.5)), None);
+        assert_eq!(bound_dsl(&Expr::Category(CategoryId(1))), None);
+    }
+
+    /// Gap 12: the help page for a point in a worksheet window: its tiles
+    /// (the column gutter as well as the row well), its grid, its formula
+    /// pane; a submenu is the menu's page, and no layer or a layer that
+    /// is no window of ours is Improv's.
+    #[test]
+    fn the_help_topic_follows_the_layer_and_point() {
+        let (app, desk) = grid_desk();
+        let title = |app: &ImprovApp, layer, at| app.topic_at(layer, at).title;
+        let g = app.matrices[0].gutters.expect("laid out");
+        let win = egui::LayerId::new(egui::Order::Middle, win_id(&app, 0));
+        assert_eq!(
+            title(&app, Some(win), Some(g.top.center())),
+            "Category tiles"
+        );
+        assert_eq!(
+            title(&app, Some(win), Some(g.well.center())),
+            "Category tiles"
+        );
+        assert_eq!(title(&app, Some(win), None), "Worksheet");
+        let cell = cell_rect(&desk, &app, 0, 0).center();
+        assert_eq!(title(&app, Some(win), Some(cell)), "Worksheet");
+        let sub = egui::LayerId::new(egui::Order::Foreground, menu::menu_id().with(("sub", 3)));
+        assert_eq!(title(&app, Some(sub), None), "The main menu");
+        let stray = egui::LayerId::new(egui::Order::Middle, egui::Id::unique("stray"));
+        assert_eq!(title(&app, Some(stray), None), crate::help::IMPROV.title);
+        assert_eq!(title(&app, None, None), crate::help::IMPROV.title);
+    }
+
+    /// Gap 11: Print with nothing to print says so; the print system path
+    /// says when there is no `lp` or `lpr`; a model in a store prints next
+    /// to it, one in memory or in Postgres under its name.
+    #[test]
+    fn print_refuses_an_empty_job_and_names_its_file_after_the_model() {
+        let (mut app, desk) = grid_desk();
+        let p = PrintPanel {
+            copies: 1,
+            pages: None,
+            selection: false,
+            printer: String::new(),
+            path: String::new(),
+        };
+        app.report_layout.data = false;
+        let doc = app.print_doc(false);
+        assert_eq!(
+            app.run_print("pdf", &doc, &p).unwrap_err(),
+            "nothing to print: Report Layout's Content is empty"
+        );
+        app.report_layout.data = true;
+        let doc = app.print_doc(false);
+        if cfg!(not(windows)) && crate::print::local_spooler("", 1).is_none() {
+            assert!(app
+                .run_print("print", &doc, &p)
+                .unwrap_err()
+                .starts_with("no lp or lpr"));
+        }
+        let dir = std::env::temp_dir().join(format!("improv-print-pages-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let two = PrintPanel {
+            path: dir.join("two").display().to_string(),
+            ..p.clone()
+        };
+        app.report_layout.formulas = true;
+        let doc = app.print_doc(false);
+        assert_eq!(doc.pages.len(), 2);
+        assert!(app
+            .run_print("ps", &doc, &two)
+            .unwrap()
+            .starts_with("saved 2 pages to "));
+        let _ = std::fs::remove_dir_all(dir);
+
+        let path = |app: &mut ImprovApp| {
+            app.print_panel = None;
+            app.run_command(&desk.ctx, Command::Print);
+            app.print_panel.as_ref().expect("Print opens").path.clone()
+        };
+        assert_eq!(path(&mut app), "Untitled.pdf");
+        app.db = "/tmp/books/q3.improv".into();
+        assert_eq!(path(&mut app), "/tmp/books/q3.pdf");
+        app.db = "postgres://h/db?model=plan".into();
+        assert_eq!(path(&mut app), "plan.pdf");
+        app.db = String::new();
+    }
+
+    /// Gap 11: the printed sheet of an axis with no row category has no
+    /// item names; Smart alignment puts text left, numbers right; a
+    /// worksheet with no measure prints nothing; the Inspector's lines off
+    /// rule nothing.
+    #[test]
+    fn the_printed_sheet_aligns_text_left_and_drops_missing_items() {
+        use crate::print::Align;
+        let mut app = build_app(typed_model());
+        select(&mut app, MeasureId(2)); // Label[Product], text
+        let s = app.print_sheet(false);
+        assert_eq!(s.corner, ["Product"]);
+        assert_eq!(
+            s.rows,
+            [(
+                vec!["WidgetA".to_owned()],
+                vec![("hello".to_owned(), Align::Left)]
+            )]
+        );
+        app.set_axis(CategoryId(1), Axis::Columns);
+        let s = app.print_sheet(false);
+        assert!(s.corner.is_empty());
+        assert_eq!(s.col_heads, [["WidgetA"]]);
+        assert_eq!(s.rows, [(vec![], vec![("hello".to_owned(), Align::Left)])]);
+        app.focused_mut().opts.lines = false;
+        app.focused_mut().opts.align = CellAlign::Right;
+        let s = app.print_sheet(false);
+        assert!(!s.item_rules && !s.cell_rules);
+        assert_eq!(s.rows[0].1[0].1, Align::Right);
+        app.focused_mut().measure = None;
+        assert_eq!(app.print_sheet(false), crate::print::Sheet::default());
+    }
+
+    /// Gap 9: the Format panel's Set on a text measure aligns its cells
+    /// but leaves its (absent) number format alone; a number format on a
+    /// text measure is refused.
+    #[test]
+    fn the_format_panel_on_a_text_measure_only_aligns() {
+        let mut app = build_app(typed_model());
+        select(&mut app, MeasureId(2));
+        let mut d = app.panel_read();
+        d.opts.align = CellAlign::Right;
+        d.decimals = Some(2);
+        assert_eq!(app.format_set(d, false), "cells aligned right");
+        assert_eq!(app.focused().opts.align, CellAlign::Right);
+        assert_eq!(app.format_set(d, false), "the format is unchanged");
+        let f = NumberFormat {
+            decimals: Some(2),
+            grouping: false,
+        };
+        assert_eq!(
+            app.set_format(f).unwrap_err(),
+            "Label holds no numbers to format"
+        );
+        // A panel read from a closed worksheet changes no worksheet.
+        d.from.0 = u64::MAX;
+        d.opts.align = CellAlign::Left;
+        assert_eq!(app.format_set(d, false), "the format is unchanged");
+        assert_eq!(app.focused().opts.align, CellAlign::Right);
+    }
+
+    /// Gap 8: a paste may clear cells (an empty field), an empty
+    /// clipboard pastes nothing, and Cut says "cell" for one.
+    #[test]
+    fn paste_clears_on_empty_fields_and_refuses_past_the_edge() {
+        let (mut app, _desk) = grid_desk(); // Quantity, cursor (0, 0)
+        assert_eq!(app.paste_cells("\t7").unwrap(), "pasted 2 cells");
+        let at = |app: &ImprovApp, r: usize, c: usize| {
+            let m = app.focused();
+            let key = m.block_keys(&app.model, (r, c), (1, 1))[0][0].clone();
+            app.cell_text(MeasureId(101), &key)
+        };
+        assert_eq!(at(&app, 0, 0), None, "the empty field cleared it");
+        assert_eq!(at(&app, 0, 1).as_deref(), Some("7"));
+        assert_eq!(app.paste_cells("").unwrap_err(), "nothing to paste");
+        app.focused_mut().cursor_row = 1;
+        app.focused_mut().anchor = None;
+        let (text, said) = app.cut_selection().unwrap();
+        assert_eq!((text.as_str(), said.as_str()), ("120\n", "cut 1 cell"));
+    }
+
+    /// Graph ▸ New Graph opens a NeXT graph window named for the worksheet,
+    /// with its inspector line and a color bar per series; its close box
+    /// closes it.
+    #[test]
+    fn new_graph_opens_a_graph_window_in_color() {
+        let mut app = build_app(revenue_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        app.run_command(&desk.ctx, Command::NewGraph);
+        desk.settle(&mut app);
+        let out = desk.frame(&mut app, Vec::new());
+        let texts = texts_of(&out);
+        let title = format!("{} - Graph - Untitled", app.matrix_title(0));
+        assert!(texts.contains(&title), "{texts:?}");
+        for want in ["Type", "Bar", "Series by", "Smart", "Color"] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+        }
+        let fills = rect_fills(&out);
+        assert!(
+            fills.contains(&crate::chart::PALETTE[0]),
+            "a red series bar: {fills:?}"
+        );
+        // The close box, top right of the window, closes it.
+        let win = crate::nxwin::NxWindow::new("graph", "").id();
+        let r = crate::nxwin::stored_rect(&desk.ctx, win).expect("shown");
+        desk.click(&mut app, egui::pos2(r.right() - 11.0, r.top() + 11.0));
+        desk.settle(&mut app);
+        assert!(!app.show_chart);
+    }
+
+    /// The graph charts a range selection, not the whole grid, and its
+    /// Color box turns it to NeXT's four grays.
+    #[test]
+    fn the_graph_follows_the_selection_and_goes_gray() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(102));
+        app.sync_axis_state();
+        let whole = app.chart_series(crate::chart::ParseBy::Columns);
+        assert_eq!(whole.series.len(), 2);
+        // Select one column (both rows of WidgetA). By columns: one series
+        // of two points.
+        app.focused_mut().anchor = Some((0, 0));
+        app.focused_mut().cursor_row = 1;
+        let col = app.chart_series(crate::chart::ParseBy::Columns);
+        assert_eq!(col.series.len(), 1);
+        assert_eq!(col.series[0].name, "WidgetA");
+        assert_eq!(col.x_labels, vec!["2025".to_string(), "2026".to_string()]);
+        assert_eq!(col.series[0].points, vec![Some(1000.0), Some(1200.0)]);
+        // Smart, on one column: "each row of data is a series".
+        let smart = app.chart_series(crate::chart::ParseBy::Smart);
+        assert_eq!(smart, app.chart_series(crate::chart::ParseBy::Rows));
+        assert_eq!(smart.series.len(), 2);
+        assert_eq!(smart.series[1].name, "2026");
+        assert_eq!(smart.x_labels, vec!["WidgetA".to_string()]);
+        assert_eq!(smart.series[1].points, vec![Some(1200.0)]);
+
+        app.chart_color = false;
+        app.show_chart = true;
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let fills = rect_fills(&desk.frame(&mut app, Vec::new()));
+        assert!(
+            !fills.iter().any(|c| crate::chart::PALETTE.contains(c)),
+            "no color in a gray graph: {fills:?}"
+        );
+    }
+
+    #[test]
+    fn the_csv_forms_add_and_remove_rows_and_report_errors() {
+        let mut app = build_app(revenue_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut time = 0.0;
+        let mut frame = |app: &mut ImprovApp, events: Vec<egui::Event>| {
+            time += 1.0;
+            let raw = egui::RawInput {
+                time: Some(time),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            ctx.test_ui(raw, |ctx_ui| {
+                egui::CentralPanel::default().show(ctx_ui, |ui| {
+                    app.csv_import_form(ui);
+                    app.csv_export_form(ui);
+                });
+            })
+        };
+        let mut click = |app: &mut ImprovApp, label: &str| {
+            let shapes = frame(app, Vec::new()).shapes;
+            let at = last_text_at(&shapes, label)
+                .unwrap_or_else(|| panic!("{label} not painted"))
+                .center();
+            let _ = frame(app, vec![egui::Event::PointerMoved(at)]);
+            let _ = frame(app, vec![press(at, true), press(at, false)]);
+        };
+        click(&mut app, "+ dimension");
+        assert_eq!(app.import_form.dimensions.len(), 2);
+        click(&mut app, "-");
+        assert_eq!(app.import_form.dimensions.len(), 1);
+        click(&mut app, "Import");
+        assert!(app.status.starts_with("import error"), "{}", app.status);
+        click(&mut app, "Export");
+        assert_eq!(app.status, "export error: select a measure to export");
+    }
+
+    #[test]
+    fn closing_the_csv_window_hides_it() {
+        let mut app = build_app(revenue_model());
+        app.show_csv_wizard = true;
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        // egui's close button: the window layer's square, icon-sized widget
+        // at the title bar's right end.
+        let win = desk
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::unique("csv_wizard")))
+            .expect("window shown");
+        // egui's close button: the rightmost small square widget in the
+        // window's title bar.
+        let at = desk
+            .ctx
+            .viewport(|v| {
+                v.prev_pass
+                    .widgets
+                    .layers()
+                    .flat_map(|(_, ws)| ws.iter().map(|w| w.rect))
+                    .filter(|r| {
+                        (r.height() - r.width()).abs() < 0.5
+                            && (8.0..24.0).contains(&r.width())
+                            && win.contains_rect(*r)
+                            && r.top() < win.top() + 2.0 * r.height()
+                    })
+                    .max_by(|a, b| a.right().total_cmp(&b.right()))
+                    .map(|r| r.center())
+            })
+            .expect("close button laid out");
+        desk.click(&mut app, at);
+        assert!(!app.show_csv_wizard);
+    }
+
+    #[test]
+    fn calc_recalculates_and_a_disabled_formula_is_struck_through() {
+        let (mut app, mut desk) = grid_desk();
+        app.set_formula_enabled(MeasureId(102), false).unwrap();
+        desk.settle(&mut app);
+        let out = desk.frame(&mut app, Vec::new());
+        let struck = out.shapes.iter().any(|c| match &c.shape {
+            egui::Shape::Text(t) => {
+                t.galley.text() == "Revenue = Price * Quantity"
+                    && t.galley
+                        .job
+                        .sections
+                        .iter()
+                        .any(|s| s.format.strikethrough.width > 0.0)
+            }
+            _ => false,
+        });
+        assert!(struck, "{:?}", texts_of(&out));
+        let calc = painted(&out.shapes, "Calc").expect("Calc shown").center();
+        desk.click(&mut app, calc);
+        assert_eq!(app.status, "recalculated");
+    }
+
+    #[test]
+    fn typing_clears_a_stale_formula_error_and_escape_reverts() {
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(102));
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        app.formula_error = Some(crate::diagnostics::Diagnostic::plain("old"));
+        let x = egui::Event::Text("x".into());
+        focused_frame(&ctx, &mut app, "formula_edit", vec![x]);
+        assert_ne!(app.formula_buf, "Price * Quantity");
+        assert_eq!(app.formula_error, None);
+        let esc = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        focused_frame(&ctx, &mut app, "formula_edit", vec![esc.clone()]);
+        assert_eq!(app.formula_buf, "Price * Quantity");
+
+        // The new-formula line: Escape leaves it without adding; a line with
+        // no `=` is refused.
+        let n = app.model.measures.len();
+        let t = egui::Event::Text("oops".into());
+        focused_frame(&ctx, &mut app, "formula_new", vec![t]);
+        focused_frame(&ctx, &mut app, "formula_new", vec![esc]);
+        assert_eq!(
+            (app.model.measures.len(), app.new_formula_line.as_str()),
+            (n, "oops")
+        );
+        focused_frame(&ctx, &mut app, "formula_new", vec![enter()]);
+        assert_eq!(app.status, "type Name = formula");
+        assert_eq!(app.model.measures.len(), n);
+    }
+
+    #[test]
+    fn the_menu_runs_what_it_picks_and_plain_keys_are_no_chords() {
+        let mut app = build_app(revenue_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let quit = painted(&shapes, "Quit").expect("menu shows Quit").center();
+        let _ = desk.frame(&mut app, vec![egui::Event::PointerMoved(quit)]);
+        let out = desk.frame(&mut app, vec![press(quit, true), press(quit, false)]);
+        assert!(closes(&out), "Quit with nothing to lose closes");
+
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Q,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let out = ctx.test_pass(raw, |ctx| app.handle_command_keys(ctx));
+        assert!(!closes(&out), "a bare Q is not Cmd+Q");
+    }
+
+    #[test]
+    fn save_view_command_uses_the_typed_name_or_saves_nothing() {
+        let ctx = egui::Context::default();
+        let mut app = build_app(revenue_model());
+        app.view_name = "Mine".into();
+        app.run_command(&ctx, Command::SaveView);
+        assert_eq!(app.status, "saved view 'Mine'");
+        assert!(app.view_name.is_empty());
+        let mut empty = ImprovApp::load("").unwrap();
+        empty.run_command(&ctx, Command::SaveView);
+        assert!(empty.model.views.is_empty());
+        assert!(empty.status.is_empty());
+    }
+
+    #[test]
+    fn the_browsers_save_view_button_saves_a_named_view_only() {
+        let (mut app, mut desk) = grid_desk();
+        let button = |desk: &mut Desk, app: &mut ImprovApp| {
+            let shapes = desk.frame(app, Vec::new()).shapes;
+            painted(&shapes, "Save view")
+                .expect("button shown")
+                .center()
+        };
+        let p = button(&mut desk, &mut app);
+        desk.click(&mut app, p);
+        assert_eq!(app.status, "view name is required");
+        app.view_name = "V".into();
+        let p = button(&mut desk, &mut app);
+        desk.click(&mut app, p);
+        assert_eq!(app.model.views.len(), 1);
+        assert!(app.view_name.is_empty());
+    }
+
+    /// Improv's formula status indicator: a check for a formula that
+    /// checks, a cross for one with an error, each named for AccessKit.
+    #[test]
+    fn each_formula_shows_its_status_indicator() {
+        let (mut app, mut desk) = grid_desk();
+        let labels: Vec<String> = accesskit_nodes(&mut app, &mut desk)
+            .iter()
+            .filter_map(|(_, n)| n.label().map(str::to_owned))
+            .filter(|l| l.starts_with("Formula "))
+            .collect();
+        assert_eq!(labels, ["Formula Revenue checks"]);
+        // The indicator alone: a check is two strokes meeting at the
+        // bottom, a cross two diagonals.
+        let strokes = |checked: bool| {
+            let ctx = egui::Context::default();
+            let out = ctx.test_ui(egui::RawInput::default(), |ui| {
+                formula_status(ui, "X", (!checked).then_some("bad"));
+            });
+            out.shapes
+                .iter()
+                .filter_map(|c| match c.shape {
+                    egui::Shape::LineSegment { points, .. } => Some(points),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (check, cross) = (strokes(true), strokes(false));
+        assert_eq!((check.len(), cross.len()), (2, 2));
+        assert_eq!(check[0][1], check[1][0], "a check's strokes meet");
+        assert_ne!(cross[0][1], cross[1][0], "a cross's do not");
+    }
+
+    #[test]
+    fn the_enabled_checkbox_toggles_a_formula_and_says_so() {
+        let (mut app, mut desk) = grid_desk();
+        app.matrices[0].measure = Some(MeasureId(101)); // the row is not the editor
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        // The checkbox sits left of the status indicator, left of the
+        // row's `1.` number.
+        let num = painted(&shapes, "1.").expect("row numbered");
+        let at = egui::pos2(num.left() - 12.0 - 12.0 - 8.0, num.center().y);
+        desk.click(&mut app, at);
+        assert_eq!(app.status, "formula Revenue disabled");
+        assert!(formula_disabled(&app.model.measures[&MeasureId(102)]));
+        desk.time += 1.0;
+        desk.click(&mut app, at);
+        assert_eq!(app.status, "formula Revenue enabled");
+    }
+
+    #[test]
+    fn the_browser_lists_each_categorys_items_when_expanded() {
+        let (mut app, mut desk) = grid_desk();
+        let open = |desk: &mut Desk, app: &mut ImprovApp, label: &str| {
+            let shapes = desk.frame(app, Vec::new()).shapes;
+            let at = painted(&shapes, label)
+                .unwrap_or_else(|| panic!("{label} not shown"))
+                .center();
+            desk.click(app, at);
+            desk.settle(app);
+        };
+        open(&mut desk, &mut app, "Categories");
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let product = shapes
+            .iter()
+            .rev()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Product" => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .expect("Product header");
+        desk.click(&mut app, product.center());
+        desk.settle(&mut app);
+        let texts = texts_of(&desk.frame(&mut app, Vec::new()));
+        assert!(
+            texts.iter().filter(|t| *t == "WidgetB").count() >= 2,
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn pivoting_a_columns_only_layout_moves_it_to_rows() {
+        let mut app = build_app(revenue_model());
+        select(&mut app, MeasureId(100)); // Price[Product]
+        app.sync_axis_state();
+        app.set_axis(CategoryId(2), Axis::Columns);
+        app.pivot_rotate();
+        assert_eq!(
+            (app.row_cats(), app.col_cats()),
+            (vec![CategoryId(2)], vec![])
+        );
+    }
+
+    #[test]
+    fn a_new_measure_needs_a_name_and_ignores_unknown_refs_for_categories() {
+        let mut app = build_app(revenue_model());
+        assert_eq!(
+            app.add_derived_measure("  ", "Price").unwrap_err(),
+            "measure name is required"
+        );
+        // A formula over a scalar literal infers no categories.
+        let id = app.add_derived_measure("Two", "1 + 1").expect("adds");
+        assert!(app.model.measures[&id].categories.is_empty());
+    }
+
+    #[test]
+    fn a_text_cell_edits_left_aligned_and_commits() {
+        let mut app = build_app(typed_model());
+        app.matrices[0].measure = Some(MeasureId(2)); // Label (Text)
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let at = cell_rect(&desk, &app, 0, 0).center();
+        desk.click(&mut app, at);
+        desk.click(&mut app, at);
+        assert!(app.matrices[0].editing.is_some());
+        app.matrices[0].edit_buf = "bye".into();
+        key(&mut desk, &mut app, egui::Key::Enter, egui::Modifiers::NONE);
+        assert_eq!(
+            app.cell_text(MeasureId(2), &typed_key()).as_deref(),
+            Some("bye")
+        );
+    }
+
+    /// `ImprovApp::load` opens a Postgres-hosted model (`postgres://…?model=`),
+    /// builds its engine, and autosaves edits back. Skipped without
+    /// `IMPROV_TEST_PG` (a libpq `key=value` DSN or a URL).
+    #[test]
+    fn loads_and_saves_a_postgres_model() {
+        let Ok(dsn) = std::env::var("IMPROV_TEST_PG") else {
+            println!("skipped: IMPROV_TEST_PG not set");
+            return;
+        };
+        let base = if improv_store::is_postgres(&dsn) {
+            dsn
+        } else {
+            let kv: HashMap<_, _> = dsn
+                .split_whitespace()
+                .filter_map(|p| p.split_once('='))
+                .collect();
+            let get = |k| kv.get(k).copied().unwrap_or_default();
+            let (u, pw, h, d) = (get("user"), get("password"), get("host"), get("dbname"));
+            match get("port") {
+                "" => format!("postgres://{u}:{pw}@{h}/{d}"),
+                port => format!("postgres://{u}:{pw}@{h}:{port}/{d}"),
+            }
+        };
+        let url = format!("{base}?model=gui_{}", std::process::id());
+        let mut store = improv_store::Store::open(&url).unwrap();
+        store.save_model(&revenue_model()).unwrap();
+
+        let mut app = ImprovApp::load(&url).expect("load postgres model");
+        assert_eq!(*app.model, revenue_model());
+        assert_eq!(app.file_name(), format!("gui_{}", std::process::id()));
+        let revenue = app.model.measure_by_name("Revenue").unwrap().id;
+        assert!(app.formula_source(revenue).is_some());
+        Arc::make_mut(&mut app.model)
+            .items
+            .get_mut(&ItemId(10))
+            .unwrap()
+            .name = Name("Q1x".into());
+        app.save().expect("save to postgres");
+        let back = store.reload_model().unwrap();
+        assert_eq!(back.items[&ItemId(10)].name.0, "Q1x");
+    }
+
+    /// A Postgres model whose database notifies (pg_improv 0.15's
+    /// `version_moved` trigger, and its data notifications; stood in for
+    /// here by SQL, when the test database lacks pg_improv): the window
+    /// listens instead of probing. A data move with nothing unsaved brings
+    /// the other program's cells in, recomputed, without a panel; its own
+    /// save's echo changes nothing; with an edit unsaved, the cells wait
+    /// and nothing is overwritten; a version move offers Reload at once;
+    /// a killed listener falls back to the probe. Prints the re-read's
+    /// time on the sample model.
+    #[test]
+    fn a_notifying_postgres_model_takes_others_cells_live() {
+        let Ok(dsn) = std::env::var("IMPROV_TEST_PG") else {
+            println!("skipped: IMPROV_TEST_PG not set");
+            return;
+        };
+        let kv: HashMap<_, _> = dsn
+            .split_whitespace()
+            .filter_map(|p| p.split_once('='))
+            .collect();
+        let get = |k| kv.get(k).copied().unwrap_or_default();
+        let name = format!("guinotify_{}", std::process::id());
+        let url = format!(
+            "postgres://{}:{}@{}:{}/{}?model={name}",
+            get("user"),
+            get("password"),
+            get("host"),
+            match get("port") {
+                "" => "5432",
+                p => p,
+            },
+            get("dbname"),
+        );
+        let mut store = improv_store::Store::open(&url).unwrap();
+        store.save_model(&grid_2x2_model()).unwrap();
+        let mut sql = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
+        let has: bool = sql
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'version_moved')",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        // The stand-in: the version trigger, and a data notification sent
+        // by hand after each outside write (as pg_improv's worker does).
+        if !has {
+            sql.batch_execute(
+                "CREATE OR REPLACE FUNCTION public.improv_test_version_moved() RETURNS trigger
+                   LANGUAGE plpgsql AS $$ BEGIN
+                     PERFORM pg_notify('improv_' || NEW.model_id, NEW.tx::text || '.0');
+                     RETURN NULL;
+                   END $$;
+                 CREATE TRIGGER version_moved AFTER INSERT OR UPDATE OF tx
+                   ON improv.model_version FOR EACH ROW
+                   EXECUTE FUNCTION public.improv_test_version_moved();",
+            )
+            .unwrap();
+        }
+        let mid: i64 = sql
+            .query_one("SELECT id FROM improv.model WHERE name = $1", &[&name])
+            .unwrap()
+            .get(0);
+        let gen = std::cell::Cell::new(0);
+        // Another program writes a cell where no save of a GUI goes
+        // (improv.cell, as a bound table's row), then the data moves.
+        let outside = |sql: &mut postgres::Client, v: f64| {
+            gen.set(gen.get() + 1);
+            let tx: i64 = sql
+                .query_one(
+                    "SELECT tx FROM improv.model_version WHERE model_id = $1",
+                    &[&mid],
+                )
+                .unwrap()
+                .get(0);
+            sql.batch_execute(&format!(
+                "UPDATE improv.cell SET value = '{v}'::jsonb WHERE model_id = {mid} \
+                   AND measure_id = 101 AND coord = '{{\"1\": 10, \"2\": 20}}'::jsonb;
+                 SELECT pg_notify('improv_{mid}', '{tx}.{}')",
+                gen.get()
+            ))
+            .unwrap();
+        };
+        let mut app = ImprovApp::load(&url).expect("load");
+        let (qkey, rkey) = q_and_rev_keys();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        assert!(app.heard.is_some(), "it listens");
+        let wait_for = |app: &mut ImprovApp, desk: &mut Desk, f: &dyn Fn(&ImprovApp) -> bool| {
+            for _ in 0..150 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                desk.time += 0.05;
+                desk.settle(app);
+                if f(app) {
+                    return true;
+                }
+            }
+            false
+        };
+        // A data move: the cell comes in, Revenue recomputes, no panel.
+        let t0 = std::time::Instant::now();
+        outside(&mut sql, 42.0);
+        let took = wait_for(&mut app, &mut desk, &|a| {
+            a.cell_text(MeasureId(101), &qkey).as_deref() == Some("42")
+        });
+        assert!(took, "another program's cell came in: {}", app.status);
+        println!(
+            "data move to the window, re-read included: {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(app.outside, None);
+        assert_eq!(app.status, "1 cell changed by another program");
+        assert!(app.cell_text(MeasureId(102), &rkey).is_some());
+        // Its own save: the echo diffs to nothing, no panel; and the save
+        // after the take wrote only its own cell (no conflict).
+        let other_key: CoordKey = [(1, 11), (2, 21)].into_iter().collect();
+        app.set_cell(MeasureId(101), other_key.clone(), Value::Number(5.0))
+            .expect("its own save after taking theirs");
+        desk.time += 2.0;
+        desk.settle(&mut app);
+        assert_eq!(app.outside, None, "its own save's echo");
+        // An unsaved edit: the outside cell waits, nothing is overwritten.
+        app.dirty = true;
+        outside(&mut sql, 43.0);
+        assert!(!wait_for(&mut app, &mut desk, &|a| {
+            a.cell_text(MeasureId(101), &qkey).as_deref() == Some("43")
+        }));
+        app.dirty = false;
+        assert!(
+            wait_for(&mut app, &mut desk, &|a| a
+                .cell_text(MeasureId(101), &qkey)
+                .as_deref()
+                == Some("43")),
+            "taken once nothing is unsaved"
+        );
+        // A version move (another program's structural save): Reload.
+        let mut m = store.reload_model().unwrap();
+        m.add_item(ItemId(12), CategoryId(1), "2027");
+        store.save_model(&m).unwrap();
+        assert!(
+            wait_for(&mut app, &mut desk, &|a| matches!(
+                a.outside,
+                Some((_, true))
+            )),
+            "a version move offers Reload"
+        );
+        // A killed listener falls back to polling.
+        sql.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE query LIKE 'LISTEN improv_%'",
+            &[],
+        )
+        .unwrap();
+        assert!(
+            wait_for(&mut app, &mut desk, &|a| a.heard.is_none()),
+            "back to the probe"
+        );
+        if !has {
+            sql.batch_execute(
+                "DROP TRIGGER version_moved ON improv.model_version;
+                 DROP FUNCTION public.improv_test_version_moved();",
+            )
+            .unwrap();
+        }
+    }
+
+    /// G2 through the GUI's real save path (it reopens the store for every
+    /// save and carries a `SaveToken`): a SQL edit to one bound cell made
+    /// after the GUI loaded survives a GUI save of a different cell, and a
+    /// GUI edit of a cell SQL changed meanwhile is a conflict, not a silent
+    /// overwrite.
+    #[test]
+    fn gui_save_keeps_concurrent_sql_edits_to_bound_cells() {
+        let Ok(dsn) = std::env::var("IMPROV_TEST_PG") else {
+            println!("skipped: IMPROV_TEST_PG not set");
+            return;
+        };
+        let pid = std::process::id();
+        let (model, table) = (format!("guig2_{pid}"), format!("guig2_sales_{pid}"));
+        // `Store::open` needs a URL (it dispatches on `postgres://`); the
+        // test DSN is libpq key=value form.
+        let kv: HashMap<_, _> = dsn
+            .split_whitespace()
+            .filter_map(|p| p.split_once('='))
+            .collect();
+        let get = |k| kv.get(k).copied().unwrap_or_default();
+        let url = format!(
+            "postgres://{}:{}@{}/{}?model={model}",
+            get("user"),
+            get("password"),
+            // The port too: a test server off 5432 must not be missed.
+            match get("port") {
+                "" => get("host").to_owned(),
+                port => format!("{}:{port}", get("host")),
+            },
+            get("dbname")
+        );
+        // An empty model with Time × Product, saved through the store so the
+        // catalog rows exist; then a fact table bound to Price by SQL.
+        let mut m = Model::new();
+        m.add_category(CategoryId(1), "Time");
+        m.add_category(CategoryId(2), "Product");
+        m.add_measure(Measure {
+            id: MeasureId(100),
+            name: Name("Price".into()),
+            value_type: ValueType::Number,
+            categories: vec![CategoryId(1), CategoryId(2)],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        let mut store = improv_store::Store::open(&url).unwrap();
+        store.save_model(&m).unwrap();
+        let mut sql = postgres::Client::connect(&dsn, postgres::NoTls).unwrap();
+        sql.batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (quarter text, product text, price float8,
+                                   PRIMARY KEY (quarter, product));
+             INSERT INTO {table} VALUES ('Q1','Widget',10), ('Q2','Widget',20);
+             INSERT INTO improv.binding (model_id, measure_id, rel, value_col, dim_cols)
+             SELECT id, 100, '{table}'::regclass, 'price',
+                    '{{\"Time\":\"quarter\",\"Product\":\"product\"}}'
+             FROM improv.model WHERE name = '{model}';"
+        ))
+        .unwrap();
+        let price = |sql: &mut postgres::Client, q: &str| -> f64 {
+            sql.query_one(
+                &format!("SELECT price FROM {table} WHERE quarter = $1"),
+                &[&q],
+            )
+            .unwrap()
+            .get(0)
+        };
+
+        let mut app = ImprovApp::load(&url).expect("load");
+        let item = |app: &ImprovApp, n: &str| {
+            app.model
+                .items
+                .values()
+                .find(|i| i.name.0 == n)
+                .map(|i| i.id)
+                .unwrap()
+        };
+        let (q1, w) = (item(&app, "Q1"), item(&app, "Widget"));
+        let at =
+            |t| improv_core_model::Coordinate::from_pairs([(CategoryId(1), t), (CategoryId(2), w)]);
+
+        // SQL edits Q2 after the GUI loaded; the GUI edits Q1 and saves.
+        sql.execute(
+            &format!("UPDATE {table} SET price = 25 WHERE quarter = 'Q2'"),
+            &[],
+        )
+        .unwrap();
+        Arc::make_mut(&mut app.model).set_input(MeasureId(100), at(q1), Value::Number(11.0));
+        app.save().expect("saving an unrelated cell succeeds");
+        assert_eq!(price(&mut sql, "Q1"), 11.0, "the GUI's edit was written");
+        assert_eq!(
+            price(&mut sql, "Q2"),
+            25.0,
+            "the SQL edit survived the GUI save"
+        );
+
+        // SQL edits Q1; the GUI, still holding 11, edits Q1 too.
+        sql.execute(
+            &format!("UPDATE {table} SET price = 99 WHERE quarter = 'Q1'"),
+            &[],
+        )
+        .unwrap();
+        Arc::make_mut(&mut app.model).set_input(MeasureId(100), at(q1), Value::Number(12.0));
+        let err = app
+            .save()
+            .expect_err("overwriting a concurrent SQL edit is a conflict");
+        assert!(err.contains("conflict"), "{err}");
+        assert_eq!(price(&mut sql, "Q1"), 99.0, "the SQL value is untouched");
+
+        // File ▸ Revert to Saved picks up the SQL edit; the retried edit saves.
+        assert!(app.command_enabled(Command::RevertToSaved));
+        app.revert_to_saved().expect("revert");
+        assert_eq!(
+            app.model.input(MeasureId(100), &at(q1)),
+            Some(&Value::Number(99.0))
+        );
+        assert!(!app.can_undo() && !app.dirty);
+        Arc::make_mut(&mut app.model).set_input(MeasureId(100), at(q1), Value::Number(12.0));
+        app.save().expect("the retried edit saves after the revert");
+        assert_eq!(price(&mut sql, "Q1"), 12.0);
+        sql.batch_execute(&format!(
+            "DROP TABLE {table}; DELETE FROM improv.model WHERE name = '{model}'"
+        ))
+        .unwrap();
+    }
+
+    // -- H7: build a model from scratch (File ▸ New/Open, Edit ▸ Add …)
+
+    fn names_of(model: &Model) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        (
+            sorted(
+                model
+                    .categories
+                    .values()
+                    .map(|c| c.name.0.clone())
+                    .collect(),
+            ),
+            sorted(model.items.values().map(|i| i.name.0.clone()).collect()),
+            sorted(model.measures.values().map(|m| m.name.0.clone()).collect()),
+        )
+    }
+
+    /// Tutorial 1 from an empty window: File ▸ New at a path, two
+    /// categories with items, an input measure, a value, a derived measure.
+    /// Every step autosaves (a reload sees it) and undoes one at a time.
+    #[test]
+    fn a_model_is_built_from_an_empty_gui_saved_and_undone() {
+        let db = temp_db("h7_build");
+        let _cleanup = Cleanup(db.clone());
+        let mut app = build_app(Model::new());
+        app.switch_model(&db, true).expect("File ▸ New");
+        assert_eq!(app.db, db);
+        assert!(!app.command_enabled(Command::AddItem), "no category yet");
+
+        let time = |app: &ImprovApp| app.model.category_by_name("Time").map(|c| c.id);
+        app.add_named(NewThing::Category, "Time").expect("Time");
+        let t = time(&app).expect("Time added");
+        assert!(app.command_enabled(Command::AddItem));
+        assert_eq!(app.add_item_target(), Some(t));
+        for q in ["Q1", "Q2"] {
+            assert_eq!(
+                app.add_named(NewThing::Item(t), q).as_deref(),
+                Ok(format!("added {q} to Time").as_str())
+            );
+        }
+        app.add_named(NewThing::Category, "Product")
+            .expect("Product");
+        let p = app.model.category_by_name("Product").expect("added").id;
+        app.add_named(NewThing::Item(p), "Widget").expect("Widget");
+        assert_eq!(app.selected(), None, "no measure yet");
+        app.add_named(NewThing::Input, "Price").expect("Price");
+        let price = app.model.measure_by_name("Price").expect("added");
+        assert_eq!(price.categories, vec![t, p], "over every category");
+        assert_eq!(price.kind, MeasureKind::Input);
+        let price = price.id;
+        assert_eq!(app.selected(), Some(price), "an empty worksheet shows it");
+
+        app.sync_axis_state();
+        let key = app.cursor_key().expect("a cell under the cursor");
+        app.commit_cell_text(price, key.clone(), "4")
+            .expect("type a value");
+        let twice = app
+            .add_derived_measure("Twice", "Price * 2")
+            .expect("Twice");
+        assert_eq!(app.values_for(twice).get(&key), Some(&8.0));
+
+        let reloaded = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert_eq!(names_of(&reloaded), names_of(&app.model), "autosaved");
+        assert_eq!(
+            reloaded.input(price, &decode(&key)),
+            Some(&Value::Number(4.0))
+        );
+
+        // Undo walks back: Twice, the value, Price, Widget, Product, Q2 …
+        app.undo().expect("undo Twice");
+        app.undo().expect("undo the value");
+        app.undo().expect("undo Price");
+        assert!(app.model.measure_by_name("Price").is_none());
+        assert_eq!(app.selected(), None, "the worksheet lets go of Price");
+        app.undo().expect("undo Widget");
+        app.undo().expect("undo Product");
+        app.undo().expect("undo Q2");
+        assert_eq!(names_of(&app.model).1, vec!["Q1".to_string()]);
+        let reloaded = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert_eq!(names_of(&reloaded), names_of(&app.model), "undo saved");
+        app.redo().expect("redo Q2");
+        assert_eq!(names_of(&app.model).1, vec!["Q1".to_string(), "Q2".into()]);
+    }
+
+    /// H1-6: `Name: Category, Category` makes an input measure over those
+    /// categories, in that order (the TUI's form); `Name:` a scalar. A name
+    /// with a comma, an unknown or repeated category is refused.
+    #[test]
+    fn an_input_measure_takes_its_categories_after_a_colon() {
+        let mut app = build_app(grid_2x2_model());
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        let cats =
+            |app: &ImprovApp, n: &str| app.model.measure_by_name(n).map(|m| m.categories.clone());
+        app.add_named(NewThing::Input, " Cost : Product, Time ")
+            .expect("Cost");
+        assert_eq!(cats(&app, "Cost"), Some(vec![p, t]));
+        app.add_named(NewThing::Input, "Tax:").expect("a scalar");
+        assert_eq!(cats(&app, "Tax"), Some(vec![]));
+        app.add_named(NewThing::Input, "Units")
+            .expect("every category");
+        assert_eq!(cats(&app, "Units"), Some(vec![t, p]));
+        let before = (*app.model).clone();
+        let refuse =
+            |app: &mut ImprovApp, line: &str| app.add_named(NewThing::Input, line).expect_err(line);
+        assert!(refuse(&mut app, "Spent, Time").contains("cannot hold a comma"));
+        assert!(refuse(&mut app, "Spent: Region").contains("no category \"Region\""));
+        assert_eq!(
+            refuse(&mut app, "Spent: Time, Time"),
+            "Time is listed twice"
+        );
+        assert_eq!(
+            refuse(&mut app, ": Time"),
+            "type Name, or Name: Category, Category"
+        );
+        assert!(refuse(&mut app, "Cost: Time").contains("already"));
+        assert_eq!(*app.model, before);
+    }
+
+    /// H1-6: an input measure's categories change. An added one puts the
+    /// cells at its first item, a removed one keeps the cells at its first
+    /// item; the formulas over it take their new shape, the open worksheet
+    /// shows it, and undo puts it all back.
+    #[test]
+    fn an_input_measures_categories_change_and_its_formulas_follow() {
+        let mut app = build_app(grid_2x2_model());
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        let (price, qty, rev) = (MeasureId(100), MeasureId(101), MeasureId(102));
+        let at = |pairs: &[(CategoryId, u32)]| {
+            improv_core_model::Coordinate::from_pairs(pairs.iter().map(|&(c, i)| (c, ItemId(i))))
+        };
+        let before = (*app.model).clone();
+        select(&mut app, qty);
+        app.sync_axis_state();
+        assert_eq!(
+            app.set_input_categories(qty, vec![p]).as_deref(),
+            Ok("Quantity's categories changed; 2 cells at other items dropped")
+        );
+        assert_eq!(
+            app.model.input(qty, &at(&[(p, 20)])),
+            Some(&Value::Number(100.0))
+        );
+        assert_eq!(
+            app.model.inputs.keys().filter(|(m, _)| *m == qty).count(),
+            2
+        );
+        assert_eq!(
+            app.model.measures[&rev].categories,
+            vec![p],
+            "Revenue follows"
+        );
+        let k: CoordKey = improv_engine::smallvec::smallvec![(2, 20)];
+        assert_eq!(app.values_for(rev).get(&k), Some(&1000.0));
+        // Back over Time: the cells land on its first item, 2025, and the
+        // worksheet (still on Quantity) puts Time back on its rows.
+        app.set_input_categories(qty, vec![p, t])
+            .expect("add Time back");
+        assert_eq!(
+            app.model.input(qty, &at(&[(p, 20), (t, 10)])),
+            Some(&Value::Number(100.0))
+        );
+        app.sync_axis_state();
+        assert_eq!(app.focused().row_cats(&app.model), vec![t]);
+        assert!(app.cursor_key().is_some(), "a cell is fully specified");
+        assert_eq!(
+            app.set_input_categories(qty, vec![p, t]).as_deref(),
+            Ok("Quantity is unchanged")
+        );
+        app.undo().expect("undo");
+        app.undo().expect("undo");
+        assert_eq!(*app.model, before);
+
+        // Refused: a formula's categories, an empty category over cells, a
+        // formula that would no longer compile, a category that is gone.
+        assert!(app
+            .set_input_categories(rev, vec![t])
+            .unwrap_err()
+            .contains("formula"));
+        Arc::make_mut(&mut app.model).add_category(CategoryId(3), "Region");
+        let e = app
+            .set_input_categories(price, vec![p, CategoryId(3)])
+            .unwrap_err();
+        assert_eq!(e, "Region has no items: add one first");
+        app.add_derived_measure("Prior", "PREV(Quantity, Time)")
+            .expect("Prior");
+        let e = app.set_input_categories(qty, vec![p]).unwrap_err();
+        assert!(e.starts_with("Prior: "), "{e}");
+        assert!(app.set_input_categories(qty, vec![CategoryId(9)]).is_err());
+        assert!(app.set_input_categories(MeasureId(99), vec![]).is_err());
+        assert_eq!(app.model.measures[&qty].categories, vec![t, p]);
+        // A category the worksheet never showed joins its pages.
+        Arc::make_mut(&mut app.model).add_item(ItemId(30), CategoryId(3), "North");
+        select(&mut app, price);
+        app.sync_axis_state();
+        app.set_input_categories(price, vec![p, CategoryId(3)])
+            .expect("Price over Region");
+        app.sync_axis_state();
+        assert_eq!(app.page_cats(), vec![CategoryId(3)]);
+        assert!(app.cursor_key().is_some(), "a cell is fully specified");
+    }
+
+    /// The painted rect of text `label` inside NxWindow `win`.
+    fn text_in(desk: &mut Desk, app: &mut ImprovApp, win: &str, label: &str) -> egui::Rect {
+        let out = desk.frame(app, Vec::new());
+        let r = crate::nxwin::stored_rect(&desk.ctx, panel_win(win))
+            .unwrap_or_else(|| panic!("the {win} window is shown"));
+        out.shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == label => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .find(|t| r.contains_rect(*t))
+            .unwrap_or_else(|| panic!("{label:?} in the {win} window"))
+    }
+
+    /// Black 1 px rules painted at the cell `(ri, ci)`'s right edge.
+    fn cell_ruled(out: &egui::FullOutput, cell: egui::Rect) -> bool {
+        out.shapes.iter().any(|c| match &c.shape {
+            egui::Shape::LineSegment { points, stroke } => {
+                stroke.width > 0.0
+                    && stroke.color == crate::theme::BLACK
+                    && (points[0].x - (cell.right() - 0.5)).abs() < 0.01
+                    && points[0].y <= cell.top() + 0.5
+                    && points[1].y >= cell.bottom() - 0.5
+            }
+            _ => false,
+        })
+    }
+
+    /// Gap 9: Edit ▸ Inspector… is Improv's Inspector, a pop-up over Grid,
+    /// Layout and Formulas pages. OK applies the panel to the focused
+    /// worksheet; Revert reads it back first.
+    #[test]
+    fn the_inspector_sets_grid_lines_markers_and_inline_errors() {
+        let (mut app, mut desk) = grid_desk();
+        app.run_command(&desk.ctx, Command::Inspector);
+        desk.settle(&mut app);
+        let cell = cell_rect(&desk, &app, 0, 0);
+        assert!(
+            cell_ruled(&desk.frame(&mut app, Vec::new()), cell),
+            "ruled at first"
+        );
+
+        // Grid: Show Grid Lines off, Revert puts it back, OK applies it.
+        let lines = text_in(&mut desk, &mut app, "inspector", "Show Grid Lines");
+        desk.click(&mut app, lines.center());
+        assert!(!app.inspector.unwrap().draft.opts.lines);
+        let revert = text_in(&mut desk, &mut app, "inspector", "Revert");
+        desk.click(&mut app, revert.center());
+        assert!(app.inspector.unwrap().draft.opts.lines, "reverted");
+        desk.click(&mut app, lines.center());
+        assert!(app.focused().opts.lines, "nothing applies before OK");
+        let ok = text_in(&mut desk, &mut app, "inspector", "OK");
+        desk.click(&mut app, ok.center());
+        assert!(!app.focused().opts.lines);
+        desk.settle(&mut app);
+        let out = desk.frame(&mut app, Vec::new());
+        assert!(!cell_ruled(&out, cell_rect(&desk, &app, 0, 0)), "unruled");
+
+        // Lines In Item Area: the headers are ruled, the cells are not.
+        app.focused_mut().opts = SheetOpts {
+            lines_in: LinesIn::Items,
+            ..SheetOpts::default()
+        };
+        desk.settle(&mut app);
+        let out = desk.frame(&mut app, Vec::new());
+        assert!(!cell_ruled(&out, cell_rect(&desk, &app, 0, 0)));
+        let header = text_at(&out.shapes, "WidgetA").expect("a column header");
+        let ruled_header = out.shapes.iter().any(|c| {
+            matches!(&c.shape, egui::Shape::LineSegment { points, stroke }
+                if stroke.color == crate::theme::BLACK && stroke.width > 0.0
+                    && points[0].y == points[1].y
+                    && points[0].x <= header.left() && points[1].x >= header.right()
+                    && (points[0].y - header.top()).abs() < 4.0)
+        });
+        assert!(ruled_header, "the item area keeps its rules");
+
+        // Layout: the Hidden Items marker. A filtered tile reads `Time*`.
+        app.toggle_filter_item(CategoryId(1), ItemId(10));
+        desk.settle(&mut app);
+        assert!(text_at(&desk.frame(&mut app, Vec::new()).shapes, "Time*").is_some());
+        app.focused_mut().opts.hidden_marker = false;
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(text_at(&shapes, "Time*").is_none() && text_at(&shapes, "Time").is_some());
+
+        // The pop-up names the three pages.
+        let popup = text_in(&mut desk, &mut app, "inspector", "Grid");
+        desk.click(&mut app, popup.center());
+        let texts = texts_of(&desk.frame(&mut app, Vec::new()));
+        for page in ["Layout", "Formulas"] {
+            assert!(texts.iter().any(|t| t == page), "{page} in {texts:?}");
+        }
+        // Its close box puts it away.
+        let close = close_box_of(&desk.ctx, panel_win("inspector")).expect("shown");
+        desk.click(&mut app, egui::pos2(5.0, 795.0));
+        desk.click(&mut app, close.center());
+        assert!(app.inspector.is_none());
+    }
+
+    /// Gap 9: with Show Errors In Line off, a formula's error moves from
+    /// under its row into its status indicator's tip.
+    #[test]
+    fn errors_in_line_can_be_turned_off() {
+        let mut model = grid_2x2_model();
+        model.add_measure(Measure {
+            id: MeasureId(103),
+            name: Name("Broken".into()),
+            value_type: ValueType::Number,
+            categories: vec![CategoryId(1), CategoryId(2)],
+            kind: MeasureKind::Derived(Formula::new(Expr::Ref(
+                MeasureId(999),
+                DimensionSpec::default(),
+            ))),
+            description: None,
+            format: None,
+        });
+        let mut app = build_app(model);
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let warned = |texts: Vec<String>| texts.iter().any(|t| t.starts_with("⚠ "));
+        assert!(
+            warned(texts_of(&desk.frame(&mut app, Vec::new()))),
+            "in line"
+        );
+        app.focused_mut().opts.errors_inline = false;
+        desk.settle(&mut app);
+        assert!(
+            !warned(texts_of(&desk.frame(&mut app, Vec::new()))),
+            "tip only"
+        );
+    }
+
+    /// Gap 9: Format ▸ Format Panel… (Ctrl+Shift+F) is Improv's Format panel:
+    /// Number sets General or Specific decimals and Commas over a sample,
+    /// Alignment Smart, Left, Center or Right; Set applies both to the
+    /// focused worksheet, the format as one undo step.
+    #[test]
+    fn the_format_panel_sets_decimals_commas_and_alignment() {
+        let (mut app, mut desk) = grid_desk();
+        let shift_f = egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+        };
+        let _ = desk.frame(&mut app, vec![shift_f]);
+        desk.settle(&mut app);
+        assert!(app.format_panel.is_some(), "Ctrl+Shift+F opens it");
+        let sample = |desk: &mut Desk, app: &mut ImprovApp| {
+            texts_of(&desk.frame(app, Vec::new()))
+                .into_iter()
+                .find(|t| t.contains("1234") || t.contains("1,23"))
+                .expect("the sample")
+        };
+        assert_eq!(sample(&mut desk, &mut app), "-1234.5678", "General");
+
+        let specific = text_in(&mut desk, &mut app, "format", "Specific");
+        desk.click(&mut app, specific.center());
+        let commas = text_in(&mut desk, &mut app, "format", "Commas");
+        desk.click(&mut app, commas.center());
+        assert_eq!(sample(&mut desk, &mut app), "-1,234.57", "2 places, commas");
+        assert_eq!(app.number_format(MeasureId(101)), None, "not before Set");
+
+        // Alignment: Center.
+        if let Some(p) = &mut app.format_panel {
+            p.page = FormatPage::Alignment;
+        }
+        desk.settle(&mut app);
+        let center = text_in(&mut desk, &mut app, "format", "Center");
+        desk.click(&mut app, center.center());
+        let set = text_in(&mut desk, &mut app, "format", "Set");
+        desk.click(&mut app, set.center());
+        assert_eq!(
+            app.number_format(MeasureId(101)),
+            Some(NumberFormat {
+                decimals: Some(2),
+                grouping: true
+            })
+        );
+        assert_eq!(app.focused().opts.align, CellAlign::Center);
+        assert!(
+            app.status.contains("cells aligned center"),
+            "{}",
+            app.status
+        );
+        desk.settle(&mut app);
+        // 100 now shows as 100.00, centered in its cell.
+        let out = desk.frame(&mut app, Vec::new());
+        let cell = cell_rect(&desk, &app, 0, 0);
+        let text = text_at(&out.shapes, "100.00").expect("formatted");
+        assert!(
+            (text.center().x - cell.center().x).abs() < 1.5,
+            "{text:?} in {cell:?}"
+        );
+        app.undo().unwrap();
+        assert_eq!(app.number_format(MeasureId(101)), None, "one undo step");
+
+        // Right puts text right too; Left puts numbers left.
+        app.focused_mut().opts.align = CellAlign::Left;
+        desk.settle(&mut app);
+        let out = desk.frame(&mut app, Vec::new());
+        let cell = cell_rect(&desk, &app, 0, 0);
+        let text = text_at(&out.shapes, "100").expect("General again");
+        assert!(text.left() - cell.left() < 8.0, "{text:?} in {cell:?}");
+    }
+
+    /// Gap 9: the panels follow the focus, as a NeXT panel follows the
+    /// selection: another worksheet's options and measure show, and a text
+    /// measure's Number page says it has no numbers.
+    #[test]
+    fn the_panels_follow_the_focused_worksheet() {
+        let mut app = two_matrix_app();
+        app.matrices[1].opts.lines = false;
+        let mut desk = Desk::new();
+        app.run_command(&desk.ctx, Command::Inspector);
+        app.run_command(&desk.ctx, Command::FormatPanel);
+        desk.settle(&mut app);
+        let uid = |app: &ImprovApp, i: usize| app.matrices[i].uid;
+        assert_eq!(app.inspector.unwrap().draft.from.0, uid(&app, 0));
+        assert!(app.inspector.unwrap().draft.opts.lines);
+        app.set_focus(1);
+        desk.settle(&mut app);
+        let p = app.inspector.unwrap();
+        assert_eq!((p.draft.from.0, p.draft.opts.lines), (uid(&app, 1), false));
+        assert_eq!(app.format_panel.unwrap().draft.from.1, Some(MeasureId(102)));
+        // Format menu picks show in the open panel.
+        app.run_command(&desk.ctx, Command::Decimals(Some(3)));
+        desk.settle(&mut app);
+        assert_eq!(app.format_panel.unwrap().draft.decimals, Some(3));
+        // An unchanged Set says so.
+        let set = text_in(&mut desk, &mut app, "format", "Set");
+        desk.click(&mut app, set.center());
+        assert_eq!(app.status, "the format is unchanged");
+
+        let mut t = build_app(typed_model());
+        select(&mut t, MeasureId(2));
+        let mut desk = Desk::new();
+        t.run_command(&desk.ctx, Command::FormatPanel);
+        desk.settle(&mut t);
+        let texts = texts_of(&desk.frame(&mut t, Vec::new()));
+        assert!(
+            texts
+                .iter()
+                .any(|x| x == "This measure holds no numbers to format."),
+            "{texts:?}"
+        );
+    }
+
+    /// Gap 11: Print… (Ctrl+P) opens the Print panel; Save as PDF writes
+    /// the focused worksheet's items and cells, as they show, to a PDF and
+    /// Save as PostScript to a PostScript file, and the panel closes.
+    #[test]
+    fn print_saves_the_worksheet_as_pdf_and_postscript() {
+        let (mut app, mut desk) = grid_desk();
+        let ctrl_p = egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        };
+        let _ = desk.frame(&mut app, vec![ctrl_p]);
+        desk.settle(&mut app);
+        let dir = std::env::temp_dir().join(format!("improv-print-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.join("sheet");
+        app.print_panel.as_mut().expect("Ctrl+P opens Print").path = base.display().to_string();
+        let pdf = text_in(&mut desk, &mut app, "print", "Save as PDF");
+        desk.click(&mut app, pdf.center());
+        assert!(app.print_panel.is_none(), "{}", app.status);
+        assert!(app.status.starts_with("saved 1 page to "), "{}", app.status);
+        let bytes = std::fs::read(base.with_extension("pdf")).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        for want in [
+            "%PDF-1.4",
+            "(Time) Tj",
+            "(WidgetA) Tj",
+            "(2026) Tj",
+            "(120) Tj",
+            "(Page 1) Tj",
+        ] {
+            assert!(text.contains(want), "{want} in the PDF");
+        }
+        assert!(
+            text.contains("(Quantity) Tj"),
+            "the worksheet's name heads the page"
+        );
+
+        app.run_command(&desk.ctx, Command::Print);
+        app.print_panel.as_mut().unwrap().path = base.display().to_string();
+        desk.settle(&mut app);
+        let ps = text_in(&mut desk, &mut app, "print", "Save as PostScript");
+        desk.click(&mut app, ps.center());
+        let ps = std::fs::read_to_string(base.with_extension("ps")).unwrap();
+        assert!(ps.starts_with("%!PS-Adobe-3.0") && ps.contains("(WidgetB) "));
+
+        // An unwritable path says so and keeps the panel.
+        app.run_command(&desk.ctx, Command::Print);
+        app.print_panel.as_mut().unwrap().path = dir.join("no/such/dir/x").display().to_string();
+        desk.settle(&mut app);
+        let pdf = text_in(&mut desk, &mut app, "print", "Save as PDF");
+        desk.click(&mut app, pdf.center());
+        assert!(app.status.starts_with("could not write "), "{}", app.status);
+        assert!(app.print_panel.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Gap 11: the sheet Print lays out is the worksheet as it shows: its
+    /// number format and alignment, the selection with Print Selected Data
+    /// Only, the formulas, and the Inspector's rules.
+    #[test]
+    fn the_printed_sheet_is_the_worksheet_as_it_shows() {
+        use crate::print::Align;
+        let (mut app, _desk) = grid_desk();
+        let s = app.print_sheet(false);
+        assert_eq!(s.corner, ["Time"]);
+        assert_eq!(s.col_heads, [["WidgetA", "WidgetB"]]);
+        assert_eq!(s.rows.len(), 2);
+        assert_eq!(s.rows[1].0, ["2026"]);
+        assert_eq!(s.rows[1].1[0], ("120".to_owned(), Align::Right));
+        assert_eq!(s.formulas, ["1. Revenue = Price * Quantity"]);
+        assert!(s.item_rules && s.cell_rules);
+        app.set_format(NumberFormat {
+            decimals: Some(1),
+            grouping: false,
+        })
+        .unwrap();
+        app.focused_mut().opts.align = CellAlign::Center;
+        app.focused_mut().opts.lines_in = LinesIn::Items;
+        // The selection: row 1, column 1 only.
+        app.focused_mut().anchor = Some((1, 1));
+        (app.focused_mut().cursor_row, app.focused_mut().cursor_col) = (1, 1);
+        let s = app.print_sheet(true);
+        assert_eq!(s.col_heads, [["WidgetB"]]);
+        assert_eq!(
+            s.rows,
+            [(
+                vec!["2026".to_owned()],
+                vec![("80.0".to_owned(), Align::Center)]
+            )]
+        );
+        assert!(s.item_rules && !s.cell_rules);
+        // The page numbers start where Report Layout says.
+        app.report_layout.first_page = 3;
+        let doc = app.print_doc(false);
+        assert!(doc.pages[0]
+            .iter()
+            .any(|o| matches!(o, crate::print::Op::Text { s, .. } if s == "Page 3")));
+    }
+
+    /// Gap 11: Format ▸ Page Layout… and Report Layout… are NeXT panels
+    /// whose settings every print uses; Print Selected Data Only is grayed
+    /// with one cell selected.
+    #[test]
+    fn page_and_report_layout_panels_set_the_print() {
+        let (mut app, mut desk) = grid_desk();
+        app.run_command(&desk.ctx, Command::PageLayout);
+        app.run_command(&desk.ctx, Command::ReportLayout);
+        desk.settle(&mut app);
+        let land = text_in(&mut desk, &mut app, "page_layout", "Landscape");
+        desk.click(&mut app, land.center());
+        assert!(app.page_layout.landscape);
+        assert!(texts_of(&desk.frame(&mut app, Vec::new())).contains(&"11.0 x 8.5 in".to_owned()));
+        let formulas = text_in(&mut desk, &mut app, "report_layout", "Formulas");
+        desk.click(&mut app, formulas.center());
+        let across = text_in(&mut desk, &mut app, "report_layout", "Left to Right");
+        desk.click(&mut app, across.center());
+        assert!(app.report_layout.formulas && app.report_layout.across_first);
+        assert_eq!(app.print_doc(false).size, (792.0, 612.0));
+        assert_eq!(app.print_doc(false).pages.len(), 2, "data, then formulas");
+        let close = close_box_of(&desk.ctx, panel_win("page_layout")).expect("shown");
+        desk.click(&mut app, close.center());
+        assert!(!app.show_page_layout);
+
+        app.run_command(&desk.ctx, Command::Print);
+        desk.settle(&mut app);
+        let texts = texts_of(&desk.frame(&mut app, Vec::new()));
+        assert!(texts.contains(&"(2 pages)".to_owned()), "{texts:?}");
+        let only = text_in(&mut desk, &mut app, "print", "Print Selected Data Only");
+        desk.click(&mut app, only.center());
+        assert!(
+            !app.print_panel.as_ref().unwrap().selection,
+            "one cell: grayed"
+        );
+    }
+
+    /// H1-6: the Info panel shows a box per category for an input measure;
+    /// unchecking one takes it out of the measure's categories.
+    #[test]
+    fn the_info_panel_changes_an_input_measures_categories() {
+        let (mut app, mut desk) = grid_desk();
+        app.show_inspector = true;
+        desk.settle(&mut app);
+        let out = desk.frame(&mut app, Vec::new());
+        let info = crate::nxwin::stored_rect(&desk.ctx, panel_win("info")).expect("Info shown");
+        let time = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Time" => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .find(|r| info.contains_rect(*r))
+            .expect("a Time box in the Info panel");
+        desk.click(&mut app, time.center());
+        assert_eq!(
+            app.model.measures[&MeasureId(101)].categories,
+            vec![CategoryId(2)]
+        );
+        assert!(
+            app.status.starts_with("Quantity's categories changed"),
+            "{}",
+            app.status
+        );
+    }
+
+    /// Bad names are refused with a reason and change nothing.
+    #[test]
+    fn adding_a_clashing_or_empty_name_is_refused() {
+        let mut app = build_app(grid_2x2_model());
+        let before = (*app.model).clone();
+        let t = CategoryId(1);
+        let refuse =
+            |app: &mut ImprovApp, what, name: &str| app.add_named(what, name).expect_err(name);
+        assert_eq!(refuse(&mut app, NewThing::Category, "  "), "type a name");
+        assert!(refuse(&mut app, NewThing::Category, "Time").contains("already"));
+        assert!(refuse(&mut app, NewThing::Category, "Price").contains("already"));
+        assert!(refuse(&mut app, NewThing::Input, "Product").contains("already"));
+        assert!(refuse(&mut app, NewThing::Item(t), "2025").contains("Time already has"));
+        assert!(refuse(&mut app, NewThing::Item(CategoryId(9)), "X").contains("no category"));
+        assert_eq!(*app.model, before);
+        assert!(!app.can_undo());
+        // The same item name in another category is fine.
+        app.add_named(NewThing::Item(CategoryId(2)), "2025")
+            .expect("Product may have a 2025");
+    }
+
+    /// Edit ▸ Add Category opens the browser's Categories list at its
+    /// New category line, focused: type a name, press Enter, and the line
+    /// clears for the next one.
+    #[test]
+    fn worksheet_add_category_types_into_the_browser() {
+        let mut app = build_app(grid_2x2_model());
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        app.show_browser = false;
+        app.run_command(&ctx, Command::AddCategory);
+        assert!(app.show_browser);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        let field = NewThing::Category.field();
+        assert_eq!(ctx.memory(|m| m.focused()), Some(field), "focused");
+        assert_eq!(app.reveal, None, "revealed once");
+        focused_frame(
+            &ctx,
+            &mut app,
+            "new_category",
+            vec![egui::Event::Text("Region".into())],
+        );
+        focused_frame(&ctx, &mut app, "new_category", vec![enter()]);
+        assert_eq!(app.status, "added category Region");
+        assert!(app.model.category_by_name("Region").is_some());
+        let buf: Option<String> = ctx.data_mut(|d| d.get_temp(field));
+        assert_eq!(buf.unwrap_or_default(), "", "the line is cleared");
+        // Measures ends in a New input measure line.
+        app.run_command(&ctx, Command::AddInputMeasure);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        focused_frame(
+            &ctx,
+            &mut app,
+            "new_input",
+            vec![egui::Event::Text("Cost".into())],
+        );
+        focused_frame(&ctx, &mut app, "new_input", vec![enter()]);
+        assert!(
+            app.model.measure_by_name("Cost").is_some(),
+            "{}",
+            app.status
+        );
+        // A refused name stays in the line, with the reason in the status.
+        focused_frame(
+            &ctx,
+            &mut app,
+            "new_input",
+            vec![egui::Event::Text("Cost".into())],
+        );
+        focused_frame(&ctx, &mut app, "new_input", vec![enter()]);
+        assert!(app.status.contains("already"), "{}", app.status);
+        let buf: Option<String> = ctx.data_mut(|d| d.get_temp(NewThing::Input.field()));
+        assert_eq!(buf.as_deref(), Some("Cost"));
+        // And each category lists its own New item line.
+        app.run_command(&ctx, Command::AddItem);
+        // Its category's header animates open first.
+        for t in [1.0, 2.0, 3.0] {
+            let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), t);
+        }
+        let target = app.add_item_target().expect("a category");
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(NewThing::Item(target).field())
+        );
+    }
+
+    /// Improv's way to add an item: type it into the category's tile (its
+    /// right-click menu ends in a New item line).
+    #[test]
+    fn typing_in_a_tile_adds_an_item_to_its_category() {
+        let mut app = gutter_app();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let time = CategoryId(1);
+        open_tile_menu(&mut desk, &mut app, time);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(
+            text_at(&shapes, "New item").is_some(),
+            "the tile menu offers it"
+        );
+        let field = egui::Id::unique(("tile_new_item", app.matrices[0].uid, time.0));
+        for ev in [egui::Event::Text("2027".into()), enter()] {
+            desk.ctx.memory_mut(|m| m.request_focus(field));
+            let _ = desk.frame(&mut app, vec![ev]);
+        }
+        let cat = &app.model.categories[&time];
+        let names: Vec<&str> = cat
+            .items
+            .iter()
+            .map(|i| app.model.items[i].name.0.as_str())
+            .collect();
+        assert!(names.contains(&"2027"), "{names:?}: {}", app.status);
+        assert!(app.can_undo());
+    }
+
+    /// File ▸ New and Open… switch the window's model; a bad target changes
+    /// nothing.
+    #[test]
+    fn file_new_and_open_switch_models_or_refuse() {
+        let seeded = temp_db("h7_open");
+        let _c1 = Cleanup(seeded.clone());
+        Store::open(&seeded)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let fresh = temp_db("h7_new");
+        let _c2 = Cleanup(fresh.clone());
+
+        let mut app = build_app(revenue_model());
+        let before = (*app.model).clone();
+        let missing = temp_db("h7_missing");
+        assert!(app
+            .switch_model(&missing, false)
+            .unwrap_err()
+            .starts_with("no model at"));
+        assert!(
+            !std::path::Path::new(&missing).exists(),
+            "Open never creates"
+        );
+        assert_eq!(
+            app.switch_model("", false).unwrap_err(),
+            "type a model file or postgres:// URL"
+        );
+        assert!(app
+            .switch_model(&seeded, true)
+            .unwrap_err()
+            .contains("already holds a model"));
+        assert_eq!(*app.model, before);
+
+        app.switch_model(&seeded, false).expect("Open");
+        assert_eq!(app.model.measures.len(), 3);
+        assert_eq!(app.db, seeded);
+        app.switch_model(&fresh, true).expect("New");
+        assert!(app.model.categories.is_empty() && app.db == fresh);
+        app.switch_model("", true).expect("New in memory");
+        assert!(app.db.is_empty() && app.model.measures.is_empty());
+
+        // Through the panel: File ▸ Open…, type the path, Enter.
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        app.run_command(&ctx, Command::OpenModel);
+        assert_eq!(app.file_panel, Some(Command::OpenModel));
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        focused_frame(
+            &ctx,
+            &mut app,
+            "file_path",
+            vec![egui::Event::Text(seeded.clone())],
+        );
+        focused_frame(&ctx, &mut app, "file_path", vec![enter()]);
+        assert_eq!(app.db, seeded, "{}", app.status);
+        assert_eq!(app.file_panel, None, "the panel closes");
+        assert!(app.status.starts_with("opened "));
+
+        // A bad path keeps the panel up with the reason.
+        app.run_command(&ctx, Command::OpenModel);
+        app.file_path = missing.clone();
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        focused_frame(&ctx, &mut app, "file_path", vec![enter()]);
+        assert_eq!(app.file_panel, Some(Command::OpenModel));
+        assert!(app.status.starts_with("no model at"), "{}", app.status);
+        // Its close box dismisses it.
+        let shapes = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0).shapes;
+        assert!(text_at(&shapes, "Open").is_some());
+        app.file_panel = None;
+        let shapes = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0).shapes;
+        assert!(text_at(&shapes, "Model file or postgres:// URL:").is_none());
+    }
+
+    /// H1-12: File ▸ New and Open… give the path field the keyboard, so a
+    /// path typed at once lands there; Escape closes the panel.
+    #[test]
+    fn the_file_panel_takes_the_keyboard_and_escape_closes_it() {
+        for c in [Command::NewModel, Command::OpenModel, Command::SaveAs] {
+            let mut app = build_app(grid_2x2_model());
+            let mut desk = Desk::new();
+            desk.settle(&mut app);
+            app.run_command(&desk.ctx, c);
+            desk.settle(&mut app);
+            type_text(&mut desk, &mut app, "x.db");
+            assert_eq!(app.file_path, "x.db", "{c:?}");
+            assert_eq!(app.selected(), Some(MeasureId(100)), "the grid saw nothing");
+            key(
+                &mut desk,
+                &mut app,
+                egui::Key::Escape,
+                egui::Modifiers::NONE,
+            );
+            assert_eq!(app.file_panel, None, "{c:?}: Escape closes it");
+        }
+    }
+
+    // -- H7: rename and delete categories, items and measures
+
+    /// Rename each kind: formulas follow (they hold ids), the store has the
+    /// new names after each autosave, and undo walks every rename back.
+    #[test]
+    fn renames_autosave_follow_into_formulas_and_undo() {
+        let db = temp_db("h7_rename");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let mut app = ImprovApp::load(&db).expect("load");
+        let price = Thing::Measure(MeasureId(100));
+        assert_eq!(
+            app.rename(price, " Cost ").as_deref(),
+            Ok("renamed measure Price to Cost")
+        );
+        assert_eq!(
+            app.rename(Thing::Category(CategoryId(1)), "Year")
+                .as_deref(),
+            Ok("renamed category Time to Year")
+        );
+        assert_eq!(
+            app.rename(Thing::Item(ItemId(20)), "Gizmo").as_deref(),
+            Ok("renamed item WidgetA to Gizmo")
+        );
+        assert_eq!(
+            app.rename(price, "Cost").as_deref(),
+            Ok("Cost is unchanged")
+        );
+        assert_eq!(
+            app.formula_source(MeasureId(102)).as_deref(),
+            Some("Cost * Quantity")
+        );
+        assert_eq!(app.values_for(MeasureId(102)).len(), 4, "still computes");
+        let stored = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert_eq!(names_of(&stored), names_of(&app.model), "autosaved");
+        assert!(stored.category_by_name("Year").is_some());
+        for _ in 0..3 {
+            app.undo().expect("undo a rename");
+        }
+        assert_eq!(names_of(&app.model), names_of(&grid_2x2_model()));
+        let stored = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert_eq!(names_of(&stored), names_of(&grid_2x2_model()), "undo saved");
+    }
+
+    /// A rename to a taken or empty name, or of something gone, changes
+    /// nothing.
+    #[test]
+    fn a_clashing_rename_is_refused() {
+        let mut app = build_app(grid_2x2_model());
+        let before = (*app.model).clone();
+        let refuse = |app: &mut ImprovApp, t, name: &str| app.rename(t, name).expect_err(name);
+        let price = Thing::Measure(MeasureId(100));
+        assert!(refuse(&mut app, price, "Quantity").contains("already"));
+        assert!(refuse(&mut app, price, "Time").contains("already"));
+        assert!(refuse(&mut app, Thing::Category(CategoryId(1)), "Revenue").contains("already"));
+        assert!(refuse(&mut app, Thing::Item(ItemId(10)), "2026").contains("Time already has"));
+        assert_eq!(refuse(&mut app, price, "  "), "type a name");
+        assert_eq!(
+            refuse(&mut app, Thing::Item(ItemId(99)), "x"),
+            "it no longer exists"
+        );
+        app.define_lambda("Twice = LAMBDA(x, 2 * x)")
+            .expect("a LAMBDA");
+        let before_lambda = (*app.model).clone();
+        assert!(refuse(&mut app, price, "twice").contains("already"));
+        assert_eq!(*app.model, before_lambda);
+        // The same item name in another category is fine.
+        app.rename(Thing::Item(ItemId(20)), "2025")
+            .expect("Product may have a 2025");
+        assert_ne!(*app.model, before);
+    }
+
+    /// Deleting a measure that a formula reads, or a category a measure
+    /// ranges over, is refused with the names of what still needs it, as
+    /// `improv.drop_measure` refuses.
+    #[test]
+    fn deleting_what_others_read_is_refused_naming_them() {
+        let mut app = build_app(grid_2x2_model());
+        app.add_derived_measure("Twice", "Revenue * 2")
+            .expect("Twice");
+        app.add_derived_measure("Half", "Revenue / 2")
+            .expect("Half");
+        app.add_named(NewThing::Category, "Region").expect("Region");
+        let region = app.model.category_by_name("Region").expect("added").id;
+        app.add_derived_measure("Share", "Quantity / SUM(Quantity OVER Time)")
+            .expect("Share");
+        let before = (*app.model).clone();
+        assert_eq!(
+            app.delete(Thing::Measure(MeasureId(102))).unwrap_err(),
+            "cannot delete Revenue: Half, Twice still reference it (delete or redefine them first)"
+        );
+        assert_eq!(
+            app.delete(Thing::Measure(MeasureId(100))).unwrap_err(),
+            "cannot delete Price: Revenue still references it (delete or redefine it first)"
+        );
+        let e = app.delete(Thing::Category(CategoryId(1))).unwrap_err();
+        assert!(e.starts_with("cannot delete Time: "), "{e}");
+        assert!(e.contains("Quantity") && e.contains("Share"), "{e}");
+        assert_eq!(*app.model, before, "nothing changed");
+        // The same reason comes from Edit ▸ Delete…, with no panel.
+        app.browser_pick = Some(Thing::Measure(MeasureId(102)));
+        let ctx = egui::Context::default();
+        app.run_command(&ctx, Command::Delete);
+        assert!(app.confirm_delete.is_none());
+        assert!(
+            app.status.starts_with("cannot delete Revenue"),
+            "{}",
+            app.status
+        );
+        // Nothing uses Region yet; a measure that names it in OVER does.
+        app.add_named(NewThing::Item(region), "North")
+            .expect("North");
+        assert!(app.delete_blockers(Thing::Category(region)).is_none());
+        let mut named = (*app.model).clone();
+        let f = parser::parse_expr(&named, "SUM(Quantity OVER Region)").expect("parse");
+        named.add_measure(Measure {
+            id: MeasureId(200),
+            name: Name("Odd".into()),
+            value_type: ValueType::Number,
+            categories: vec![],
+            kind: MeasureKind::Derived(f),
+            description: None,
+            format: None,
+        });
+        app.model = Arc::new(named);
+        assert!(app
+            .delete_blockers(Thing::Category(region))
+            .is_some_and(|e| e.contains("Odd still uses it")));
+    }
+
+    /// Deletes autosave and undo: a formula, then an input measure with
+    /// its cells (views lose its matrix), an item with its cells, and a
+    /// category with its items. Each undo puts it back, in the store too.
+    #[test]
+    fn deletes_autosave_take_what_goes_with_them_and_undo() {
+        let db = temp_db("h7_delete");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let mut app = ImprovApp::load(&db).expect("load");
+        select(&mut app, MeasureId(101));
+        let both = app.save_view("both").expect("a view of Quantity");
+        select(&mut app, MeasureId(102));
+        let rev_view = app.save_view("rev").expect("a view of Revenue");
+        app.add_named(NewThing::Category, "Region").expect("Region");
+        let region = app.model.category_by_name("Region").expect("added").id;
+        for r in ["North", "South"] {
+            app.add_named(NewThing::Item(region), r).expect("item");
+        }
+        let start = (*app.model).clone();
+        let reload = || {
+            Store::open(&db)
+                .and_then(|mut s| s.load_model())
+                .expect("reload")
+        };
+
+        assert_eq!(
+            app.delete_question(Thing::Measure(MeasureId(102)))
+                .as_deref(),
+            Ok("Delete the formula Revenue?")
+        );
+        assert_eq!(
+            app.delete(Thing::Measure(MeasureId(102))).as_deref(),
+            Ok("deleted measure Revenue")
+        );
+        assert!(
+            !app.model.views.contains_key(&rev_view),
+            "its only matrix went"
+        );
+        assert!(app.model.views.contains_key(&both));
+        assert!(app
+            .matrices
+            .iter()
+            .all(|m| m.measure != Some(MeasureId(102))));
+        assert_eq!(
+            app.delete_question(Thing::Measure(MeasureId(101)))
+                .as_deref(),
+            Ok("Delete the input measure Quantity and its 4 cells?")
+        );
+        app.delete(Thing::Measure(MeasureId(101)))
+            .expect("Quantity");
+        assert!(app.model.inputs.keys().all(|(m, _)| *m != MeasureId(101)));
+        assert!(app.model.views.is_empty(), "the Quantity view went");
+        assert_eq!(
+            app.delete_question(Thing::Item(ItemId(20))).as_deref(),
+            Ok("Delete the item WidgetA of Product and its 1 cell?")
+        );
+        app.delete(Thing::Item(ItemId(20))).expect("WidgetA");
+        assert!(!app.model.categories[&CategoryId(2)]
+            .items
+            .contains(&ItemId(20)));
+        assert_eq!(app.model.inputs.len(), 1, "Price's WidgetA cell went");
+        assert_eq!(
+            app.delete_question(Thing::Category(region)).as_deref(),
+            Ok("Delete the category Region and its 2 items?")
+        );
+        app.delete(Thing::Category(region)).expect("Region");
+        assert!(app.model.category_by_name("Region").is_none());
+        assert!(app.model.items.values().all(|i| i.category != region));
+        let stored = reload();
+        assert_eq!(names_of(&stored), names_of(&app.model), "autosaved");
+        assert_eq!(stored.inputs, app.model.inputs);
+        assert_eq!(
+            app.delete(Thing::Category(region)).unwrap_err(),
+            "it no longer exists"
+        );
+
+        for _ in 0..4 {
+            app.undo().expect("undo a delete");
+        }
+        assert_eq!(*app.model, start, "every delete undone");
+        assert_eq!(reload(), start, "and saved");
+        app.redo().expect("redo the formula delete");
+        assert!(!app.model.measures.contains_key(&MeasureId(102)));
+    }
+
+    /// An item's delete drops it from saved views' filters and page pins.
+    #[test]
+    fn deleting_an_item_scrubs_it_from_views() {
+        let mut app = build_app(grid_2x2_model());
+        select(&mut app, MeasureId(101));
+        app.sync_axis_state();
+        app.toggle_filter_item(CategoryId(2), ItemId(21));
+        let v = app.save_view("filtered").expect("view");
+        let mut view = app.model.views[&v].clone();
+        view.page_items = vec![(CategoryId(2), ItemId(20))];
+        view.placements = vec![view.primary()];
+        Arc::make_mut(&mut app.model).add_view(view);
+        app.delete(Thing::Item(ItemId(20))).expect("delete");
+        let view = &app.model.views[&v];
+        for p in view.matrices() {
+            assert!(p.filters.iter().all(|f| !f.items.contains(&ItemId(20))));
+            assert!(p.page_items.is_empty());
+        }
+        assert!(app.matrices[0]
+            .filters
+            .iter()
+            .all(|f| !f.items.contains(&ItemId(20))));
+    }
+
+    /// The browser's rename line: double-click a measure, its name comes up
+    /// selected in a line; type and Enter renames. A refused name keeps the
+    /// line; Esc ends it. Edit ▸ Rename opens the same line.
+    #[test]
+    fn double_clicking_a_browser_row_renames_it_in_place() {
+        let (mut app, mut desk) = grid_desk();
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let at = painted(&shapes, "Price").expect("Price listed").center();
+        desk.click(&mut app, at);
+        assert_eq!(app.browser_pick, Some(Thing::Measure(MeasureId(100))));
+        desk.click(&mut app, at);
+        assert!(
+            matches!(app.renaming, Some((Thing::Measure(MeasureId(100)), _, _))),
+            "a double-click starts the rename"
+        );
+        desk.settle(&mut app);
+        let line = egui::Id::unique("rename_line");
+        assert_eq!(
+            desk.ctx.memory(|m| m.focused()),
+            Some(line),
+            "it has the keys"
+        );
+        let sel = egui::TextEdit::load_state(&desk.ctx, line)
+            .and_then(|s| s.cursor.char_range())
+            .expect("a selection");
+        assert_eq!(
+            (sel.primary.index.0, sel.secondary.index.0),
+            (5, 0),
+            "all selected"
+        );
+        // Typing replaces the selection.
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("Quantity".into())]);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        assert!(app.status.contains("already"), "{}", app.status);
+        assert!(app.renaming.is_some(), "a refused name keeps the line");
+        desk.settle(&mut app);
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("Unit Price".into())]);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        assert_eq!(app.status, "renamed measure Price to Unit Price");
+        assert!(app.renaming.is_none());
+        assert!(app.can_undo());
+
+        // Edit ▸ Rename, then Esc: nothing changes.
+        app.run_command(&desk.ctx, Command::Rename);
+        desk.settle(&mut app);
+        let before = (*app.model).clone();
+        let esc = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("x".into()), esc]);
+        desk.settle(&mut app);
+        assert!(app.renaming.is_none(), "Esc ends it");
+        assert_eq!(*app.model, before);
+        // Rename and Delete… act on the worksheet's measure with no pick.
+        app.browser_pick = None;
+        assert_eq!(app.edit_target(), app.selected().map(Thing::Measure));
+        app.matrices[0].measure = None;
+        assert!(!app.command_enabled(Command::Rename));
+        assert!(!app.command_enabled(Command::Delete));
+    }
+
+    /// H1-15: a click on a view row picks the view, so Edit ▸ Rename
+    /// and Delete… act on it, not on a measure picked before. Save View
+    /// without a name opens the rename line on its "view N".
+    #[test]
+    fn views_rename_and_delete_from_the_browser() {
+        let (mut app, mut desk) = grid_desk();
+        app.run_command(&desk.ctx, Command::SaveView);
+        let v = app.current_view.expect("saved");
+        assert_eq!(app.renaming, Some((Thing::View(v), "view 1".into(), true)));
+        desk.settle(&mut app);
+        assert_eq!(
+            desk.ctx.memory(|m| m.focused()),
+            Some(egui::Id::unique("rename_line")),
+            "the name is ready to type over"
+        );
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("Budget".into())]);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        assert_eq!(app.status, "renamed view view 1 to Budget");
+        assert_eq!(app.model.views[&v].name.0, "Budget");
+        let other = app.save_view("Other").expect("a second view");
+        // Pick a measure, then the view row: the view is the target.
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let price = painted(&shapes, "Price").expect("Price listed").center();
+        desk.click(&mut app, price);
+        assert_eq!(app.browser_pick, Some(Thing::Measure(MeasureId(100))));
+        let row = painted(&shapes, "Budget - Worksheet")
+            .expect("Budget listed")
+            .center();
+        desk.click(&mut app, row);
+        assert_eq!(app.browser_pick, Some(Thing::View(v)));
+        // Edit ▸ Rename: a taken name is refused, the line stays.
+        app.run_command(&desk.ctx, Command::Rename);
+        desk.settle(&mut app);
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("Other".into())]);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        assert_eq!(app.status, "a view is already named \"Other\"");
+        assert!(app.renaming.is_some());
+        // A measure's name is fine for a view.
+        desk.settle(&mut app);
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("Price".into())]);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        assert_eq!(app.status, "renamed view Budget to Price");
+        // Delete… asks about the view, and deletes only it.
+        app.run_command(&desk.ctx, Command::Delete);
+        let q = app.confirm_delete.clone().expect("asks");
+        assert_eq!(
+            q,
+            (
+                Thing::View(v),
+                "Delete the view Price? Its worksheets stay open.".into()
+            )
+        );
+        desk.settle(&mut app);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        desk.settle(&mut app);
+        assert_eq!(app.status, "deleted view Price");
+        assert!(!app.model.views.contains_key(&v));
+        assert!(app.model.views.contains_key(&other));
+        assert!(
+            app.model.measures.contains_key(&MeasureId(100)),
+            "not Price"
+        );
+        assert_eq!(app.browser_pick, None);
+        assert_eq!(app.matrix_count(), 1, "the canvas stays");
+        app.undo().expect("undo");
+        assert_eq!(app.model.views[&v].name.0, "Price", "undo brings it back");
+        assert_eq!(
+            app.delete(Thing::View(ViewId(99))).unwrap_err(),
+            "it no longer exists"
+        );
+    }
+
+    /// Category and item rows rename the same way.
+    #[test]
+    fn categories_and_items_rename_from_the_browser() {
+        let (mut app, mut desk) = grid_desk();
+        app.start_rename(Thing::Item(ItemId(21)));
+        desk.settle(&mut app);
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("Gizmo".into())]);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        assert_eq!(app.status, "renamed item WidgetB to Gizmo");
+        app.start_rename(Thing::Category(CategoryId(2)));
+        desk.settle(&mut app);
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("Kind".into())]);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        assert_eq!(app.status, "renamed category Product to Kind");
+        // Clicking an item picks it for Edit ▸ Delete….
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let at = last_text_at(&shapes, "Gizmo")
+            .expect("Gizmo listed")
+            .center();
+        desk.click(&mut app, at);
+        assert_eq!(app.browser_pick, Some(Thing::Item(ItemId(21))));
+        // Closing the browser ends a rename.
+        app.start_rename(Thing::Item(ItemId(21)));
+        app.show_browser = false;
+        desk.settle(&mut app);
+        assert!(app.renaming.is_none());
+    }
+
+    /// Edit ▸ Delete… asks first: Cancel (or Esc) keeps it, Enter on
+    /// the focused Delete button deletes, autosaved and undoable.
+    #[test]
+    fn worksheet_delete_asks_before_deleting() {
+        let (mut app, mut desk) = grid_desk();
+        app.add_derived_measure("Twice", "Revenue * 2")
+            .expect("Twice");
+        let twice = app.model.measure_by_name("Twice").expect("added").id;
+        app.browser_pick = Some(Thing::Measure(twice));
+        app.run_command(&desk.ctx, Command::Delete);
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(painted(&shapes, "Delete the formula Twice?").is_some());
+        let cancel = painted(&shapes, "Cancel").expect("Cancel").center();
+        desk.click(&mut app, cancel);
+        assert!(app.confirm_delete.is_none());
+        assert!(app.model.measures.contains_key(&twice), "kept");
+
+        app.run_command(&desk.ctx, Command::Delete);
+        desk.settle(&mut app);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        desk.settle(&mut app);
+        assert_eq!(app.status, "deleted measure Twice");
+        assert!(!app.model.measures.contains_key(&twice));
+        assert!(app.confirm_delete.is_none());
+        app.undo().expect("undo");
+        assert!(app.model.measures.contains_key(&twice));
+
+        // Esc cancels, and so does the close box.
+        app.browser_pick = Some(Thing::Measure(twice));
+        app.run_command(&desk.ctx, Command::Delete);
+        desk.settle(&mut app);
+        let esc = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = desk.frame(&mut app, vec![esc]);
+        assert!(app.confirm_delete.is_none());
+        app.run_command(&desk.ctx, Command::Delete);
+        desk.settle(&mut app);
+        let close = close_box_of(&desk.ctx, panel_win("delete_panel")).expect("close box");
+        desk.click(&mut app, close.center());
+        assert!(app.confirm_delete.is_none());
+        assert!(app.model.measures.contains_key(&twice));
+        // A delete that was fine when asked but is refused by Enter time
+        // reports why.
+        app.confirm_delete = Some((Thing::Measure(MeasureId(100)), "Delete?".into()));
+        desk.settle(&mut app);
+        let _ = desk.frame(&mut app, vec![enter()]);
+        assert!(
+            app.status.starts_with("cannot delete Price"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            app.delete_question(Thing::Item(ItemId(99))).unwrap_err(),
+            "it no longer exists"
+        );
+    }
+
+    // -- H2: accessibility (what can be checked without a screen reader)
+
+    /// The AccessKit nodes of one frame of `app` with every window open,
+    /// as egui hands them to the platform's screen reader.
+    fn accesskit_nodes(
+        app: &mut ImprovApp,
+        desk: &mut Desk,
+    ) -> Vec<(egui::accesskit::NodeId, egui::accesskit::Node)> {
+        desk.ctx.enable_accesskit();
+        desk.settle(app);
+        desk.frame(app, Vec::new())
+            .platform_output
+            .accesskit_update
+            .expect("AccessKit is on")
+            .nodes
+    }
+
+    /// egui's own drag handles, by shape: egui_extras' column resize grips
+    /// (a few px wide) and an egui window's title bar.
+    fn egui_drag_handle(n: &egui::accesskit::Node) -> bool {
+        n.bounds()
+            .is_some_and(|r| r.x1 - r.x0 < 8.0 || (r.y1 - r.y0 - 28.0).abs() < 1.0)
+    }
+
+    /// Every widget a keyboard or a screen reader can reach (an AccessKit
+    /// node that takes focus) is labeled: a name, or a text field's value
+    /// or placeholder. Checked with the browser, the Info panel, the
+    /// function help, the CSV wizard, a submenu and a tile menu open.
+    #[test]
+    fn every_interactive_widget_has_an_accesskit_label() {
+        use egui::accesskit::{Action, Role};
+        let (mut app, mut desk) = grid_desk();
+        app.show_inspector = true;
+        app.fn_help.toggle();
+        app.show_csv_wizard = true;
+        app.show_chart = true;
+        app.run_command(&desk.ctx, Command::AddCategory);
+        let mut checked = 0;
+        let mut unlabeled = Vec::new();
+        // egui's own drag handles (scroll bars, window and panel resize
+        // grips) are focusable nodes too, but Tab never stops on them; what
+        // a keyboard user reaches is what Tab visits, so that is the set.
+        let tab_stops = |app: &mut ImprovApp, desk: &mut Desk| {
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..300 {
+                let tab = egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                };
+                let _ = desk.frame(app, vec![tab]);
+                if let Some(f) = desk.ctx.memory(|m| m.focused()) {
+                    if !seen.insert(egui::accesskit::NodeId::from(f.value())) {
+                        break;
+                    }
+                }
+            }
+            seen
+        };
+        let mut check =
+            |nodes: Vec<(egui::accesskit::NodeId, egui::accesskit::Node)>,
+             stops: &std::collections::HashSet<egui::accesskit::NodeId>| {
+                for (id, n) in nodes {
+                    // egui's own drag handles (a scroll area's content and
+                    // bars, table column and panel resize grips) are
+                    // drag-only and unnamed; the rest must be named.
+                    // (egui 0.37 gives those a click action too: they are
+                    // still Unknown-role and unnamed in its own code.)
+                    let egui_handle = n.role() == Role::Unknown
+                        && (!n.supports_action(Action::Click) || egui_drag_handle(&n));
+                    if !n.supports_action(Action::Focus) || !stops.contains(&id) || egui_handle {
+                        continue;
+                    }
+                    checked += 1;
+                    let named = n.label().is_some_and(|s| !s.trim().is_empty())
+                        || n.value().is_some_and(|s| !s.trim().is_empty())
+                        || n.placeholder().is_some_and(|s| !s.trim().is_empty());
+                    if !named {
+                        let b = n.bounds().map(|r| {
+                            (
+                                r.x0 as i32,
+                                r.y0 as i32,
+                                (r.x1 - r.x0) as i32,
+                                (r.y1 - r.y0) as i32,
+                            )
+                        });
+                        unlabeled.push(format!("{:?} {b:?}", n.role()));
+                    }
+                }
+            };
+        let nodes = accesskit_nodes(&mut app, &mut desk);
+        let stops = tab_stops(&mut app, &mut desk);
+        check(nodes, &stops);
+        // A submenu open.
+        app.menu = menu::MenuState::default();
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let ws = text_at(&shapes, "Worksheet").expect("the menu").center();
+        desk.click(&mut app, ws);
+        let nodes = accesskit_nodes(&mut app, &mut desk);
+        let stops = tab_stops(&mut app, &mut desk);
+        check(nodes, &stops);
+        assert!(checked > 40, "only {checked} Tab stops: is AccessKit on?");
+        println!("H2: {checked} Tab stops checked, all named");
+        assert!(unlabeled.is_empty(), "unlabeled: {unlabeled:#?}");
+    }
+
+    /// Keyboard only: every menu command is reachable by its key equivalent
+    /// or by Tab to the menu row and Enter, and the grid moves, edits,
+    /// commits, pages and pivots from the keyboard. No pointer events.
+    #[test]
+    fn the_menus_and_the_grid_work_from_the_keyboard_alone() {
+        let (mut app, mut desk) = grid_desk();
+        let key = |desk: &mut Desk, app: &mut ImprovApp, k: egui::Key, m: egui::Modifiers| {
+            let ev = egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: m,
+            };
+            let _ = desk.frame(app, vec![ev]);
+        };
+        let none = egui::Modifiers::NONE;
+        // The grid: arrows move, Enter edits, typing and Enter commit.
+        assert_eq!(app.cursor_key(), Some(q_and_rev_keys().0));
+        key(&mut desk, &mut app, egui::Key::ArrowRight, none);
+        key(&mut desk, &mut app, egui::Key::ArrowLeft, none);
+        key(&mut desk, &mut app, egui::Key::Enter, none);
+        assert!(
+            app.matrices[0].editing.is_some(),
+            "Enter edits: {}",
+            app.status
+        );
+        desk.settle(&mut app);
+        let _ = desk.frame(&mut app, vec![egui::Event::Text("5".into())]);
+        key(&mut desk, &mut app, egui::Key::Enter, none);
+        desk.settle(&mut app);
+        assert!(app.matrices[0].editing.is_none(), "{}", app.status);
+        assert!(app.can_undo(), "the edit was committed");
+        // Key equivalents: undo, redo.
+        key(&mut desk, &mut app, egui::Key::Z, egui::Modifiers::COMMAND);
+        assert!(app.can_redo(), "Ctrl+Z undoes");
+        key(&mut desk, &mut app, egui::Key::Y, egui::Modifiers::COMMAND);
+        assert!(!app.can_redo(), "Ctrl+Y redoes");
+        // Every menu row takes the keyboard: Tab reaches it, Enter runs it.
+        let rows = menu::focusable_rows();
+        assert!(rows > 10, "{rows}");
+        let mut reached = std::collections::HashSet::new();
+        desk.ctx.memory_mut(|m| m.surrender_focus(egui::Id::NULL));
+        for _ in 0..400 {
+            key(&mut desk, &mut app, egui::Key::Tab, none);
+            if let Some(f) = desk.ctx.memory(|m| m.focused()) {
+                reached.insert(f);
+            }
+        }
+        let menu_rows = (0..rows)
+            .filter(|i| reached.contains(&menu::menu_id().with(*i)))
+            .count();
+        assert_eq!(menu_rows, rows, "Tab reaches every top-level menu row");
+        // Focus View with Tab and open it with Enter, then run New View
+        // the same way.
+        let ws = menu::top_index("View");
+        desk.ctx
+            .memory_mut(|m| m.request_focus(menu::menu_id().with(ws)));
+        let _ = desk.frame(&mut app, Vec::new());
+        key(&mut desk, &mut app, egui::Key::Enter, none);
+        assert_eq!(menu::open_submenu(&app.menu), Some(ws), "Enter opens it");
+        let before = app.matrix_count();
+        let add = menu::sub_row("View", "New View");
+        desk.ctx
+            .memory_mut(|m| m.request_focus(menu::sub_id_pub(ws).with(add)));
+        let _ = desk.frame(&mut app, Vec::new());
+        key(&mut desk, &mut app, egui::Key::Enter, none);
+        assert_eq!(app.matrix_count(), before + 1, "Enter on New View");
+    }
+
+    /// The theme's text and fills meet WCAG 2.1 contrast: 4.5:1 for body
+    /// text, 3:1 for disabled text (WCAG exempts it, but it should read) and
+    /// for the 1 px rules and tiles that carry meaning.
+    #[test]
+    fn theme_colors_meet_wcag_contrast() {
+        use crate::theme::{BLACK, DARK_GRAY, LIGHT_GRAY, TROUGH, WHITE};
+        fn lum(c: egui::Color32) -> f64 {
+            let ch = |v: u8| {
+                let s = f64::from(v) / 255.0;
+                if s <= 0.04045 {
+                    s / 12.92
+                } else {
+                    ((s + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+        }
+        let ratio = |a, b| {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        };
+        let pairs = [
+            ("text on cells", BLACK, WHITE, 4.5),
+            ("text on panels and menus", BLACK, LIGHT_GRAY, 4.5),
+            ("tile text", WHITE, DARK_GRAY, 4.5),
+            ("title text", WHITE, BLACK, 4.5),
+            ("disabled text on menus", DARK_GRAY, LIGHT_GRAY, 3.0),
+            ("selection against cells", LIGHT_GRAY, WHITE, 1.0),
+            ("rules on cells", BLACK, WHITE, 3.0),
+            ("knob against trough", LIGHT_GRAY, TROUGH, 1.0),
+        ];
+        let mut report = Vec::new();
+        for (what, fg, bg, need) in pairs {
+            let r = ratio(fg, bg);
+            report.push(format!("{what}: {r:.2}:1 (need {need}:1)"));
+            assert!(r >= need, "{what}: {r:.2}:1 < {need}:1");
+        }
+        println!("{}", report.join("\n"));
+    }
+
+    /// Import shows its status for a painted frame before it runs (it
+    /// blocks the UI thread), and a bad form is still refused at once.
+    #[test]
+    fn import_shows_importing_before_it_blocks() {
+        let path =
+            std::env::temp_dir().join(format!("improv_gui_queued_{}.csv", std::process::id()));
+        std::fs::write(&path, "region,amount\nNorth,5\n").expect("write csv");
+        let mut app = build_app(inputs_only_model());
+        app.queue_csv_import();
+        assert!(app.status.starts_with("import error"), "{}", app.status);
+        assert_eq!(app.queued_import, None);
+        app.import_form = ImportForm {
+            path: path.to_string_lossy().into_owned(),
+            tsv: false,
+            has_header: true,
+            measure_id: "500".into(),
+            measure_name: "Imported".into(),
+            value_column: "amount".into(),
+            dimensions: vec![csv_wizard::DimRow {
+                column: "region".into(),
+                category_id: "9".into(),
+                category_name: "Region".into(),
+            }],
+        };
+        app.queue_csv_import();
+        assert!(app.status.starts_with("importing and saving"));
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let out = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        assert!(
+            texts_of(&out)
+                .iter()
+                .any(|t| t.starts_with("importing and saving")),
+            "the status is painted first"
+        );
+        assert!(!app.model.measures.contains_key(&MeasureId(500)), "not yet");
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.1);
+        assert!(
+            app.model.measures.contains_key(&MeasureId(500)),
+            "{}",
+            app.status
+        );
+        assert!(
+            app.status.starts_with("imported 1 cell(s)"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.queued_import, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -- H9: offer Reload when another writer saved
+
+    /// A second store handle saves while the window is open: the next
+    /// check offers Reload, Not Now hides it until the next outside save,
+    /// and Reload shows the other writer's edit. The window's own saves
+    /// never raise it.
+    #[test]
+    fn another_writers_save_offers_reload() {
+        let db = temp_db("h9_reload");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let mut app = ImprovApp::load(&db).expect("load");
+        let (qkey, _) = q_and_rev_keys();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        assert_eq!(app.outside, None);
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(5.0))
+            .expect("its own save");
+        desk.time += PROBE_SECS;
+        desk.settle(&mut app);
+        assert_eq!(app.outside, None, "its own save is no outside save");
+
+        // Another writer: a second handle, loaded now, saves an edit.
+        let other = |v: f64| {
+            let mut s = Store::open(&db).expect("open");
+            let mut m = s.load_model().expect("load");
+            m.set_input(MeasureId(101), decode(&qkey), Value::Number(v));
+            s.save_model(&m).expect("the other writer saves");
+        };
+        other(42.0);
+        let _ = desk.frame(&mut app, Vec::new());
+        assert_eq!(app.outside, None, "not checked again yet");
+        desk.time += PROBE_SECS;
+        desk.settle(&mut app);
+        assert!(matches!(app.outside, Some((_, true))), "{:?}", app.outside);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        assert!(painted(&shapes, "Another program saved this model.").is_some());
+        // A save from here is still refused, never overwriting.
+        let e = app
+            .set_cell(MeasureId(101), qkey.clone(), Value::Number(6.0))
+            .expect_err("stale");
+        assert!(e.contains("another program"), "{e}");
+
+        let later = painted(&shapes, "Not Now").expect("Not Now").center();
+        desk.click(&mut app, later);
+        assert!(matches!(app.outside, Some((_, false))));
+        assert!(app.status.starts_with("not reloaded"), "{}", app.status);
+        desk.time += PROBE_SECS;
+        desk.settle(&mut app);
+        assert!(matches!(app.outside, Some((_, false))), "stays hidden");
+        other(43.0);
+        desk.time += PROBE_SECS;
+        desk.settle(&mut app);
+        assert!(
+            matches!(app.outside, Some((_, true))),
+            "a new save shows it"
+        );
+
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let reload = painted(&shapes, "Reload").expect("Reload").center();
+        desk.click(&mut app, reload);
+        assert_eq!(app.outside, None);
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("43"));
+        assert!(app.status.starts_with("reloaded"), "{}", app.status);
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(7.0))
+            .expect("saves after the reload");
+        // In memory, nothing to check; an unreadable store offers nothing.
+        let mut mem = build_app(grid_2x2_model());
+        mem.probe_store(100.0);
+        assert_eq!(mem.outside, None);
+        mem.db = "/nonexistent/dir/m.db".into();
+        mem.save_token = app.save_token.clone();
+        assert_eq!(mem.outside_save(), None);
+        // The close box is Not Now too.
+        other(44.0);
+        desk.time += PROBE_SECS;
+        desk.settle(&mut app);
+        let close = close_box_of(&desk.ctx, panel_win("reload_panel")).expect("close box");
+        desk.click(&mut app, close.center());
+        assert!(matches!(app.outside, Some((_, false))));
+    }
+
+    // -- H8: named LAMBDAs from the formula list's last line
+
+    /// `Name = LAMBDA(…)` on the new-formula line defines a named LAMBDA,
+    /// stored exactly as the CLI's `define` stores it (`parse_definition`);
+    /// a formula then calls it, a redefinition keeps its id and recomputes
+    /// the caller, and undo takes it back out of the store too.
+    #[test]
+    fn the_formula_line_defines_a_named_lambda_like_cli_define() {
+        let db = temp_db("h8_lambda");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&revenue_model()))
+            .expect("seed");
+        let mut app = ImprovApp::load(&db).expect("load");
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let _ = full_frame(&ctx, &mut app, egui::vec2(1200.0, 800.0), 0.0);
+        let line = "Margin = LAMBDA(p, c, p - c)";
+        focused_frame(
+            &ctx,
+            &mut app,
+            "formula_new",
+            vec![egui::Event::Text(line.into())],
+        );
+        focused_frame(&ctx, &mut app, "formula_new", vec![enter()]);
+        assert_eq!(app.status, "defined LAMBDA Margin(p, c)");
+        assert!(app.new_formula_line.is_empty());
+        let parser::Definition::Lambda(cli) =
+            parser::parse_definition(&revenue_model(), line).expect("what define parses")
+        else {
+            panic!("not a LAMBDA");
+        };
+        assert_eq!(
+            app.model.lambdas.get(&1),
+            Some(&cli.lambda),
+            "as define stores it"
+        );
+        assert!(
+            app.formula_rows()
+                .iter()
+                .all(|r| r.measure.0 != 1 || app.model.measures.contains_key(&r.measure)),
+            "a LAMBDA is no formula row"
+        );
+
+        // A formula calls it.
+        let id = app
+            .add_derived_measure("Net", "Margin(Revenue, 1)")
+            .expect("call the LAMBDA");
+        let at = [(1, 10), (2, 20)];
+        assert_eq!(app.values_for(id).get(at.as_slice()), Some(&69.0));
+        // Redefining keeps the id and recomputes the caller.
+        assert_eq!(
+            app.define_lambda("Margin = LAMBDA(p, c, p - 2 * c)")
+                .as_deref(),
+            Ok("redefined LAMBDA Margin(p, c)")
+        );
+        assert_eq!(
+            app.model.lambdas.keys().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(app.values_for(id).get(at.as_slice()), Some(&68.0));
+        // A redefinition that breaks its caller is refused, nothing changed.
+        let err = app
+            .define_lambda("Margin = LAMBDA(p, p)")
+            .expect_err("Net passes two arguments");
+        assert!(!err.is_empty());
+        assert_eq!(app.values_for(id).get(at.as_slice()), Some(&68.0));
+
+        let reloaded = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert_eq!(reloaded.lambdas, app.model.lambdas, "saved");
+        // Undo: the redefinition, Net, then the definition.
+        app.undo().expect("undo the redefinition");
+        app.undo().expect("undo Net");
+        app.undo().expect("undo the LAMBDA");
+        assert!(app.model.lambdas.is_empty());
+        let reloaded = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert!(reloaded.lambdas.is_empty(), "the undone LAMBDA stays gone");
+    }
+
+    /// A bad LAMBDA line is located like a bad formula, and names already
+    /// taken are refused.
+    #[test]
+    fn a_bad_lambda_line_is_located_and_clashes_are_refused() {
+        let mut app = build_app(revenue_model());
+        app.new_formula_line = "Twice = LAMBDA(x, x * Nope)".into();
+        app.add_from_formula_line();
+        let d = app.new_formula_error.clone().expect("located");
+        let span = d.span.expect("a span");
+        assert_eq!(&app.new_formula_line[span], "Nope");
+        assert!(app.status.starts_with("formula error:"), "{}", app.status);
+        assert_eq!(app.new_formula_line, "Twice = LAMBDA(x, x * Nope)", "kept");
+
+        app.new_formula_line = "Revenue = lambda (x, x)".into();
+        app.add_from_formula_line();
+        assert!(
+            app.status.contains("is a measure or category"),
+            "{}",
+            app.status
+        );
+        assert!(app
+            .new_formula_error
+            .as_ref()
+            .is_some_and(|d| d.span.is_none()));
+        app.add_named(NewThing::Category, "Region")
+            .expect("a category");
+        assert!(app
+            .define_lambda("Region = LAMBDA(x, x)")
+            .unwrap_err()
+            .contains("category"));
+        // A built-in function's name is the parser's to refuse.
+        assert!(app
+            .define_lambda("Time = LAMBDA(x, x)")
+            .unwrap_err()
+            .contains("built-in"));
+        assert_eq!(
+            app.define_lambda("Twice = 2").unwrap_err(),
+            "type Name = LAMBDA(parameters, body)"
+        );
+        assert!(app.model.lambdas.is_empty());
+        // An ordinary formula still adds a measure.
+        assert!(!is_lambda_definition("Lambdas = Revenue"));
+        assert!(!is_lambda_definition("no equals"));
+        assert!(is_lambda_definition("F=LAMBDA (x, x)"));
+    }
+
+    // -- H6: crash safety (kill -9 during a save, a full disk, two writers)
+
+    /// A model with one input measure over 100 x 50 items, every cell 0: a
+    /// save that rewrites them all takes long enough to be killed midway.
+    fn crash_model() -> Model {
+        let mut m = Model::new();
+        let (a, b) = (CategoryId(1), CategoryId(2));
+        m.add_category(a, "A");
+        m.add_category(b, "B");
+        for i in 0..100 {
+            m.add_item(ItemId(100 + i), a, format!("a{i}"));
+        }
+        for j in 0..50 {
+            m.add_item(ItemId(1000 + j), b, format!("b{j}"));
+        }
+        m.add_measure(Measure {
+            id: MeasureId(1),
+            name: Name("X".into()),
+            value_type: ValueType::Number,
+            categories: vec![a, b],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        for i in 0..100 {
+            for j in 0..50 {
+                let at = improv_core_model::Coordinate::from_pairs([
+                    (a, ItemId(100 + i)),
+                    (b, ItemId(1000 + j)),
+                ]);
+                m.set_input(MeasureId(1), at, Value::Number(0.0));
+            }
+        }
+        m
+    }
+
+    /// The one value every cell of [`crash_model`]'s measure holds: a save is
+    /// atomic, so a store with two values in it is a half-applied save.
+    fn uniform_value(model: &Model) -> f64 {
+        let vals: std::collections::BTreeSet<u64> = model
+            .inputs
+            .values()
+            .map(|v| match v {
+                Value::Number(n) => n.to_bits(),
+                other => panic!("not a number: {other:?}"),
+            })
+            .collect();
+        assert_eq!(model.inputs.len(), 5000, "cells were lost");
+        assert_eq!(vals.len(), 1, "a save was half applied: {vals:?}");
+        f64::from_bits(*vals.first().expect("a value"))
+    }
+
+    /// SQLite's own check of the store file.
+    fn integrity(db: &str) -> String {
+        let store = mentat::Store::open(db).expect("open the store");
+        store
+            .sqlite_ref()
+            .pragma_query_value(None, "integrity_check", |r| r.get::<_, String>(0))
+            .expect("integrity_check")
+    }
+
+    /// Run this test binary's [`h6_child`] in `mode`, with `db`.
+    fn h6_child_command(mode: &str, db: &str) -> std::process::Command {
+        let mut c = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+        c.args([
+            "--exact",
+            "app::tests::h6_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("IMPROV_GUI_H6_CHILD", mode)
+        .env("IMPROV_GUI_H6_DB", db);
+        c
+    }
+
+    /// The child process of the H6 tests; does nothing unless one runs it.
+    #[test]
+    #[ignore = "a child process of the H6 crash-safety tests"]
+    fn h6_child() {
+        let (Ok(mode), Ok(db)) = (
+            std::env::var("IMPROV_GUI_H6_CHILD"),
+            std::env::var("IMPROV_GUI_H6_DB"),
+        ) else {
+            return;
+        };
+        match mode.as_str() {
+            "saves" => h6_child_saves(&db),
+            "disk-full" => h6_child_disk_full(&db),
+            other => panic!("unknown mode {other}"),
+        }
+    }
+
+    /// Save k = 1, 2, … through the GUI's atomic path (`publish`: build,
+    /// adopt, save), every cell set to k, saying `saving k` and `saved k`
+    /// once the save thread has landed it, as the app saves (H3). Runs
+    /// until killed.
+    fn h6_child_saves(db: &str) {
+        let mut app = ImprovApp::load(db).expect("load");
+        app.background = true;
+        let cells: Vec<_> = app.model.inputs.keys().cloned().collect();
+        for k in 1..=u16::MAX {
+            let mut candidate = (*app.model).clone();
+            for (m, at) in &cells {
+                candidate.set_input(*m, at.clone(), Value::Number(f64::from(k)));
+            }
+            println!("saving {k}");
+            app.publish(candidate).expect("queued");
+            app.finish_saves().expect("save");
+            assert!(!app.dirty);
+            println!("saved {k}");
+            app.finish_build();
+        }
+    }
+
+    /// kill -9 a process that is saving, then reopen: the store holds every
+    /// acknowledged save and nothing of the killed one (all cells hold one
+    /// value), SQLite finds no corruption, and the GUI opens and saves it.
+    #[test]
+    fn kill_9_during_a_save_loses_nothing_and_corrupts_nothing() {
+        use std::io::BufRead;
+        let db = temp_db("h6_kill");
+        let _cleanup = Cleanup(db.clone());
+        let _wal = Cleanup(format!("{db}-wal"));
+        let _shm = Cleanup(format!("{db}-shm"));
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&crash_model()))
+            .expect("seed");
+        let mut midway = 0;
+        // Three rounds, and more (to nine) until one kill lands mid-save.
+        let fractions = [0.2, 0.5, 0.8, 0.35, 0.65, 0.1, 0.9, 0.45, 0.55];
+        for (round, fraction) in fractions.into_iter().enumerate() {
+            if round >= 3 && midway > 0 {
+                break;
+            }
+            let mut child = h6_child_command("saves", &db)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the saving child");
+            let mut lines = std::io::BufReader::new(child.stdout.take().expect("stdout")).lines();
+            let mut next = |want: &str| loop {
+                let line = lines.next().expect("the child stopped").expect("read");
+                if let Some(k) = line.strip_prefix(want) {
+                    break (k.parse::<u32>().expect("k"), std::time::Instant::now());
+                }
+            };
+            // Time the second save: the first is a full save, the rest
+            // write the changed cells (B12), much faster.
+            next("saving ");
+            next("saved ");
+            let (_, t1) = next("saving ");
+            let (_, t2) = next("saved ");
+            let save = t2 - t1;
+            let (k, _) = next("saving ");
+            std::thread::sleep(save.mul_f64(fraction));
+            child.kill().expect("kill -9");
+            let _ = child.wait();
+            // Where the child really stopped: on Windows TerminateProcess
+            // returns before the child does, so it can start more saves
+            // after save k. The last "saving" it printed is the one that
+            // may have been cut off; every earlier one finished.
+            let mut k = k;
+            let mut finished = false;
+            for l in lines.map_while(Result::ok) {
+                if let Some(n) = l.strip_prefix("saving ") {
+                    k = n.parse().expect("k");
+                    finished = false;
+                } else if l == format!("saved {k}") {
+                    finished = true;
+                }
+            }
+            let acked = if finished { k } else { k - 1 };
+            let reopened = Store::open(&db)
+                .and_then(|mut s| s.load_model())
+                .expect("the store reopens");
+            let v = uniform_value(&reopened);
+            assert!(
+                v == f64::from(acked) || v == f64::from(k),
+                "round {round}: store holds {v}, acknowledged {acked}, killed during {k}"
+            );
+            // Windows' TerminateProcess returns before the child stops, so
+            // the child runs on past the kill, there usually past the
+            // commit: a kill cannot be aimed before it. There, a kill inside
+            // the save call counts; elsewhere it must leave the save unwritten.
+            if !finished && (cfg!(windows) || v == f64::from(acked)) {
+                midway += 1;
+            }
+            println!("H6 kill -9 round {round}: killed during save {k} (finished: {finished}), store holds {v}");
+            assert_eq!(integrity(&db), "ok");
+            // The GUI opens it and saves again (no stale lock, no damage);
+            // the next child starts again at 1, so this -1 is gone by then.
+            let mut app = ImprovApp::load(&db).expect("the GUI reopens it");
+            let mut next_round = (*app.model).clone();
+            for v in next_round.inputs.values_mut() {
+                *v = Value::Number(-1.0);
+            }
+            app.publish(next_round).expect("and saves");
+        }
+        assert!(midway > 0, "no kill landed inside a save");
+    }
+
+    /// Inside its own mount namespace, on a tiny tmpfs at `dir`: fill the
+    /// disk, edit until a save fails, check the failure and that the store
+    /// is untouched, fail a second edit of another kind, free the space, and
+    /// check that the next save wrote both (their changes merge, H3).
+    fn h6_child_disk_full(dir: &str) {
+        let db = format!("{dir}/model.db");
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let mut app = ImprovApp::load(&db).expect("load");
+        let filler = format!("{dir}/filler");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&filler).expect("filler");
+            let chunk = vec![0u8; 4096];
+            while f.write_all(&chunk).is_ok() {}
+        }
+        let (qkey, _) = q_and_rev_keys();
+        let stored = || Store::open(&db).and_then(|mut s| s.load_model());
+        let full = |e: &str| {
+            assert!(
+                e.contains("the disk is full") || e.contains("is the disk full?"),
+                "unclear: {e}"
+            );
+            assert!(e.contains("not saved yet"), "{e}");
+        };
+        // Alternate a cell edit and a structural one: both paths save.
+        let edit = |app: &mut ImprovApp, i: u32| {
+            if i.is_multiple_of(2) {
+                app.set_cell(MeasureId(101), qkey.clone(), Value::Number(f64::from(i)))
+            } else {
+                app.add_named(NewThing::Item(CategoryId(1)), &format!("y{i}"))
+                    .map(|_| ())
+            }
+        };
+        let mut failed = None;
+        // What the store holds: the model after the last save that worked.
+        let mut saved = (*app.model).clone();
+        for i in 0..2000 {
+            if let Err(e) = edit(&mut app, i) {
+                full(&e);
+                println!("H6 disk-full message: {e}");
+                // H3: the edit stays in the window, unsaved.
+                assert!(app.dirty, "the title marks it unsaved");
+                assert!(!app.unsaved.is_empty(), "kept for the next save");
+                assert_ne!(*app.model, saved);
+                failed = Some(i);
+                break;
+            }
+            saved = (*app.model).clone();
+        }
+        let i = failed.expect("no save failed on a full disk");
+        // A second edit, of the other kind, fails too; both are kept.
+        let e = edit(&mut app, i + 1).expect_err("the disk is still full");
+        full(&e);
+        let kept = app.unsaved.clone();
+        assert!(kept.structure && !kept.cells.is_empty(), "merged: {kept:?}");
+        std::fs::remove_file(&filler).expect("free the space");
+        // (A full disk cannot open the store even to read it.)
+        assert_eq!(stored().expect("reopen"), saved, "the store is untouched");
+        let ctx = egui::Context::default();
+        app.run_command(&ctx, Command::SaveModel);
+        assert_eq!(app.status, "saved model", "with room again Save writes it");
+        assert!(!app.dirty && app.unsaved.is_empty());
+        let back = stored().expect("reopen");
+        assert_eq!(back, *app.model, "both failed edits are in the store");
+        assert_eq!(integrity(&db), "ok");
+        println!(
+            "H6 disk-full: saves {i} and {} failed cleanly, then saved",
+            i + 1
+        );
+    }
+
+    /// A full disk during a save: a clear error, the model kept in memory,
+    /// the store intact. Runs the GUI's save on a small tmpfs mounted in a
+    /// user namespace (Linux; skipped where those are not allowed).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_disk_fails_the_save_clearly_and_keeps_the_model() {
+        let dir = temp_db("h6_full");
+        std::fs::create_dir(&dir).expect("mount point");
+        struct Rmdir(String);
+        impl Drop for Rmdir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _rmdir = Rmdir(dir.clone());
+        let child = h6_child_command("disk-full", &dir);
+        let script = r#"mount -t tmpfs -o size=1m tmpfs "$IMPROV_GUI_H6_DB" || exit 77; exec "$@""#;
+        let mut c = std::process::Command::new("unshare");
+        c.args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-c",
+            script,
+            "sh",
+        ])
+        .arg(child.get_program())
+        .args(child.get_args())
+        .envs(child.get_envs().filter_map(|(k, v)| Some((k, v?))));
+        let out = match c.output() {
+            Ok(o) => o,
+            Err(e) => return eprintln!("skipped: no unshare ({e})"),
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() == Some(77) || stderr.starts_with("unshare:") {
+            return eprintln!("skipped: no user and mount namespaces: {stderr}");
+        }
+        assert!(
+            out.status.success() && stdout.contains("H6 disk-full: save"),
+            "the disk-full child failed:\n{stdout}\n{stderr}"
+        );
+        stdout
+            .lines()
+            .filter(|l| l.starts_with("H6"))
+            .for_each(|l| println!("{l}"));
+    }
+
+    /// Two programs on one store: the second save to land is refused with a
+    /// clear "changed by another program", never overwriting. The refused
+    /// program keeps its edit in the window, unsaved (H3), shows the Reload
+    /// panel at once and saves nothing more (no retry) until Revert to Saved,
+    /// which takes the other program's changes and drops its own.
+    #[test]
+    fn two_writers_conflict_and_neither_overwrites_the_other() {
+        let db = temp_db("h6_two");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let mut a = ImprovApp::load(&db).expect("A");
+        let mut b = ImprovApp::load(&db).expect("B");
+        let q = MeasureId(101);
+        let k = |t: u32, p: u32| {
+            let mut k: CoordKey = improv_engine::smallvec::smallvec![(1u32, t), (2, p)];
+            k.sort();
+            k
+        };
+        b.set_cell(q, k(10, 20), Value::Number(7.0))
+            .expect("B saves first");
+
+        let e = a
+            .set_cell(q, k(11, 21), Value::Number(9.0))
+            .expect_err("A's save is stale");
+        assert!(e.contains("another program changed this model"), "{e}");
+        assert!(e.contains("not saved"), "{e}");
+        assert!(e.contains("Revert to Saved"), "{e}");
+        assert_eq!(
+            a.cell_text(q, &k(11, 21)).as_deref(),
+            Some("9"),
+            "A keeps it"
+        );
+        assert!(a.dirty);
+        assert!(
+            matches!(a.outside, Some((_, true))),
+            "the Reload panel shows"
+        );
+        let e = a
+            .add_named(NewThing::Category, "Region")
+            .expect_err("a structural edit is stale too");
+        assert!(e.contains("another program"), "{e}");
+        // The menu's Save says so too, and writes nothing.
+        let ctx = egui::Context::default();
+        a.run_command(&ctx, Command::SaveModel);
+        assert!(a.status.contains("another program"), "{}", a.status);
+        // Not Now keeps it refused: nothing is retried behind B's back.
+        a.outside = a.outside.map(|(hw, _)| (hw, false));
+        let e = a
+            .set_cell(q, k(11, 20), Value::Number(3.0))
+            .expect_err("still stale after Not Now");
+        assert!(e.contains("another program"), "{e}");
+
+        let stored = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        let value = |m: &Model, key| m.input(q, &decode(&key)).cloned();
+        assert_eq!(
+            value(&stored, k(10, 20)),
+            Some(Value::Number(7.0)),
+            "B's edit kept"
+        );
+        assert_eq!(
+            value(&stored, k(11, 21)),
+            Some(Value::Number(80.0)),
+            "A wrote nothing"
+        );
+        assert!(stored.category_by_name("Region").is_none());
+
+        assert!(
+            stored.measures.len() == a.model.measures.len(),
+            "B's catalog"
+        );
+
+        // Revert to Saved picks up B's edit and drops A's unsaved ones; A's
+        // edit then saves on top.
+        a.revert_to_saved().expect("revert");
+        assert!(!a.dirty && a.unsaved.is_empty() && a.outside.is_none());
+        assert_eq!(a.cell_text(q, &k(10, 20)).as_deref(), Some("7"));
+        assert_eq!(a.cell_text(q, &k(11, 21)).as_deref(), Some("80"));
+        a.set_cell(q, k(11, 21), Value::Number(9.0))
+            .expect("A saves now");
+        let stored = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert_eq!(value(&stored, k(10, 20)), Some(Value::Number(7.0)));
+        assert_eq!(value(&stored, k(11, 21)), Some(Value::Number(9.0)));
+        // Now B is the stale one, undo included: the undo is taken in B's
+        // window, unsaved, and the store keeps A's save.
+        let e = b.undo().expect_err("B's undo is stale");
+        assert!(e.contains("another program"), "{e}");
+        assert_eq!(
+            b.cell_text(q, &k(10, 20)).as_deref(),
+            Some("100"),
+            "undone in B"
+        );
+        assert!(b.dirty && b.can_redo());
+        let stored = Store::open(&db)
+            .and_then(|mut s| s.load_model())
+            .expect("reload");
+        assert_eq!(
+            value(&stored, k(10, 20)),
+            Some(Value::Number(7.0)),
+            "not overwritten"
+        );
+        assert_eq!(value(&stored, k(11, 21)), Some(Value::Number(9.0)));
+    }
+
+    /// The status line's wording for each kind of failed save.
+    #[test]
+    fn save_errors_say_what_happened() {
+        use improv_store::StoreError;
+        let full = StoreError::Mentat(improv_storage_mentat::StoreError::Mentat(
+            "SQL error: database or disk is full".into(),
+        ));
+        assert!(save_error(full).starts_with("save failed: the disk is full"));
+        let io = StoreError::Mentat(improv_storage_mentat::StoreError::Mentat(
+            "SQL error: disk I/O error, cause: Error code 4874".into(),
+        ));
+        assert!(save_error(io).contains("is the disk full?"));
+        assert!(save_error(StoreError::Conflict("x".into())).starts_with("save conflict: another"));
+        let other = StoreError::Mentat(improv_storage_mentat::StoreError::Integrity("bad".into()));
+        let other = save_error(other);
+        assert!(
+            other.starts_with("save failed: data integrity: bad"),
+            "{other}"
+        );
+        // Each says plainly the change is not saved, and what happens next.
+        for e in [
+            save_error(StoreError::Conflict("x".into())),
+            save_error(StoreError::Mentat(
+                improv_storage_mentat::StoreError::Mentat(
+                    "SQL error: database or disk is full".into(),
+                ),
+            )),
+            other,
+        ] {
+            assert!(e.contains("not saved"), "{e}");
+        }
+    }
+
+    /// Autosaves write only what changed, and lose nothing: a cell edit, a
+    /// structural edit, an import whose save failed (kept in memory, so the
+    /// next save writes it all) and Save all end with the store equal to
+    /// the model.
+    #[test]
+    fn incremental_autosaves_keep_the_store_equal_to_the_model() {
+        let db = temp_db("b12_autosave");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let stored = |db: &str| Store::open(db).and_then(|mut s| s.load_model()).unwrap();
+        let mut app = ImprovApp::load(&db).expect("load");
+        let (q, _) = q_and_rev_keys();
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(5.0))
+            .expect("a cell");
+        app.clear_cell(MeasureId(101), q.clone()).expect("cleared");
+        assert_eq!(stored(&db), *app.model);
+        app.add_named(NewThing::Item(CategoryId(1)), "2027")
+            .expect("an item");
+        app.undo().expect("undo the item");
+        app.undo().expect("undo the clear");
+        assert_eq!(stored(&db), *app.model);
+
+        // An import whose save fails keeps its cells in memory; the next
+        // autosave writes them.
+        let good = std::mem::replace(&mut app.db, "/nonexistent-dir-improv/x.db".into());
+        let mut imported = (*app.model).clone();
+        imported.set_input(MeasureId(101), decode(&q), Value::Number(42.0));
+        imported.add_item(ItemId(99), CategoryId(1), "2030");
+        let changes = improv_store::ChangeSet::between(&app.model, &imported);
+        app.model = Arc::new(imported);
+        assert!(app.save_changes(&changes).is_err() && app.dirty);
+        app.db = good;
+        app.add_named(NewThing::Category, "Region")
+            .expect("saves all");
+        assert!(!app.dirty);
+        assert_eq!(stored(&db), *app.model, "the kept change was written");
+        let ctx = egui::Context::default();
+        app.run_command(&ctx, Command::SaveModel);
+        assert_eq!(app.status, "saved model");
+        assert_eq!(stored(&db), *app.model);
+    }
+
+    /// A failed undo keeps the step it failed to take: once the store is
+    /// writable again, the retry restores the state before the edit (it
+    /// used to push the current state back, so the retry did nothing).
+    #[test]
+    fn a_failed_undo_or_redo_can_be_retried() {
+        let mut app = build_app(grid_2x2_model());
+        let (qkey, _) = q_and_rev_keys();
+        app.set_cell(MeasureId(101), qkey.clone(), Value::Number(200.0))
+            .expect("edit");
+        let unwritable = std::env::temp_dir()
+            .join(format!("improv_gui_no_dir_{}", std::process::id()))
+            .join("m.db")
+            .to_string_lossy()
+            .into_owned();
+        app.db = unwritable.clone();
+        app.undo().expect_err("the store is unwritable");
+        app.db.clear();
+        app.undo().expect("the retry");
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("100"));
+        app.db = unwritable;
+        app.redo().expect_err("the store is unwritable");
+        app.db.clear();
+        app.redo().expect("the retry");
+        assert_eq!(app.cell_text(MeasureId(101), &qkey).as_deref(), Some("200"));
+    }
+
+    // -- H3: the GUI at scale (a stress probe; run it in release)
+
+    /// Time × Product, 1000 × 1000 = 1M input cells, `Revenue = Qty * 2`
+    /// and `Total = SUM(Qty OVER Time)`: the CLI-built H3 store's shape.
+    fn million_cell_model() -> Model {
+        let mut m = Model::new();
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        m.add_category(t, "Time");
+        m.add_category(p, "Product");
+        for i in 0..1000 {
+            m.add_item(ItemId(1 + i), t, format!("t{i}"));
+            m.add_item(ItemId(2001 + i), p, format!("p{i}"));
+        }
+        m.add_measure(Measure {
+            id: MeasureId(100),
+            name: Name("Qty".into()),
+            value_type: ValueType::Number,
+            categories: vec![t, p],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        for i in 0..1000 {
+            for j in 0..1000 {
+                let at = improv_core_model::Coordinate::from_pairs([
+                    (t, ItemId(1 + i)),
+                    (p, ItemId(2001 + j)),
+                ]);
+                m.set_input(
+                    MeasureId(100),
+                    at,
+                    Value::Number(f64::from((i * 7 + j * 13) % 101)),
+                );
+            }
+        }
+        for (id, name, f) in [
+            (101, "Revenue", "Qty * 2"),
+            (102, "Total", "SUM(Qty OVER Time)"),
+        ] {
+            let formula = parser::parse_expr(&m, f).expect("formula");
+            let (value_type, categories) =
+                improv_engine::compiler::derived_shape(&m, MeasureId(id), name, &formula)
+                    .expect("shape");
+            m.add_measure(Measure {
+                id: MeasureId(id),
+                name: Name(name.into()),
+                value_type,
+                categories,
+                kind: MeasureKind::Derived(formula),
+                description: None,
+                format: None,
+            });
+        }
+        m
+    }
+
+    /// Frame times in ms: (median, p95, max).
+    fn frame_stats(mut ms: Vec<f64>) -> (f64, f64, f64) {
+        ms.sort_by(f64::total_cmp);
+        let at = |q: f64| ms[((ms.len() - 1) as f64 * q).round() as usize];
+        (at(0.5), at(0.95), at(1.0))
+    }
+
+    /// H3's numbers: load, engine build, frame time idle / scrolling /
+    /// after a pivot, and a cell edit split into its parts. A 1M-cell model
+    /// built in memory, or the store at `IMPROV_GUI_H3_DB` (then the edit
+    /// includes the autosave). `cargo test --release -p improv_gui h3_ --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "stress probe: a 1M-cell model, minutes in a debug build"]
+    fn h3_scale_probe() {
+        use std::time::Instant;
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+        let db = std::env::var("IMPROV_GUI_H3_DB").unwrap_or_default();
+        let t = Instant::now();
+        let mut app = if db.is_empty() {
+            let m = million_cell_model();
+            println!("H3 build model in memory: {:.0} ms", ms(t));
+            let t = Instant::now();
+            let app = build_app(m);
+            println!("H3 engine build: {:.0} ms", ms(t));
+            app
+        } else {
+            // As the app opens: the window waits only for `open`; the model
+            // loads behind a "Loading…" desk, painted meanwhile.
+            let mut app = ImprovApp::open(&db).expect("open");
+            println!("H3 ImprovApp::open (before the window): {:.0} ms", ms(t));
+            app.background = true;
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            let (mut worst, mut frames) = (0.0f64, 0);
+            while app.loading.is_some() || app.building.is_some() {
+                let f = Instant::now();
+                let was = app.loading.is_some();
+                let _ = full_frame(&ctx, &mut app, egui::vec2(1400.0, 900.0), 0.0);
+                if ms(f) > 50.0 {
+                    println!(
+                        "H3   slow frame {frames}: {:.0} ms ({})",
+                        ms(f),
+                        if was {
+                            "the model lands"
+                        } else {
+                            "the first layout of its grid"
+                        }
+                    );
+                }
+                worst = worst.max(ms(f));
+                frames += 1;
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+            println!(
+                "H3 the model and its engine are in after {:.0} ms; longest frame meanwhile {worst:.1} ms over {frames}",
+                ms(t)
+            );
+            app.background = false;
+            let t = Instant::now();
+            app.rebuild_engine();
+            println!(
+                "H3 of which the engine (now in the background): {:.0} ms",
+                ms(t)
+            );
+            app
+        };
+        println!("H3 cells: {}", app.model.inputs.len());
+        select(&mut app, MeasureId(100));
+        app.sync_axis_state();
+
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let size = egui::vec2(1400.0, 900.0);
+        let mut time = 0.0;
+        let mut frame = |app: &mut ImprovApp, events: Vec<egui::Event>| -> f64 {
+            time += 1.0 / 60.0;
+            let t = Instant::now();
+            let out = full_frame_with(&ctx, app, size, time, events, |_| ());
+            let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+            ms(t)
+        };
+        let first = frame(&mut app, Vec::new());
+        for _ in 0..5 {
+            frame(&mut app, Vec::new());
+        }
+        let idle: Vec<f64> = (0..30).map(|_| frame(&mut app, Vec::new())).collect();
+        let table = app.matrices[0].gutters.expect("rendered").table;
+        let over = egui::Event::PointerMoved(table.center());
+        let wheel = |d: egui::Vec2| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: d,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![over.clone()]);
+        let down: Vec<f64> = (0..60)
+            .map(|_| frame(&mut app, vec![over.clone(), wheel(egui::vec2(0.0, -120.0))]))
+            .collect();
+        let right: Vec<f64> = (0..60)
+            .map(|_| frame(&mut app, vec![over.clone(), wheel(egui::vec2(-120.0, 0.0))]))
+            .collect();
+        // The wheel really scrolled: the first row and column are off screen.
+        let cell = |ctx: &egui::Context, app: &ImprovApp, ri: usize, ci: usize| {
+            let id = egui::Id::unique(("cell", app.matrices[0].uid, ri, ci));
+            ctx.viewport(|v| v.prev_pass.widgets.get(id).is_some())
+        };
+        assert!(!cell(&ctx, &app, 0, 0), "the wheel did not scroll the grid");
+        let t = Instant::now();
+        app.pivot_rotate();
+        let pivot_call = ms(t);
+        let pivot_first = frame(&mut app, Vec::new());
+        let pivoted: Vec<f64> = (0..30).map(|_| frame(&mut app, Vec::new())).collect();
+        println!("H3 first frame: {first:.1} ms; pivot call {pivot_call:.1} ms, first frame after {pivot_first:.1} ms");
+        for (what, v) in [
+            ("idle", idle),
+            ("scroll down", down),
+            ("scroll right", right),
+            ("pivoted", pivoted),
+        ] {
+            let (med, p95, max) = frame_stats(v);
+            println!("H3 frame {what}: median {med:.1} ms, p95 {p95:.1}, max {max:.1} ({:.0} fps at the median)", 1e3 / med);
+        }
+
+        // One cell edit, as the grid commits it, and its parts.
+        let key = app.cursor_key().expect("a cell");
+        let t = Instant::now();
+        let clone = (*app.model).clone();
+        println!("H3 edit part: model clone (the undo point) {:.0} ms", ms(t));
+        drop(clone);
+        let t = Instant::now();
+        app.push_engine(MeasureId(100), &key, Some(&Value::Number(5.0)))
+            .expect("engine");
+        println!("H3 edit part: incremental recalc {:.1} ms", ms(t));
+        let t = Instant::now();
+        app.save_changes(&improv_store::ChangeSet::cell(MeasureId(100), decode(&key)))
+            .expect("save");
+        println!(
+            "H3 edit part: autosave, the cell (save_changes) {:.0} ms",
+            ms(t)
+        );
+        let t = Instant::now();
+        app.save().expect("save");
+        println!("H3 full save (save_model, unchanged model) {:.0} ms", ms(t));
+        let t = Instant::now();
+        app.commit_cell_text(MeasureId(100), key.clone(), "6")
+            .expect("edit");
+        println!("H3 cell edit, whole (commit_cell_text): {:.0} ms", ms(t));
+        let t = Instant::now();
+        app.undo().expect("undo");
+        println!("H3 undo: {:.0} ms", ms(t));
+        // The structural changes, as the app runs them (H3): the engine
+        // builds in the background. Each line is the call, then the longest
+        // frame until the build lands, and how long that took.
+        if !db.is_empty() {
+            let t = Instant::now();
+            let _ = app.outside_save();
+            println!(
+                "H3 reload check (H9, every {PROBE_SECS} s): {:.0} ms",
+                ms(t)
+            );
+        }
+        app.background = true;
+        let mut stalls = |app: &mut ImprovApp, what: &str, act: &mut dyn FnMut(&mut ImprovApp)| {
+            let t = Instant::now();
+            act(app);
+            let call = ms(t);
+            let (mut worst, mut frames) = (0.0f64, 0);
+            while app.building.is_some() || app.saving.is_some() {
+                let f = frame(app, Vec::new());
+                if f > 50.0 {
+                    println!("H3   slow frame {frames}: {f:.0} ms at {:.0} ms", ms(t));
+                }
+                worst = worst.max(f);
+                frames += 1;
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+            worst = worst.max(frame(app, Vec::new()));
+            // (In memory, any undo history is "unsaved".)
+            assert!(
+                app.db.is_empty() || !app.dirty,
+                "{what}: saved ({})",
+                app.status
+            );
+            println!(
+                "H3 {what}: call {call:.0} ms, longest frame {worst:.1} ms over {frames} frames, landed after {:.0} ms",
+                ms(t)
+            );
+        };
+        let input = app.model.measures[&MeasureId(100)].name.0.clone();
+        let revenue = app.model.measure_by_name("Revenue").expect("Revenue").id;
+        stalls(&mut app, "add a derived measure", &mut |app| {
+            app.add_derived_measure("Twice", &format!("{input} * 2"))
+                .expect("a formula");
+        });
+        stalls(&mut app, "undo the new formula", &mut |app| {
+            app.undo().expect("undo the formula");
+        });
+        stalls(&mut app, "redo the new formula", &mut |app| {
+            app.redo().expect("redo the formula");
+        });
+        stalls(&mut app, "edit a formula", &mut |app| {
+            app.commit_formula(revenue, &format!("{input} * 3"))
+                .expect("a formula");
+        });
+        let twice = app.model.measure_by_name("Twice").expect("Twice").id;
+        // A cell edit `delay` ms into a rebuild: the call is the UI
+        // thread's stall (the build used to copy the model first, and an
+        // edit meanwhile waited for the copy).
+        for (n, delay) in [0u64, 50, 100, 200, 500].into_iter().enumerate() {
+            let (k, v) = (4 + n, 10 + n);
+            let what = format!("edit a formula, then a cell {delay} ms into the build");
+            stalls(&mut app, &what, &mut |app| {
+                app.commit_formula(revenue, &format!("{input} * {k}"))
+                    .expect("a formula");
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                let t = Instant::now();
+                app.commit_cell_text(MeasureId(100), key.clone(), &v.to_string())
+                    .expect("edit");
+                println!("H3 cell edit {delay} ms into the build: {:.1} ms", ms(t));
+            });
+            assert_eq!(app.cell_text(revenue, &key), Some((k * v).to_string()));
+            assert_eq!(app.cell_text(twice, &key), Some((2 * v).to_string()));
+        }
+        stalls(&mut app, "undo the cell edit", &mut |app| {
+            app.undo().expect("undo");
+        });
+    }
+
+    thread_local! {
+        /// See [`super::full_sizing`].
+        pub(super) static FULL_SIZING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// H3: the grid's sizing pass measures each cell's value alone, not its
+    /// whole layout (139 → 46 ms for a 1,000-column grid's first frame), and
+    /// sizes every column exactly as the whole layout did: numbers, text, a
+    /// formatted measure, an empty cell, and with the row labels.
+    #[test]
+    fn the_sizing_pass_measures_columns_as_their_cells_do() {
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        let mut m = Model::new();
+        m.add_category(t, "Time");
+        m.add_category(p, "Product");
+        m.add_item(ItemId(10), t, "Q1");
+        m.add_item(ItemId(11), t, "a much longer row label");
+        for j in 0..6 {
+            m.add_item(ItemId(20 + j), p, format!("p{j}"));
+        }
+        m.add_measure(Measure {
+            id: MeasureId(1),
+            name: Name("N".into()),
+            value_type: ValueType::Number,
+            categories: vec![t, p],
+            kind: MeasureKind::Input,
+            description: None,
+            format: Some(NumberFormat {
+                decimals: Some(2),
+                grouping: true,
+            }),
+        });
+        let at = |q, j| improv_core_model::Coordinate::from_pairs([(t, ItemId(q)), (p, ItemId(j))]);
+        for (j, v) in [(20, 5.0), (21, 12345678.5), (22, -0.25), (24, 1e15)] {
+            m.set_input(MeasureId(1), at(10, j), Value::Number(v));
+        }
+        m.set_input(MeasureId(1), at(11, 25), Value::Number(42.0));
+        let widths = |full: bool| {
+            FULL_SIZING.with(|f| f.set(full));
+            let mut app = build_app(m.clone());
+            let mut desk = Desk::new();
+            desk.settle(&mut app);
+            FULL_SIZING.with(|f| f.set(false));
+            let out = desk.frame(&mut app, Vec::new());
+            let mut xs: Vec<(String, f32, f32)> = (0..6)
+                .map(|j| {
+                    let r = text_at(&out.shapes, &format!("p{j}")).expect("a column header");
+                    (format!("p{j}"), r.left(), r.right())
+                })
+                .collect();
+            xs.sort_by(|a, b| a.1.total_cmp(&b.1));
+            xs
+        };
+        let (fast, whole) = (widths(false), widths(true));
+        assert_eq!(fast, whole);
+        assert!(fast.windows(2).all(|w| w[0].1 < w[1].1), "{fast:?}");
+    }
+
+    /// H3's Postgres probe: the model at `IMPROV_GUI_H3_PG` (the 2.5M-row
+    /// model of `crates/pg_improv/tests/scale.sh`, its measures bound to the
+    /// fact table with `count` and `count_distinct`, so read-only), as the
+    /// app opens it: the store open before the window, the load and engine
+    /// behind it, then frames idle, scrolling and pivoted, and a new formula
+    /// and its undo (structural saves to Postgres, on the save thread).
+    /// `cargo test --release -p improv_gui h3_pg -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "stress probe: needs IMPROV_GUI_H3_PG"]
+    fn h3_pg_probe() {
+        use std::time::Instant;
+        let Ok(url) = std::env::var("IMPROV_GUI_H3_PG") else {
+            return println!("skipped: IMPROV_GUI_H3_PG not set");
+        };
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let size = egui::vec2(1400.0, 900.0);
+        let mut time = 0.0;
+        let mut frame = |app: &mut ImprovApp, events: Vec<egui::Event>| -> f64 {
+            time += 1.0 / 60.0;
+            let t = Instant::now();
+            let out = full_frame_with(&ctx, app, size, time, events, |_| ());
+            let _ = ctx.tessellate(out.shapes, out.pixels_per_point);
+            ms(t)
+        };
+        let t = Instant::now();
+        let mut app = ImprovApp::open(&url).expect("open");
+        println!("H3pg ImprovApp::open (before the window): {:.0} ms", ms(t));
+        app.background = true;
+        let (mut worst, mut frames) = (0.0f64, 0);
+        let mut loaded_at = None;
+        while app.loading.is_some() || app.building.is_some() {
+            let f = frame(&mut app, Vec::new());
+            if f > 50.0 {
+                println!("H3pg   slow frame {frames}: {f:.0} ms at {:.0} ms", ms(t));
+            }
+            worst = worst.max(f);
+            frames += 1;
+            if loaded_at.is_none() && app.loading.is_none() {
+                loaded_at = Some(ms(t));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        println!(
+            "H3pg model in after {:.0} ms, engine after {:.0} ms; longest frame meanwhile {worst:.1} ms over {frames}",
+            loaded_at.unwrap_or_default(),
+            ms(t)
+        );
+        let cells = app.model.inputs.len();
+        let n = app.model.measure_by_name("N").expect("N").id;
+        let items: usize = app.model.categories.values().map(|c| c.items.len()).sum();
+        println!("H3pg cells: {cells}, items: {items}");
+        select(&mut app, n);
+        app.sync_axis_state();
+        for _ in 0..5 {
+            frame(&mut app, Vec::new());
+        }
+        let idle: Vec<f64> = (0..30).map(|_| frame(&mut app, Vec::new())).collect();
+        let table = app.matrices[0].gutters.expect("rendered").table;
+        let over = egui::Event::PointerMoved(table.center());
+        let wheel = |d: egui::Vec2| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: d,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![over.clone()]);
+        let down: Vec<f64> = (0..60)
+            .map(|_| frame(&mut app, vec![over.clone(), wheel(egui::vec2(0.0, -120.0))]))
+            .collect();
+        let right: Vec<f64> = (0..60)
+            .map(|_| frame(&mut app, vec![over.clone(), wheel(egui::vec2(-120.0, 0.0))]))
+            .collect();
+        let t = Instant::now();
+        app.pivot_rotate();
+        let pivot_call = ms(t);
+        let pivot_first = frame(&mut app, Vec::new());
+        let pivoted: Vec<f64> = (0..30).map(|_| frame(&mut app, Vec::new())).collect();
+        println!("H3pg pivot call {pivot_call:.1} ms, first frame after {pivot_first:.1} ms");
+        for (what, v) in [
+            ("idle", idle),
+            ("scroll down", down),
+            ("scroll right", right),
+            ("pivoted", pivoted),
+        ] {
+            let (med, p95, max) = frame_stats(v);
+            println!("H3pg frame {what}: median {med:.1} ms, p95 {p95:.1}, max {max:.1} ({:.0} fps at the median)", 1e3 / med);
+        }
+        let mut stalls = |app: &mut ImprovApp, what: &str, act: &mut dyn FnMut(&mut ImprovApp)| {
+            let t = Instant::now();
+            act(app);
+            let call = ms(t);
+            let (mut worst, mut frames) = (0.0f64, 0);
+            while app.building.is_some() || app.saving.is_some() {
+                worst = worst.max(frame(app, Vec::new()));
+                frames += 1;
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+            assert!(!app.dirty, "{what}: saved ({})", app.status);
+            println!(
+                "H3pg {what}: call {call:.0} ms, longest frame {worst:.1} ms over {frames} frames, landed after {:.0} ms",
+                ms(t)
+            );
+        };
+        stalls(&mut app, "add a derived measure", &mut |app| {
+            app.add_derived_measure("Twice", "N * 2")
+                .expect("a formula");
+        });
+        stalls(&mut app, "undo the new formula", &mut |app| {
+            app.undo().expect("undo");
+        });
+    }
+
+    /// A grid wider than its window draws only the columns on screen: the
+    /// cells past the right edge are never laid out, and scrolling right
+    /// brings them in (H3: 1,000 columns cost 125 ms a frame).
+    #[test]
+    fn a_wide_grid_lays_out_only_the_columns_on_screen() {
+        let mut m = Model::new();
+        let (t, p) = (CategoryId(1), CategoryId(2));
+        m.add_category(t, "Time");
+        m.add_category(p, "Product");
+        for i in 0..3 {
+            m.add_item(ItemId(1 + i), t, format!("t{i}"));
+        }
+        for j in 0..300 {
+            m.add_item(ItemId(1000 + j), p, format!("p{j}"));
+        }
+        m.add_measure(Measure {
+            id: MeasureId(1),
+            name: Name("Q".into()),
+            value_type: ValueType::Number,
+            categories: vec![t, p],
+            kind: MeasureKind::Input,
+            description: None,
+            format: None,
+        });
+        let mut app = build_app(m);
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let laid_out = |desk: &Desk, app: &ImprovApp, ci: usize| {
+            let id = egui::Id::unique(("cell", app.matrices[0].uid, 0, ci));
+            desk.ctx.viewport(|v| v.prev_pass.widgets.get(id).is_some())
+        };
+        assert!(laid_out(&desk, &app, 0));
+        assert!(
+            !laid_out(&desk, &app, 299),
+            "an off-screen column was laid out"
+        );
+        let shown = (0..300).filter(|&ci| laid_out(&desk, &app, ci)).count();
+        assert!((1..60).contains(&shown), "{shown} columns laid out");
+        let table = app.matrices[0].gutters.expect("rendered").table;
+        for _ in 0..200 {
+            let _ = desk.frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(table.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(-400.0, 0.0),
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(!laid_out(&desk, &app, 0), "scrolled past the first column");
+        assert!(laid_out(&desk, &app, 299), "the last column scrolls in");
+    }
+
+    /// A grid edit's undo step is the cell, not the model: undo and redo
+    /// put the value back through the live engine (no rebuild), clear a
+    /// cell that was empty, and mix with whole-model steps in order.
+    #[test]
+    fn a_grid_edit_undoes_as_a_cell_step() {
+        let mut app = build_app(grid_2x2_model());
+        let (q, rev) = q_and_rev_keys();
+        let empty: CoordKey = {
+            let mut k: CoordKey = improv_engine::smallvec::smallvec![(1u32, 11u32), (2, 20)];
+            k.sort();
+            k
+        };
+        app.clear_cell(MeasureId(101), empty.clone())
+            .expect("clear 2026/A");
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(200.0))
+            .expect("edit");
+        assert!(matches!(app.undo_stack.last(), Some(Step::Cell(..))));
+        app.add_named(NewThing::Category, "Region")
+            .expect("a model step");
+        app.set_cell(MeasureId(101), empty.clone(), Value::Number(5.0))
+            .expect("fill the empty cell");
+        let revenue = |app: &ImprovApp| app.cell_text(MeasureId(102), &rev);
+        assert_eq!(revenue(&app).as_deref(), Some("2000"));
+
+        app.undo().expect("undo the fill");
+        assert_eq!(app.cell_text(MeasureId(101), &empty), None, "empty again");
+        app.undo().expect("undo Region");
+        assert!(app.model.category_by_name("Region").is_none());
+        app.undo().expect("undo the edit");
+        assert_eq!(app.cell_text(MeasureId(101), &q).as_deref(), Some("100"));
+        assert_eq!(revenue(&app).as_deref(), Some("1000"), "recomputed");
+        app.redo().expect("redo the edit");
+        assert_eq!(revenue(&app).as_deref(), Some("2000"));
+        app.redo().expect("redo Region");
+        app.redo().expect("redo the fill");
+        assert_eq!(app.cell_text(MeasureId(101), &empty).as_deref(), Some("5"));
+        assert!(app.model.category_by_name("Region").is_some());
+        assert!(!app.can_redo());
+    }
+
+    /// H3: a structural change rebuilds the engine in the background. The
+    /// grid keeps the old results meanwhile, and a cell edit made during the
+    /// build waits for the new engine and lands on it, undo and all.
+    #[test]
+    fn a_cell_edit_during_a_rebuild_lands_on_the_new_engine() {
+        let mut app = build_app(grid_2x2_model());
+        app.background = true;
+        let (q, rev) = q_and_rev_keys();
+        let revenue = |app: &ImprovApp| app.cell_text(MeasureId(102), &rev);
+        app.commit_formula(MeasureId(102), "Price * Quantity * 2")
+            .expect("formula");
+        assert!(app.building.is_some(), "built in the background");
+        assert_eq!(revenue(&app).as_deref(), Some("1000"), "the old results");
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(200.0))
+            .expect("edit");
+        assert_eq!(app.building.as_ref().map(|b| b.edits.len()), Some(1));
+        app.finish_build();
+        assert_eq!(revenue(&app).as_deref(), Some("4000"), "10 * 200 * 2");
+        app.undo().expect("undo the edit");
+        assert_eq!(revenue(&app).as_deref(), Some("2000"));
+        app.undo().expect("undo the formula");
+        app.finish_build();
+        assert_eq!(revenue(&app).as_deref(), Some("1000"));
+        assert_eq!(*app.model, grid_2x2_model());
+    }
+
+    /// Saves on the save thread wait while a test holds this up (one test
+    /// at a time: [`SAVES_HELD`]).
+    static SAVE_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    /// Serializes the tests that hold [`SAVE_GATE`]; other tests' saves
+    /// pass through it.
+    static SAVES_HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn save_gate() {
+        while SAVE_GATE.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Holds every save on the save thread until it drops (or `release`).
+    struct HeldSaves(Option<std::sync::MutexGuard<'static, ()>>);
+
+    impl HeldSaves {
+        /// Let the saves run, from any thread.
+        fn release() {
+            SAVE_GATE.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl Drop for HeldSaves {
+        fn drop(&mut self) {
+            Self::release();
+            self.0.take();
+        }
+    }
+
+    fn hold_saves() -> HeldSaves {
+        let one = SAVES_HELD.lock().unwrap_or_else(|e| e.into_inner());
+        SAVE_GATE.store(true, std::sync::atomic::Ordering::Release);
+        HeldSaves(Some(one))
+    }
+
+    /// A store-backed app whose saves run on the save thread, as in the app.
+    fn saving_app(tag: &str) -> (ImprovApp, Cleanup) {
+        let db = temp_db(tag);
+        let cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let mut app = ImprovApp::load(&db).expect("load");
+        app.finish_build();
+        app.background = true;
+        (app, cleanup)
+    }
+
+    /// Run frames until the save thread has nothing running.
+    fn saves_land(desk: &mut Desk, app: &mut ImprovApp) {
+        let t = std::time::Instant::now();
+        while app.saving.is_some() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(30),
+                "a save hung"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let _ = desk.frame(app, Vec::new());
+        }
+    }
+
+    fn stored_model(db: &str) -> Model {
+        Store::open(db)
+            .and_then(|mut s| s.load_model())
+            .expect("reopen")
+    }
+
+    /// H3: the window opens before the model has loaded. The desk says
+    /// "Loading…" (the status bar, the title and the empty desk), every
+    /// command but Quit, Hide and User Guide is off, an edit asked for is
+    /// refused and nothing reaches the store; once it lands the model's
+    /// first view shows and its engine builds.
+    #[test]
+    fn the_window_opens_while_the_model_loads() {
+        let db = temp_db("h3_open");
+        let _cleanup = Cleanup(db.clone());
+        let mut seeded = grid_2x2_model();
+        seeded.add_view(View {
+            id: ViewId(1),
+            name: Name("Quantity by year".into()),
+            measure: MeasureId(101),
+            axis_order: vec![CategoryId(1), CategoryId(2)],
+            n_rows: 1,
+            n_cols: 1,
+            page_items: vec![],
+            filters: vec![],
+            rect: CanvasRect::default(),
+            placements: vec![],
+        });
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&seeded))
+            .expect("seed");
+        let mut app = ImprovApp::open(&db).expect("open");
+        // Hold the answer back: this is the load still running.
+        let rx = app.loading.take().expect("loading");
+        let (tx, held) = mpsc::channel();
+        app.loading = Some(held);
+        let mut desk = Desk::new();
+        let out = desk.frame(&mut app, Vec::new());
+        assert!(text_at(&out.shapes, "Loading…").is_some(), "the status bar");
+        let name = app.file_name().to_owned();
+        assert!(text_at(&out.shapes, &format!("Loading {name}…")).is_some());
+        assert!(app.native_title().ends_with("Loading…"));
+        assert!(!app.command_enabled(Command::SaveModel));
+        assert!(app.command_enabled(Command::Quit));
+        let (q, rev) = q_and_rev_keys();
+        assert!(app
+            .set_cell(MeasureId(101), q.clone(), Value::Number(1.0))
+            .is_err());
+        assert!(app.add_named(NewThing::Category, "Region").is_err());
+        // The edit asked for while loading changed nothing in the store.
+        tx.send(rx.recv().expect("loaded")).expect("send");
+        desk.settle(&mut app);
+        assert!(app.loading.is_none());
+        assert_eq!(*app.model, seeded, "installed whole");
+        assert_eq!(app.current_view, Some(ViewId(1)), "its first view");
+        assert!(!app.dirty && !app.can_undo());
+        app.finish_build();
+        assert_eq!(app.cell_text(MeasureId(102), &rev).as_deref(), Some("1000"));
+        assert_eq!(stored_model(&db), seeded);
+        let out = desk.frame(&mut app, Vec::new());
+        assert!(text_at(&out.shapes, "Loading…").is_none());
+        // Edits save over the token the load took.
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(2.0))
+            .expect("saves");
+        assert_eq!(*app.model, stored_model(&db));
+    }
+
+    /// H3: a store that opens but does not load (a load thread that dies,
+    /// or a read error) says so and leaves an in-memory model, so nothing is
+    /// saved over the store it could not read; a store that cannot be opened
+    /// at all is still the error before any window.
+    #[test]
+    fn a_failed_background_load_says_so_and_saves_nothing() {
+        let db = temp_db("h3_badload");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let mut app = ImprovApp::open(&db).expect("open");
+        drop(app.loading.take());
+        let (tx, rx) = mpsc::channel::<Loaded>();
+        drop(tx);
+        app.loading = Some(rx);
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        assert!(app.status.contains(LOAD_LOST), "{}", app.status);
+        assert!(app.status.starts_with("could not open"), "{}", app.status);
+        assert!(app.db.is_empty(), "in memory now");
+        assert_eq!(stored_model(&db), grid_2x2_model(), "the store untouched");
+        let mut bad = ImprovApp::open(&db).expect("open");
+        let (tx, rx) = mpsc::channel::<Loaded>();
+        tx.send(Err("boom".into())).expect("send");
+        bad.loading = Some(rx);
+        assert_eq!(bad.finish_load(), Err("boom".into()));
+        assert!(ImprovApp::open("/nonexistent-dir-improv/x.db").is_err());
+        assert!(ImprovApp::load("/nonexistent-dir-improv/x.db").is_err());
+    }
+
+    /// H3: saves run on the save thread, one at a time and in order. Two
+    /// quick edits return before either is written; the title says • until
+    /// the store has both, then the store equals the model, the second
+    /// value last.
+    #[test]
+    fn two_quick_saves_land_in_order_off_the_ui_thread() {
+        let (mut app, _c) = saving_app("h3_order");
+        let (q, _) = q_and_rev_keys();
+        let gate = hold_saves();
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(1.0))
+            .expect("queued");
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(2.0))
+            .expect("queued");
+        app.add_named(NewThing::Category, "Region").expect("queued");
+        assert!(
+            app.saving.is_some() && app.save_wanted,
+            "one runs, one waits"
+        );
+        assert!(app.dirty, "not saved yet: •");
+        assert!(app.native_title().ends_with(" •"));
+        let value = |m: &Model| m.input(MeasureId(101), &decode(&q)).cloned();
+        assert_eq!(value(&stored_model(&app.db)), Some(Value::Number(100.0)));
+        drop(gate);
+        saves_land(&mut Desk::new(), &mut app);
+        assert!(!app.dirty && app.unsaved.is_empty());
+        let stored = stored_model(&app.db);
+        assert_eq!(
+            value(&stored),
+            Some(Value::Number(2.0)),
+            "the last value last"
+        );
+        assert!(stored.category_by_name("Region").is_some());
+        assert_eq!(stored, *app.model);
+        assert_eq!(
+            app.outside_save(),
+            None,
+            "its own saves are no outside save"
+        );
+    }
+
+    /// H3: a background save that fails says so on the status line, plainly,
+    /// keeps the change for the next save and the • until then; the next
+    /// save writes every failed change, and says so.
+    #[test]
+    fn a_failed_background_save_is_reported_and_written_by_the_next() {
+        let (mut app, _c) = saving_app("h3_fail");
+        let (q, _) = q_and_rev_keys();
+        let good = app.db.clone();
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        // Unwritable: each save fails, off the UI thread.
+        app.db = "/nonexistent-dir-improv/x.db".into();
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(5.0))
+            .expect("queued, not yet failed");
+        app.add_named(NewThing::Category, "Region").expect("queued");
+        saves_land(&mut desk, &mut app);
+        assert!(app.status.starts_with("save failed:"), "{}", app.status);
+        assert!(app.status.contains("not saved yet"), "{}", app.status);
+        assert!(app.dirty && app.unsaved.structure && !app.unsaved.cells.is_empty());
+        assert_eq!(
+            app.cell_text(MeasureId(101), &q).as_deref(),
+            Some("5"),
+            "kept"
+        );
+        // Writable again: the next save writes both failed changes.
+        app.db = good;
+        let ctx = egui::Context::default();
+        app.run_command(&ctx, Command::SaveModel);
+        assert_eq!(app.status, SAVING);
+        saves_land(&mut desk, &mut app);
+        assert_eq!(app.status, SAVED_AGAIN);
+        assert!(!app.dirty);
+        let stored = stored_model(&app.db);
+        assert_eq!(stored, *app.model, "both are in the store");
+        assert!(stored.category_by_name("Region").is_some());
+    }
+
+    /// H3: Quit (and the window's close box) waits for a running save and
+    /// then closes; a save that failed makes the first Quit warn, and the
+    /// second discard. A lost save thread is reported, never silent.
+    #[test]
+    fn quit_waits_for_a_pending_save_and_warns_when_it_failed() {
+        let (mut app, _c) = saving_app("h3_quit");
+        let (q, _) = q_and_rev_keys();
+        let gate = hold_saves();
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(6.0))
+            .expect("queued");
+        assert!(app.saving.is_some());
+        let release = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            HeldSaves::release();
+        });
+        assert!(app.quit_allowed(), "closes once the save is in");
+        release.join().expect("release");
+        drop(gate);
+        assert!(app.saving.is_none() && !app.dirty);
+        assert_eq!(
+            stored_model(&app.db).input(MeasureId(101), &decode(&q)),
+            Some(&Value::Number(6.0)),
+            "the store has it before the window closes"
+        );
+
+        let good = std::mem::replace(&mut app.db, "/nonexistent-dir-improv/x.db".into());
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(7.0))
+            .expect("queued");
+        assert!(!app.quit_allowed(), "the first Quit warns");
+        assert!(app.status.contains("not saved"), "{}", app.status);
+        assert!(app.status.ends_with("Quit again to discard the change."));
+        assert!(app.quit_allowed(), "the second discards");
+        // The close box asks the same question.
+        app.quit_armed = false;
+        let ctx = egui::Context::default();
+        let close = egui::RawInput {
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    events: vec![egui::ViewportEvent::Close],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        let out = ctx.test_ui(close.clone(), |ui| app.frame(ui));
+        let cancelled = |out: &egui::FullOutput| {
+            out.viewport_output
+                .values()
+                .any(|v| v.commands.contains(&egui::ViewportCommand::CancelClose))
+        };
+        assert!(cancelled(&out), "the first close is cancelled");
+        let out = ctx.test_ui(close, |ui| app.frame(ui));
+        assert!(!cancelled(&out), "the second closes");
+        app.db = good;
+
+        // A save thread that dies takes the token: said, and nothing more
+        // is saved until Revert to Saved.
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        app.saving = Some(Saving {
+            done: rx,
+            whole: false,
+            retry: false,
+        });
+        let e = app.finish_saves().expect_err("lost");
+        assert_eq!(e, SAVE_LOST);
+        let e = app
+            .set_cell(MeasureId(101), q.clone(), Value::Number(8.0))
+            .expect_err("nothing more saves");
+        assert_eq!(e, SAVE_LOST);
+        app.revert_to_saved().expect("revert");
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(9.0))
+            .expect("saves again");
+        app.finish_saves().expect("saved");
+        assert_eq!(
+            stored_model(&app.db).input(MeasureId(101), &decode(&q)),
+            Some(&Value::Number(9.0))
+        );
+    }
+
+    /// H3: a change no save wrote is not dropped by File ▸ Open (it refuses
+    /// until the change is saved or reverted), and Save As to a new store
+    /// writes it there and clears the failure.
+    #[test]
+    fn open_refuses_and_save_as_writes_a_change_that_failed() {
+        let (mut app, _c) = saving_app("h3_open_refuse");
+        let other = temp_db("h3_open_other");
+        let _o = Cleanup(other.clone());
+        Store::open(&other)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let (q, _) = q_and_rev_keys();
+        let good = std::mem::replace(&mut app.db, "/nonexistent-dir-improv/x.db".into());
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(9.0))
+            .expect("queued");
+        let _ = app.finish_saves();
+        let e = app.switch_model(&other, false).expect_err("refused");
+        assert!(e.contains("not saved"), "{e}");
+        assert_eq!(app.cell_text(MeasureId(101), &q).as_deref(), Some("9"));
+        drop(good);
+        let fresh = temp_db("h3_save_as");
+        let _f = Cleanup(fresh.clone());
+        app.save_as(&fresh).expect("save as");
+        assert!(!app.dirty && app.unsaved.is_empty() && !app.save_failed);
+        assert_eq!(stored_model(&fresh), *app.model);
+        app.switch_model(&other, false).expect("opens now");
+        app.finish_load().expect("loaded");
+        assert_eq!(*app.model, grid_2x2_model());
+    }
+
+    /// H3: a save of every cell (more than [`improv_store::SEEK_SAVE_LIMIT`])
+    /// shares the model itself; a structural change while it runs copies the
+    /// model rather than wait for it, and both land in order.
+    #[test]
+    fn a_change_during_a_whole_model_save_does_not_wait_for_it() {
+        let (mut app, _c) = saving_app("h3_whole");
+        let gate = hold_saves();
+        let mut big = (*app.model).clone();
+        big.add_item(ItemId(500), CategoryId(1), "big");
+        for i in 0..=improv_store::SEEK_SAVE_LIMIT {
+            big.add_item(ItemId(1000 + i as u32), CategoryId(2), format!("p{i}"));
+            let at = improv_core_model::Coordinate::from_pairs([
+                (CategoryId(1), ItemId(500)),
+                (CategoryId(2), ItemId(1000 + i as u32)),
+            ]);
+            big.set_input(MeasureId(101), at, Value::Number(1.0));
+        }
+        app.publish(big).expect("queued");
+        assert!(
+            app.saving.as_ref().is_some_and(|s| s.whole),
+            "shares the model"
+        );
+        // A build in flight that has let go of the model: only the save
+        // holds it now.
+        let built = app.building.take().expect("rebuilding");
+        let (tx, rx) = mpsc::channel();
+        app.building = Some(Build {
+            done: rx,
+            edits: Vec::new(),
+            stale: false,
+        });
+        let t = std::time::Instant::now();
+        app.add_named(NewThing::Category, "Region")
+            .expect("no wait");
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "it waited");
+        drop(gate);
+        app.finish_saves().expect("both");
+        tx.send(built.done.recv().expect("built")).expect("send");
+        app.finish_build();
+        assert_eq!(stored_model(&app.db), *app.model);
+    }
+
+    /// H3: edits made while a save runs (cell, structure, undo) go in the
+    /// next save, after it, and the window keeps responding: none waits for
+    /// the running save.
+    #[test]
+    fn edits_during_a_pending_save_go_in_the_next() {
+        let (mut app, _c) = saving_app("h3_during");
+        let (q, rev) = q_and_rev_keys();
+        let gate = hold_saves();
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(3.0))
+            .expect("queued");
+        let t = std::time::Instant::now();
+        app.commit_formula(MeasureId(102), "Price * Quantity * 2")
+            .expect("formula");
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(4.0))
+            .expect("edit");
+        app.undo().expect("undo the edit");
+        assert!(t.elapsed() < std::time::Duration::from_secs(2), "it waited");
+        assert!(app.save_wanted);
+        app.finish_build();
+        assert_eq!(app.cell_text(MeasureId(102), &rev).as_deref(), Some("60"));
+        drop(gate);
+        app.finish_saves().expect("both saves");
+        let stored = stored_model(&app.db);
+        assert_eq!(stored, *app.model);
+        assert_eq!(
+            stored.input(MeasureId(101), &decode(&q)),
+            Some(&Value::Number(3.0))
+        );
+    }
+
+    /// H3: a cell edit made while a build still holds the model (it copies
+    /// it first) does not wait for it: it is held beside the model, shown,
+    /// undone and saved like any edit, and written to the model once the
+    /// build lets go. Here the "build" is a clone of the model held by hand.
+    #[test]
+    fn a_cell_edit_while_a_build_holds_the_model_does_not_wait() {
+        let db = temp_db("h3_held");
+        let _cleanup = Cleanup(db.clone());
+        Store::open(&db)
+            .and_then(|mut s| s.save_model(&grid_2x2_model()))
+            .expect("seed");
+        let mut app = ImprovApp::load(&db).expect("load");
+        app.finish_build();
+        let (q, rev) = q_and_rev_keys();
+        let (tx, rx) = mpsc::channel();
+        app.building = Some(Build {
+            done: rx,
+            edits: Vec::new(),
+            stale: false,
+        });
+        let holder = Arc::clone(&app.model);
+        let t = std::time::Instant::now();
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(200.0))
+            .expect("edit");
+        app.clear_cell(MeasureId(100), decode_key(&[(2, 21)]))
+            .expect("clear");
+        // Both edits save in the foreground here (tests do); 5 s, as the
+        // tests above, is far under a wait for the held build (forever)
+        // and over two SQLite saves on a loaded Windows runner (>1 s).
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "it waited");
+        assert_eq!(app.held.len(), 2, "held beside the shared model");
+        assert_eq!(app.cell_text(MeasureId(101), &q).as_deref(), Some("200"));
+        assert_eq!(app.cell_text(MeasureId(100), &decode_key(&[(2, 21)])), None);
+        assert_eq!(app.values_for(MeasureId(101)).get(&q), Some(&200.0));
+        assert!(!app
+            .values_for(MeasureId(100))
+            .contains_key(&decode_key(&[(2, 21)])));
+        let stored = || Store::open(&db).and_then(|mut s| s.load_model()).unwrap();
+        assert_eq!(
+            stored().input(MeasureId(101), &decode(&q)),
+            Some(&Value::Number(200.0)),
+            "saved at once"
+        );
+        app.undo().expect("undo the clear");
+        assert_eq!(
+            app.cell_text(MeasureId(100), &decode_key(&[(2, 21)]))
+                .as_deref(),
+            Some("20")
+        );
+        // The build lets go and lands: the edits move into the model.
+        drop(holder);
+        tx.send(try_build_engine(&app.model)).expect("send");
+        app.finish_build();
+        assert!(app.held.is_empty());
+        assert_eq!(
+            app.model.input(MeasureId(101), &decode(&q)),
+            Some(&Value::Number(200.0))
+        );
+        assert_eq!(app.cell_text(MeasureId(102), &rev).as_deref(), Some("2000"));
+        assert_eq!(stored(), *app.model);
+    }
+
+    fn decode_key(pairs: &[(u32, u32)]) -> CoordKey {
+        let mut k: CoordKey = pairs.iter().copied().collect();
+        k.sort();
+        k
+    }
+
+    /// H3: a structural change made while a build runs makes that build
+    /// stale. When it lands it is thrown away and the model is built again,
+    /// with the cell edits made in between; the result is what a foreground
+    /// build of the final model computes.
+    #[test]
+    fn two_rebuilds_in_a_row_build_the_last_model() {
+        let mut app = build_app(grid_2x2_model());
+        app.background = true;
+        let (q, rev) = q_and_rev_keys();
+        app.commit_formula(MeasureId(102), "Price * Quantity * 2")
+            .expect("formula");
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(200.0))
+            .expect("edit");
+        let double = app
+            .add_derived_measure("Double", "Quantity * 2")
+            .expect("add");
+        let b = app.building.as_ref().expect("still building");
+        assert!(b.stale && b.edits.is_empty(), "the model is built again");
+        app.set_cell(MeasureId(101), q.clone(), Value::Number(300.0))
+            .expect("edit");
+        app.finish_build();
+        assert!(app.building.is_none());
+        assert_eq!(app.cell_text(MeasureId(102), &rev).as_deref(), Some("6000"));
+        assert_eq!(app.cell_text(double, &q).as_deref(), Some("600"));
+        let fresh = build_app((*app.model).clone());
+        assert_eq!(app.snapshot, fresh.snapshot);
+    }
+
+    /// H3: while a build runs the status bar says "Recalculating…" (and Calc
+    /// adds no "recalculated" of its own); a build that fails, or whose
+    /// thread dies, leaves no engine, says why, and the inputs still show.
+    #[test]
+    fn the_status_bar_says_recalculating_until_the_engine_lands() {
+        let (mut app, mut desk) = grid_desk();
+        app.background = true;
+        let (q, rev) = q_and_rev_keys();
+        let hold = |app: &mut ImprovApp| {
+            let (tx, rx) = mpsc::channel();
+            app.building = Some(Build {
+                done: rx,
+                edits: Vec::new(),
+                stale: false,
+            });
+            tx
+        };
+        let shown = |desk: &mut Desk, app: &mut ImprovApp| {
+            let out = desk.frame(app, Vec::new());
+            text_at(&out.shapes, "Recalculating…").is_some()
+        };
+        let tx = hold(&mut app);
+        assert!(shown(&mut desk, &mut app), "shown while it builds");
+        assert!(shown(&mut desk, &mut app), "still shown");
+        tx.send(try_build_engine(&app.model)).expect("send");
+        assert!(!shown(&mut desk, &mut app), "gone once it lands");
+        assert!(app.building.is_none() && app.engine.is_some());
+
+        let tx = hold(&mut app);
+        tx.send(Err("boom".into())).expect("send");
+        let _ = desk.frame(&mut app, Vec::new());
+        assert_eq!(app.status, "recalculation failed: boom");
+        assert!(app.engine.is_none() && app.snapshot.is_empty());
+        assert_eq!(app.cell_text(MeasureId(102), &rev), None);
+        assert_eq!(app.cell_text(MeasureId(101), &q).as_deref(), Some("100"));
+
+        drop(hold(&mut app));
+        let _ = desk.frame(&mut app, Vec::new());
+        assert_eq!(app.status, format!("recalculation failed: {BUILD_LOST}"));
+
+        // A stale build is built again even when it failed.
+        let tx = hold(&mut app);
+        app.rebuild_engine();
+        tx.send(Err("stale".into())).expect("send");
+        app.finish_build();
+        assert_eq!(app.cell_text(MeasureId(102), &rev).as_deref(), Some("1000"));
+
+        app.status.clear();
+        let calc = painted(&desk.frame(&mut app, Vec::new()).shapes, "Calc")
+            .expect("Calc shown")
+            .center();
+        desk.click(&mut app, calc);
+        assert_eq!(app.status, "", "Calc in the background says nothing yet");
+        app.finish_build();
+        assert_eq!(app.cell_text(MeasureId(102), &rev).as_deref(), Some("1000"));
+    }
+
+    /// Edit ▸ Add Category, clicked the way a pointer does (the press
+    /// and the release a frame apart, the pointer staying on the menu),
+    /// then typed with no help: the text lands in the New category line.
+    #[test]
+    fn add_category_from_the_menu_then_typing_reaches_the_line() {
+        let mut app = build_app(grid_2x2_model());
+        let mut desk = Desk::new();
+        desk.settle(&mut app);
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let ws = text_at(&shapes, "Edit").expect("the menu");
+        desk.click(&mut app, ws.center());
+        let shapes = desk.frame(&mut app, Vec::new()).shapes;
+        let item = text_at(&shapes, "Add Category").expect("the submenu");
+        let at = item.center();
+        let _ = desk.frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        let _ = desk.frame(&mut app, vec![press(at, true)]);
+        let _ = desk.frame(&mut app, vec![press(at, false)]);
+        for _ in 0..30 {
+            let _ = desk.frame(&mut app, Vec::new());
+        }
+        for ev in [egui::Event::Text("Region".into()), enter()] {
+            let _ = desk.frame(&mut app, vec![ev]);
+        }
+        assert!(
+            app.model.category_by_name("Region").is_some(),
+            "typing after the menu did not add: focus {:?}, status {:?}",
+            desk.ctx.memory(|m| m.focused()),
+            app.status
+        );
+    }
+}

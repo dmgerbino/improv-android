@@ -1,0 +1,37 @@
+[package]
+name = "improv_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "improv"
+path = "src/main.rs"
+
+[dependencies]
+improv_core_model = { path = "../core_model" }
+improv_store = { path = "../store", features = ["duckdb"] }
+improv_storage_sql = { path = "../storage_sql" }
+improv_storage_csv = { path = "../storage_csv" }
+improv_engine = { path = "../engine" }
+improv_policy = { path = "../policy" }
+thiserror.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+
+[dependencies.rusqlite]
+# 0.41, Mentat's line: mentatdb 1.20.0 needs rusqlite ~0.41, and a second
+# bundled libsqlite3-sys cannot link beside it (`links = "sqlite3"`). Move
+# with Mentat. 0.41 bundles SQLite 3.54.1 (RUSTSEC-2026-0459).
+version = "0.41"
+features = ["bundled"]
+
+# `cargo llvm-cov` on nightly sets `--cfg coverage_nightly`; test modules are
+# `coverage(off)` so the report measures library code only.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
+[dev-dependencies]
+improv_extfn = { path = "../extfn" }
+clap_mangen.workspace = true
+clap_complete.workspace = true

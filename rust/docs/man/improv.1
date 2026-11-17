@@ -1,0 +1,289 @@
+.\" Generated from its parser and crates/cli/man/improv.1.roff by `UPDATE_DOCS=1 cargo test -p improv_cli`. Do not edit.
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH IMPROV 1 "" "improv" "Improv Manual"
+.SH NAME
+improv \- headless multidimensional spreadsheet model CLI
+.SH SYNOPSIS
+\fBimprov\fR [COMMAND]
+.SH DESCRIPTION
+.B improv
+is the command-line front-end to the Improv multidimensional spreadsheet.
+It operates on a model store backed by an embedded (SQLite) Mentat datom
+database, or, when
+.I <db>
+is a
+.BI postgres:// ...?model= name
+(or
+.BR postgresql:// )
+URL, on that model in a Postgres database's
+.B improv
+catalog, and when it is
+.BI duckdb: file ?model= name\fR,
+on that model in a DuckDB file. Each invocation opens the store, mutates the
+loaded model, and saves it back.
+.PP
+A model is built from
+.B categories
+(dimensions such as Time or Product),
+.B items
+(members of a category, such as 2025 or WidgetA),
+.B measures
+(named variables indexed by a subset of the categories), and
+.B input cells
+(raw values at a coordinate). A coordinate maps category names to item names.
+.PP
+The
+.B \-\-at
+flag on
+.B set
+and
+.B scenario
+names a coordinate as
+.IR Category = Item
+pairs, resolved against the loaded model. Pairs may be comma-joined
+.RB ( "\-\-at Time=Q1,Product=A" ),
+space-separated after one flag
+.RB ( "\-\-at Time=Q1 Product=A" ),
+or spread over repeated flags
+.RB ( "\-\-at Time=Q1 \-\-at Product=A" );
+all are merged. Naming a category twice is an error, as is any argument that
+is not a pair after
+.BR \-\-at .
+.PP
+A command that takes a measure
+.RB ( set ,
+.BR format ,
+.BR show ,
+.BR eval ,
+.BR scenario ,
+.BR save\-view ,
+the refresh and export commands,
+.BR stream )
+takes its numeric id or its name:
+.B improv eval model.db Revenue
+is
+.BR "improv eval model.db 102" .
+An argument of all digits is an id. An unknown name is an error that lists
+the measures, nearest first. The ids of new categories, items and measures
+are given as numbers.
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH COMMANDS
+.TP
+improv\-init(1)
+Create or open a store and install the schema
+.TP
+improv\-add\-category(1)
+Add a category (a dimension, such as Time)
+.TP
+improv\-add\-item(1)
+Add an item (a member of a category)
+.TP
+improv\-add\-measure(1)
+Add an input measure
+.TP
+improv\-add\-derived(1)
+Add a derived (formula) measure
+.TP
+improv\-define(1)
+Create a measure or LAMBDA from a definition, "Target = ..."
+.TP
+improv\-register\-ext(1)
+Register a Python external function
+.TP
+improv\-refresh\-ext(1)
+Run a CALL(...) measure\*(Aqs function and store its cells
+.TP
+improv\-set(1)
+Set an input cell
+.TP
+improv\-list(1)
+Print the categories, items, measures, views and input cells
+.TP
+improv\-save\-view(1)
+Save a named view of a measure, as the GUI does
+.TP
+improv\-format(1)
+Set how a measure\*(Aqs numbers are shown
+.TP
+improv\-show(1)
+Print one measure and its input cells
+.TP
+improv\-eval(1)
+Compute a derived measure and print its cells
+.TP
+improv\-scenario(1)
+Add an input\-cell override to a what\-if scenario
+.TP
+improv\-export(1)
+Print the whole model as JSON
+.TP
+improv\-import\-sql(1)
+Import a SQLite query into a new SQL\-backed input measure
+.TP
+improv\-refresh\-sql(1)
+Re\-run an SQL\-backed measure\*(Aqs query and replace its cells
+.TP
+improv\-refresh\-all(1)
+Refresh every external measure now
+.TP
+improv\-serve\-refresh(1)
+Refresh measures as their refresh policies fall due, until interrupted
+.TP
+improv\-export\-sql(1)
+Write a measure\*(Aqs input cells to a SQLite table
+.TP
+improv\-import\-csv(1)
+Import a CSV or TSV file into a new input measure
+.TP
+improv\-export\-csv(1)
+Write a measure\*(Aqs cells to a CSV or TSV file
+.TP
+improv\-stream(1)
+Apply input edits from stdin and print the cells they change
+.TP
+improv\-policy(1)
+Manage a model\*(Aqs access policies (Cedar)
+.SH FORMULAS
+A derived measure's formula is an expression over measures, written
+.BR "Target = expression" :
+operators
+.BR "+ - * / ^ & %" ,
+comparisons
+.BR "== <> < <= > >=" ,
+.BR "AND OR NOT" ,
+and 681 built-in functions with Excel's names
+.RB ( ROUND ,
+.BR PMT ,
+.BR XLOOKUP ,
+.BR NORM.DIST ,
+\&...).
+An aggregation reduces a measure along a category:
+.BR "SUM(Sales OVER Month)" ;
+.B WHERE
+filters it, a window
+.B OVER Month[FIRST..THIS]
+makes a running total, and
+.B INTO
+lays a list result along a category.
+.BR LET ,
+.B LAMBDA
+and named LAMBDAs
+.RB ( "define db 1 \(dqMargin = LAMBDA(p, c, p - c)\(dq" )
+are supported. Every function is listed, with its arguments, in the
+Function Reference of the user guide (docs/src/functions.md); the language
+is described in docs/src/formulas.md.
+.SH EXAMPLES
+Build a small Time \(mu Product model:
+.PP
+.RS
+.nf
+improv init          model.db
+improv add-category  model.db 1 Time
+improv add-category  model.db 2 Product
+improv add-item      model.db 10 1 2025
+improv add-item      model.db 20 2 WidgetA
+improv add-measure   model.db 100 Price    number input
+improv add-measure   model.db 101 Quantity number input
+improv set           model.db 100 10 --at Product=WidgetA
+improv set           model.db 101 100 --at Time=2025,Product=WidgetA
+improv save-view     model.db 1 Prices 100 --rows Product --cols Time
+improv format        model.db Price 2 grouped
+improv list          model.db
+improv show          model.db Price
+improv export        model.db
+.fi
+.RE
+Pipe new data through a model and print what it changes:
+.PP
+.RS
+.nf
+improv define model.db 102 \(dqRevenue = Price * Quantity\(dq
+printf \(aqPrice 15 Product=WidgetA\en\(aq | improv stream model.db Revenue
+.fi
+.RE
+.PP
+Work on a model stored in Postgres:
+.PP
+.RS
+.nf
+improv list \(aqpostgres://me@127.0.0.1/sales?model=plan\(aq
+.fi
+.RE
+.SH FILES
+.TP
+.I <db>
+The model store: a single SQLite file created and read by
+.BR improv ,
+a
+.BI postgres:// ...?model= name
+URL, or
+.BI duckdb: file ?model= name\fR,
+a model in a DuckDB file (created when missing, by
+.B init
+and the imports). DuckDB lets one program at a time open a file for writing:
+while
+.BR improv-server (1)
+serves a DuckDB file, the CLI is refused, naming the server, and changes go
+through the server. An empty string names an in-memory database that is
+discarded on exit.
+.SH ENVIRONMENT
+.TP
+.B IMPROV_LOCALE
+The formula locale for
+.B define
+and
+.BR add-derived ,
+else the OS locale
+.RB ( LC_ALL ,
+.BR LC_MESSAGES ,
+.BR LANG ).
+In German
+.RB ( de )
+a formula may use the German function names, a decimal comma and
+.B ;
+between arguments:
+.BR "WENN(Price > 1,5; RUNDEN(Price; 2); 0)" .
+The English spelling is always accepted; models store it.
+.TP
+.B IMPROV_EXTFN_TRUSTED=1
+Run external functions without the sandbox.
+.TP
+.B IMPROV_EXTFN_ALLOW_UNSANDBOXED=1
+Without bubblewrap, run external functions under resource limits only
+(otherwise they are refused).
+.TP
+.B IMPROV_ENGINE_WORKERS
+Threads one
+.B eval
+uses (1 to 64); by default one per 10,000 input cells, at most 8 and
+the number of cores.
+A FIXPOINT step over at least 20,000 rows reduces on as many threads.
+The result is the same on any count.
+.TP
+.B MENTAT_MMAP_SIZE
+Bytes of the store file SQLite may memory-map;
+.B 0
+turns mapping off.
+.SH AUTHOR
+Greg Burd <greg@burd.me>
+.SH LICENSE
+Dual-licensed under Apache-2.0 OR MIT, at your option.
+.SH SEE ALSO
+.BR improv-formulas (7),
+.BR improv-functions (7),
+.BR improv-files (5),
+.BR improv-tui (1),
+.BR improv-gui (1),
+.BR improv-server (1),
+.BR pg_improv (7),
+and a page per command, such as
+.BR improv-import-csv (1).
+The user guide: https://gregburd.codeberg.page/improv/ (also
+https://gburd.github.io/improv/).

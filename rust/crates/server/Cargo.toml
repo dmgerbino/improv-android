@@ -1,0 +1,45 @@
+[package]
+name = "improv_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "improv-server"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+improv_core_model = { path = "../core_model" }
+improv_store = { path = "../store", features = ["duckdb"] }
+improv_engine = { path = "../engine" }
+improv_nl_formula = { path = "../nl_formula" }
+improv_policy = { path = "../policy" }
+improv_client = { path = "../client" }
+improv_service = { path = "../service" }
+futures-util = { version = "0.3", default-features = false }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["time", "signal"] }
+tower = { workspace = true, features = ["limit", "timeout", "util"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "service", "tokio"] }
+sha2 = "0.11"
+# HTTPS with --tls-cert/--tls-key: rustls on the ring provider.
+rustls.workspace = true
+tokio-rustls.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+improv_extfn = { path = "../extfn" }
+# tests/remote.rs: the native remote model service against this binary.
+improv_client = { path = "../client", features = ["remote"] }
+tokio = { workspace = true, features = ["io-util", "test-util"] }
+rcgen.workspace = true
+
+# `cargo llvm-cov` on nightly sets `--cfg coverage_nightly`; test modules are
+# `coverage(off)` so the report measures library code only.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }

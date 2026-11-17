@@ -1,0 +1,938 @@
+//! SQL connectivity (Phase 7): import external SQL query results into an Improv
+//! `Model`, and export a measure's cells back to a SQL table.
+//!
+//! Design invariants (see `.agent/steering/AGENT_DATABASE_CONNECTIVITY.md` §7):
+//!
+//! * **Storage separation.** External SQL is a data *source/sink*; the canonical
+//!   model lives in Mentat. Import produces ordinary categories/items/measures/
+//!   input cells — the engine gains no SQL-specific paths and stays deterministic.
+//! * **Security.** An import/refresh query must be a single `SELECT`/`WITH`
+//!   statement ([`check_read_only_sql`]), and every backend runs it read-only
+//!   (Postgres and DuckDB in a `READ ONLY` transaction, DuckDB with external
+//!   access off; SQLite only if the statement is read-only). Data values are
+//!   bound as parameters, never interpolated. [`connect_postgres`] uses
+//!   TLS, with the server's certificate verified, to any host off this
+//!   machine unless the connection string says `sslmode=disable`.
+//!
+//! Testing Postgres: the live tests skip unless `IMPROV_TEST_PG` holds a
+//! libpq DSN to a scratch database they may create/drop tables in, e.g.
+//! `IMPROV_TEST_PG="host=127.0.0.1 user=improv password=improv
+//! dbname=improv_test" cargo test -p improv_storage_sql`.
+//!
+//! Backends sit behind a common [`Backend`] enum ([`backend`] module): SQLite
+//! (the reference driver, and what the embedded Mentat store already uses) and
+//! Postgres. Both produce a common typed [`backend::Table`], so the column→model
+//! mapping below is backend-agnostic. Connections are described out of band by
+//! [`conn::Connection`] (no plaintext secrets) and opened via [`conn::open`].
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// The attribute is only used inside #[cfg(test)] modules, so non-test
+// coverage builds would otherwise warn that the feature is unused.
+#![cfg_attr(coverage_nightly, allow(unused_features))]
+
+pub mod backend;
+pub mod conn;
+pub mod duck;
+pub mod pg;
+
+pub use backend::{Backend, Cell, SqlConn, Table};
+pub use conn::{ConnKind, Connection};
+pub use duck::connect_duckdb;
+pub use pg::connect_postgres;
+
+use backend::Cell as BackendCell;
+use improv_core_model::{CategoryId, Coordinate, MeasureId, Model, Value, ValueType};
+
+#[derive(Debug, thiserror::Error)]
+pub enum SqlError {
+    #[error("sql error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("connect: {0}")]
+    Connect(String),
+    #[error("import: {0}")]
+    Import(String),
+    #[error("export: {0}")]
+    Export(String),
+}
+
+pub type Result<T> = std::result::Result<T, SqlError>;
+
+/// Reject anything that is not a single read statement.
+///
+/// A stored `SqlSource.query` is re-run on every refresh with the analyst's
+/// credentials, so it must not be able to write. After skipping leading
+/// whitespace and `--` / `/* */` comments, the text must start with the
+/// keyword `SELECT` or `WITH`, and a `;` may only be followed by whitespace.
+/// This is a cheap first line of defence (deliberately conservative: a `;`
+/// inside a string literal is rejected too). Each backend additionally runs
+/// the query read-only (see [`Backend::query`]), which is what catches a
+/// data-modifying CTE such as `WITH x AS (DELETE ...) SELECT ...`.
+pub fn check_read_only_sql(sql: &str) -> Result<()> {
+    let reject = |why: &str| Err(SqlError::Import(format!("refusing SQL query: {why}")));
+    let mut s = sql;
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            s = rest.find('\n').map_or("", |i| &rest[i + 1..]);
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(i) => s = &rest[i + 2..],
+                None => return reject("unterminated comment"),
+            }
+        } else {
+            break;
+        }
+    }
+    let word: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if !word.eq_ignore_ascii_case("select") && !word.eq_ignore_ascii_case("with") {
+        return reject("only a single SELECT or WITH statement is allowed");
+    }
+    if let Some(i) = s.find(';') {
+        if !s[i + 1..].trim().is_empty() {
+            return reject("multiple statements are not allowed");
+        }
+    }
+    Ok(())
+}
+
+/// How to map a query's result columns onto model elements.
+///
+/// Each `dimensions` entry names a result column that becomes a **category**
+/// (its distinct values become items); `value_column` names the column that
+/// becomes the imported measure's numeric value. A row therefore contributes
+/// one input cell: `measure[dim=val, …] = value_column`.
+pub struct ImportSpec {
+    /// SQL `SELECT` to run against the connection.
+    pub query: String,
+    /// Result-column name → the category it maps to (name + id).
+    pub dimensions: Vec<DimensionMapping>,
+    /// The result column holding the numeric measure value.
+    pub value_column: String,
+    /// The measure to create/populate for the value column.
+    pub measure_id: MeasureId,
+    pub measure_name: String,
+    /// Base id for minting item ids; items get sequential ids from here.
+    pub item_id_base: u32,
+    /// How the resulting measure should refresh (default `Manual`).
+    pub refresh_policy: improv_core_model::RefreshPolicy,
+}
+
+pub struct DimensionMapping {
+    pub column: String,
+    pub category_id: CategoryId,
+    pub category_name: String,
+}
+
+/// Import the result of `spec.query` into `model` as a new input measure over
+/// the mapped dimension categories. Distinct dimension-column values become
+/// items (interned by their string form). Returns the number of cells imported.
+///
+/// SQL data enters purely as input cells (a normal measure collection), so the
+/// deterministic engine core is untouched.
+pub fn import_query<C: SqlConn>(
+    mut conn: C,
+    model: &mut Model,
+    spec: &ImportSpec,
+) -> Result<usize> {
+    // Run the query once, up front, into a backend-agnostic table. Only a
+    // single read statement is accepted, and backends run it read-only.
+    check_read_only_sql(&spec.query)?;
+    let table = conn.query(&spec.query)?;
+
+    // Ensure the categories exist.
+    improv_data_source::ensure_categories(
+        model,
+        spec.dimensions
+            .iter()
+            .map(|d| (d.category_id, d.category_name.as_str())),
+    );
+    // Create the measure (input, over the mapped categories).
+    let cats: Vec<CategoryId> = spec.dimensions.iter().map(|d| d.category_id).collect();
+    improv_data_source::add_input_measure(
+        model,
+        spec.measure_id,
+        &spec.measure_name,
+        ValueType::Number,
+        cats,
+        Some(format!("imported from SQL: {}", truncate(&spec.query, 80))),
+    );
+
+    // Per-category interner: dimension value string -> ItemId. Seeded with the
+    // model's EXISTING items (by category + name) so re-import / refresh reuses
+    // items instead of minting duplicates with the same name.
+    let mut interner = improv_data_source::ItemInterner::seeded_from(model, spec.item_id_base);
+
+    // Resolve column indices up front; error clearly if a mapped column is absent.
+    let dim_idx: Vec<(usize, CategoryId)> = spec
+        .dimensions
+        .iter()
+        .map(|d| Ok((table.column_index(&d.column)?, d.category_id)))
+        .collect::<Result<_>>()?;
+    let val_idx = table.column_index(&spec.value_column)?;
+
+    let mut count = 0usize;
+    // Collect (coord, value) first so we can mutate the model after.
+    let mut cells: Vec<(Coordinate, f64)> = Vec::new();
+    for row in &table.rows {
+        let mut coord = Coordinate::new();
+        for (ci, cat) in &dim_idx {
+            let key = row[*ci].as_text();
+            let item = interner.intern(*cat, &key);
+            coord = coord.with(*cat, item);
+        }
+        let value: f64 = row[val_idx].as_number().map_err(|_| {
+            SqlError::Import(format!(
+                "value column '{}' is not numeric",
+                spec.value_column
+            ))
+        })?;
+        cells.push((coord, value));
+        count += 1;
+    }
+
+    // Register interned items on their categories, then set the input cells.
+    interner.register(model);
+    for (coord, value) in cells {
+        model.set_input(spec.measure_id, coord, Value::Number(value));
+    }
+
+    Ok(count)
+}
+
+/// Register an SQL-backed input measure (records its `SqlSource` on the model)
+/// and populate it by running the query once. The measure's categories must
+/// already exist or be creatable from the import; this is a convenience over
+/// `import_query` that also marks the measure as SQL-backed so it can be
+/// refreshed later.
+pub fn add_sql_measure<C: SqlConn>(conn: C, model: &mut Model, spec: &ImportSpec) -> Result<usize> {
+    let source = improv_core_model::SqlSource {
+        query: spec.query.clone(),
+        dimension_columns: spec.dimensions.iter().map(|d| d.column.clone()).collect(),
+        value_column: spec.value_column.clone(),
+        refresh_policy: spec.refresh_policy,
+    };
+    let n = import_query(conn, model, spec)?;
+    model.sql_sources.insert(spec.measure_id, source);
+    Ok(n)
+}
+
+/// Refresh an SQL-backed measure: re-run its stored query and replace its input
+/// cells with the fresh result. New dimension values become new items. The
+/// measure must have a `SqlSource` (added via `add_sql_measure`).
+///
+/// This is the `SQL("...")` live-query refresh (Phase 7): SQL data re-enters as
+/// ordinary input cells, so the engine recomputes dependents with no SQL path
+/// of its own. It is nondeterministic by nature (external data), hence gated on
+/// an explicit refresh rather than sitting on a pure evaluation path.
+pub fn refresh_sql_measure<C: SqlConn>(
+    conn: C,
+    model: &mut Model,
+    measure: MeasureId,
+) -> Result<usize> {
+    let source = model
+        .sql_sources
+        .get(&measure)
+        .cloned()
+        .ok_or_else(|| SqlError::Import(format!("{measure:?} is not an SQL-backed measure")))?;
+    let m = model
+        .measures
+        .get(&measure)
+        .ok_or_else(|| SqlError::Import(format!("no measure {measure:?}")))?;
+    if source.dimension_columns.len() != m.categories.len() {
+        return Err(SqlError::Import(format!(
+            "SQL source for {measure:?} maps {} columns but the measure has {} categories",
+            source.dimension_columns.len(),
+            m.categories.len()
+        )));
+    }
+    // Rebuild the import spec from the stored source + the measure's categories.
+    let dimensions: Vec<DimensionMapping> = source
+        .dimension_columns
+        .iter()
+        .zip(m.categories.iter())
+        .map(|(col, cat)| DimensionMapping {
+            column: col.clone(),
+            category_id: *cat,
+            category_name: model
+                .categories
+                .get(cat)
+                .map(|c| c.name.0.clone())
+                .unwrap_or_else(|| cat.0.to_string()),
+        })
+        .collect();
+    let spec = ImportSpec {
+        query: source.query.clone(),
+        dimensions,
+        value_column: source.value_column.clone(),
+        measure_id: measure,
+        measure_name: m.name.0.clone(),
+        // Continue item ids above the current max to avoid collisions.
+        item_id_base: model
+            .items
+            .keys()
+            .map(|i| i.0)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1_000_000),
+        refresh_policy: source.refresh_policy,
+    };
+    // Clear this measure's existing cells (refresh replaces them). Items from
+    // prior refreshes are left in place (harmless; may be re-referenced).
+    model.inputs.retain(|(mid, _), _| *mid != measure);
+    // import_query re-adds the measure; remove first so it isn't duplicated.
+    model.measures.remove(&measure);
+    let n = import_query(conn, model, &spec)?;
+    Ok(n)
+}
+
+/// Write a measure's input cells to a SQL table: one column per dimension
+/// category (item name), plus a value column. Creates the table if missing and
+/// inserts one row per cell. Values are bound as parameters (no interpolation).
+///
+/// `table` and column names are validated as plain identifiers to avoid
+/// injection through DDL (which cannot be parameterized).
+pub fn export_measure<C: SqlConn>(
+    mut conn: C,
+    model: &Model,
+    measure: MeasureId,
+    table: &str,
+    value_column: &str,
+) -> Result<usize> {
+    ident(table)?;
+    ident(value_column)?;
+    let m = model
+        .measures
+        .get(&measure)
+        .ok_or_else(|| SqlError::Export(format!("no measure {measure:?}")))?;
+
+    // Column per category, in the measure's declared order.
+    let dim_cols: Vec<(CategoryId, String)> = m
+        .categories
+        .iter()
+        .map(|c| {
+            let name = model
+                .categories
+                .get(c)
+                .map(|x| sanitize_ident(&x.name.0))
+                .unwrap_or_else(|| format!("cat{}", c.0));
+            (*c, name)
+        })
+        .collect();
+    for (_, name) in &dim_cols {
+        ident(name)?;
+    }
+
+    // CREATE TABLE (idempotent). Identifiers are validated; values are bound.
+    let cols_ddl = dim_cols
+        .iter()
+        .map(|(_, n)| format!("{n} TEXT"))
+        .chain(std::iter::once(format!(
+            "{value_column} {}",
+            conn.real_type()
+        )))
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.execute(
+        &format!("CREATE TABLE IF NOT EXISTS {table} ({cols_ddl})"),
+        &[],
+    )?;
+
+    let placeholders = (1..=dim_cols.len() + 1)
+        .map(|n| conn.placeholder(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let col_list = dim_cols
+        .iter()
+        .map(|(_, n)| n.clone())
+        .chain(std::iter::once(value_column.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let insert = format!("INSERT INTO {table} ({col_list}) VALUES ({placeholders})");
+
+    let mut count = 0usize;
+    for ((mid, coord), val) in &model.inputs {
+        if *mid != measure {
+            continue;
+        }
+        let n = match val {
+            Value::Number(n) => *n,
+            _ => continue, // v1 exports numeric cells only
+        };
+        // Bind dimension item names then the value (all as parameters).
+        let mut params: Vec<BackendCell> = Vec::with_capacity(dim_cols.len() + 1);
+        for (cat, _) in &dim_cols {
+            let item_name = coord
+                .get(*cat)
+                .and_then(|i| model.items.get(&i))
+                .map(|it| it.name.0.clone())
+                .unwrap_or_default();
+            params.push(BackendCell::Text(item_name));
+        }
+        params.push(BackendCell::Float(n));
+        conn.execute(&insert, &params)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+// --- helpers ---
+
+/// Validate a SQL identifier (table/column) used in DDL/DML that can't be
+/// parameterized: ASCII alphanumeric + underscore, not starting with a digit.
+fn ident(s: &str) -> Result<()> {
+    let ok = !s.is_empty()
+        && s.chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(SqlError::Export(format!("invalid SQL identifier: {s:?}")))
+    }
+}
+
+/// Turn an arbitrary category/measure name into a safe identifier.
+fn sanitize_ident(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if out
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(true)
+    {
+        out.insert(0, '_');
+    }
+    out
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..n])
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::*;
+
+    fn source_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sales (time TEXT, product TEXT, revenue REAL);
+             INSERT INTO sales VALUES ('2025','WidgetA', 1000.0);
+             INSERT INTO sales VALUES ('2025','WidgetB', 500.0);
+             INSERT INTO sales VALUES ('2026','WidgetA', 1200.0);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn revenue_spec() -> ImportSpec {
+        ImportSpec {
+            query: "SELECT time, product, revenue FROM sales".into(),
+            dimensions: vec![
+                DimensionMapping {
+                    column: "time".into(),
+                    category_id: CategoryId(1),
+                    category_name: "Time".into(),
+                },
+                DimensionMapping {
+                    column: "product".into(),
+                    category_id: CategoryId(2),
+                    category_name: "Product".into(),
+                },
+            ],
+            value_column: "revenue".into(),
+            measure_id: MeasureId(100),
+            measure_name: "Revenue".into(),
+            item_id_base: 1000,
+            refresh_policy: Default::default(),
+        }
+    }
+
+    #[test]
+    fn import_maps_columns_to_model() {
+        let mut conn = Backend::Sqlite(source_db());
+        let mut model = Model::new();
+        let n = import_query(&mut conn, &mut model, &revenue_spec()).unwrap();
+        assert_eq!(n, 3, "three rows imported");
+
+        // Categories + items created.
+        assert_eq!(model.category_by_name("Time").unwrap().items.len(), 2); // 2025, 2026
+        assert_eq!(model.category_by_name("Product").unwrap().items.len(), 2);
+
+        // Measure created as input over both categories.
+        let m = model.measure_by_name("Revenue").unwrap();
+        assert!(m.is_input());
+        assert_eq!(m.categories.len(), 2);
+        assert_eq!(model.inputs.len(), 3);
+
+        // A specific cell resolves: Revenue[2025, WidgetA] = 1000.
+        let time = model.category_by_name("Time").unwrap().id;
+        let product = model.category_by_name("Product").unwrap().id;
+        let item = |cat, name: &str| {
+            model
+                .items
+                .values()
+                .find(|i| i.category == cat && i.name.0 == name)
+                .unwrap()
+                .id
+        };
+        let coord = Coordinate::from_pairs([
+            (time, item(time, "2025")),
+            (product, item(product, "WidgetA")),
+        ]);
+        assert_eq!(
+            model.input(MeasureId(100), &coord),
+            Some(&Value::Number(1000.0))
+        );
+    }
+
+    #[test]
+    fn import_then_export_round_trips_values() {
+        let mut conn = Backend::Sqlite(source_db());
+        let mut model = Model::new();
+        import_query(&mut conn, &mut model, &revenue_spec()).unwrap();
+
+        let out = rusqlite::Connection::open_in_memory().unwrap();
+        let mut out_be = Backend::Sqlite(out);
+        let n = export_measure(
+            &mut out_be,
+            &model,
+            MeasureId(100),
+            "revenue_out",
+            "revenue",
+        )
+        .unwrap();
+        assert_eq!(n, 3);
+
+        // Read the exported values back; the multiset of revenues matches.
+        let Backend::Sqlite(out) = &out_be else {
+            unreachable!()
+        };
+        let mut stmt = out
+            .prepare("SELECT revenue FROM revenue_out ORDER BY revenue")
+            .unwrap();
+        let vals: Vec<f64> = stmt
+            .query_map([], |r| r.get::<_, f64>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(vals, vec![500.0, 1000.0, 1200.0]);
+    }
+
+    #[test]
+    fn missing_column_errors() {
+        let mut conn = Backend::Sqlite(source_db());
+        let mut model = Model::new();
+        let mut spec = revenue_spec();
+        spec.value_column = "nope".into();
+        assert!(import_query(&mut conn, &mut model, &spec).is_err());
+    }
+
+    #[test]
+    fn export_rejects_bad_identifier() {
+        let model = {
+            let mut conn = Backend::Sqlite(source_db());
+            let mut m = Model::new();
+            import_query(&mut conn, &mut m, &revenue_spec()).unwrap();
+            m
+        };
+        let mut out = Backend::Sqlite(rusqlite::Connection::open_in_memory().unwrap());
+        // A table name with a quote must be rejected, not interpolated.
+        assert!(export_measure(&mut out, &model, MeasureId(100), "bad\"; DROP", "v").is_err());
+    }
+
+    #[test]
+    fn sql_measure_refresh_picks_up_new_data() {
+        let mut conn = Backend::Sqlite(source_db());
+        let mut model = Model::new();
+        // Register + populate an SQL-backed measure.
+        let n = add_sql_measure(&mut conn, &mut model, &revenue_spec()).unwrap();
+        assert_eq!(n, 3);
+        assert!(model.sql_sources.contains_key(&MeasureId(100)));
+
+        // The source data changes (a new row + a changed value).
+        let Backend::Sqlite(raw) = &conn else {
+            unreachable!()
+        };
+        raw.execute_batch(
+            "UPDATE sales SET revenue = 9999.0 WHERE time='2025' AND product='WidgetA';
+             INSERT INTO sales VALUES ('2027','WidgetA', 1.0);",
+        )
+        .unwrap();
+
+        // Refresh replaces this measure's cells with the fresh query result.
+        let n2 = refresh_sql_measure(&mut conn, &mut model, MeasureId(100)).unwrap();
+        assert_eq!(n2, 4, "now four rows");
+        assert_eq!(model.inputs.len(), 4);
+
+        // The changed cell reflects the new value.
+        let time = model.category_by_name("Time").unwrap().id;
+        let product = model.category_by_name("Product").unwrap().id;
+        let item = |cat, name: &str| {
+            model
+                .items
+                .values()
+                .find(|i| i.category == cat && i.name.0 == name)
+                .unwrap()
+                .id
+        };
+        let coord = Coordinate::from_pairs([
+            (time, item(time, "2025")),
+            (product, item(product, "WidgetA")),
+        ]);
+        assert_eq!(
+            model.input(MeasureId(100), &coord),
+            Some(&Value::Number(9999.0))
+        );
+    }
+
+    #[test]
+    fn refresh_requires_a_registered_source() {
+        let mut conn = Backend::Sqlite(source_db());
+        let mut model = Model::new();
+        // A plain import (no source registered) can't be refreshed.
+        import_query(&mut conn, &mut model, &revenue_spec()).unwrap();
+        assert!(refresh_sql_measure(&mut conn, &mut model, MeasureId(100)).is_err());
+    }
+
+    /// Backend abstraction: open a SQLite `Connection` descriptor and run the
+    /// SQLite import through the same enum, then export. Exercises `conn::open`.
+    #[test]
+    fn conn_open_sqlite_import_export() {
+        // Seed an in-memory DB and hand it to the abstraction directly.
+        let mut conn = Backend::Sqlite(source_db());
+        let mut model = Model::new();
+        let n = import_query(&mut conn, &mut model, &revenue_spec()).unwrap();
+        assert_eq!(n, 3);
+
+        // A file-backed SQLite descriptor round-trips through open().
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("improv_sql_test_{}.db", std::process::id()));
+        let desc = crate::conn::sqlite("s1", "scratch", path.to_str().unwrap());
+        let mut be = crate::conn::open(&desc).unwrap();
+        let out =
+            export_measure(&mut be, &model, MeasureId(100), "revenue_out", "revenue").unwrap();
+        assert_eq!(out, 3);
+        drop(be);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// DuckDB round-trip: same shape as the SQLite test, through the DuckDB
+    /// backend. Seed an in-memory DuckDB, import a measure, then export it back
+    /// and read the values.
+    #[test]
+    fn duckdb_import_then_export_round_trips() {
+        let dconn = duckdb::Connection::open_in_memory().unwrap();
+        dconn
+            .execute_batch(
+                "CREATE TABLE sales (time VARCHAR, product VARCHAR, revenue DOUBLE);
+                 INSERT INTO sales VALUES ('2025','WidgetA', 1000.0);
+                 INSERT INTO sales VALUES ('2025','WidgetB', 500.0);
+                 INSERT INTO sales VALUES ('2026','WidgetA', 1200.0);",
+            )
+            .unwrap();
+        let mut conn = Backend::Duckdb(dconn);
+        let mut model = Model::new();
+        let n = import_query(&mut conn, &mut model, &revenue_spec()).unwrap();
+        assert_eq!(n, 3);
+
+        // Imported cells match: Revenue[2025, WidgetA] = 1000.
+        let time = model.category_by_name("Time").unwrap().id;
+        let product = model.category_by_name("Product").unwrap().id;
+        let item = |cat, name: &str| {
+            model
+                .items
+                .values()
+                .find(|i| i.category == cat && i.name.0 == name)
+                .unwrap()
+                .id
+        };
+        let coord = Coordinate::from_pairs([
+            (time, item(time, "2025")),
+            (product, item(product, "WidgetA")),
+        ]);
+        assert_eq!(
+            model.input(MeasureId(100), &coord),
+            Some(&Value::Number(1000.0))
+        );
+
+        // Export back into a fresh DuckDB and read the revenues.
+        let mut out_be = Backend::Duckdb(duckdb::Connection::open_in_memory().unwrap());
+        let out = export_measure(
+            &mut out_be,
+            &model,
+            MeasureId(100),
+            "revenue_out",
+            "revenue",
+        )
+        .unwrap();
+        assert_eq!(out, 3);
+        let Backend::Duckdb(out_conn) = &out_be else {
+            unreachable!()
+        };
+        let mut stmt = out_conn
+            .prepare("SELECT revenue FROM revenue_out ORDER BY revenue")
+            .unwrap();
+        let vals: Vec<f64> = stmt
+            .query_map([], |r| r.get::<_, f64>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(vals, vec![500.0, 1000.0, 1200.0]);
+    }
+
+    #[test]
+    fn read_only_sql_accepts_single_reads() {
+        for ok in [
+            "SELECT 1",
+            "  select time, product FROM sales;  ",
+            "-- note\nSELECT 1",
+            "/* hi */ /* again */ WITH x AS (SELECT 1) SELECT * FROM x",
+            "with x as (select 1) select * from x;\n",
+        ] {
+            assert!(check_read_only_sql(ok).is_ok(), "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn read_only_sql_rejects_writes_and_stacking() {
+        for bad in [
+            "",
+            "drop table sales",
+            "select 1; drop table x",
+            "SELECT 1;DELETE FROM sales",
+            "/* */ delete from sales",
+            "-- SELECT\nupdate sales set revenue = 0",
+            "/* unterminated SELECT",
+            "selectx 1",
+            "COPY sales TO PROGRAM 'id'",
+            "ATTACH 'x.db'",
+            "PRAGMA writable_schema = 1",
+        ] {
+            assert!(check_read_only_sql(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `WITH ... DELETE` passes the keyword check; the backend's read-only
+    /// execution is what stops it (SQLite: `sqlite3_stmt_readonly`).
+    #[test]
+    fn sqlite_refuses_cte_write() {
+        let conn = source_db();
+        let mut spec = revenue_spec();
+        spec.query = "WITH x AS (SELECT 1) DELETE FROM sales".into();
+        assert!(check_read_only_sql(&spec.query).is_ok());
+        let mut model = Model::new();
+        assert!(import_query(&conn, &mut model, &spec).is_err());
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sales", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 3, "rows must survive");
+    }
+
+    /// DuckDB runs queries in a READ ONLY transaction and with external access
+    /// off, so neither a write nor a host-file read gets through.
+    #[test]
+    fn duckdb_query_is_read_only_and_sandboxed() {
+        let mut be = crate::connect_duckdb(":memory:").unwrap();
+        be.execute("CREATE TABLE t (v DOUBLE)", &[]).unwrap();
+        be.execute("INSERT INTO t VALUES (?)", &[Cell::Float(1.0)])
+            .unwrap();
+        // Bypass check_read_only_sql to prove the transaction layer holds.
+        assert!(be.query("DELETE FROM t").is_err());
+        assert!(be.query("INSERT INTO t VALUES (2)").is_err());
+        assert!(be.query("WITH x AS (SELECT 1) DELETE FROM t").is_err());
+        assert!(be.query("SELECT * FROM read_csv('/etc/passwd')").is_err());
+        let t = be.query("SELECT v FROM t").unwrap();
+        assert_eq!(t.rows.len(), 1, "the read still works, the writes did not");
+        // The handle remains usable for export after a refused query.
+        be.execute("INSERT INTO t VALUES (?)", &[Cell::Float(3.0)])
+            .unwrap();
+        assert_eq!(be.query("SELECT v FROM t").unwrap().rows.len(), 2);
+    }
+
+    /// Postgres query mapping: guarded by IMPROV_TEST_PG. Skips cleanly if unset
+    /// so CI without a database still passes.
+    #[test]
+    fn postgres_import_when_available() {
+        let Ok(uri) = std::env::var("IMPROV_TEST_PG") else {
+            println!("skipped: IMPROV_TEST_PG not set");
+            return;
+        };
+        let mut be = crate::connect_postgres(&uri).expect("connect IMPROV_TEST_PG");
+        // Build a disposable source table.
+        be.execute("DROP TABLE IF EXISTS improv_pg_sales", &[])
+            .unwrap();
+        be.execute(
+            "CREATE TABLE improv_pg_sales (t TEXT, p TEXT, revenue DOUBLE PRECISION)",
+            &[],
+        )
+        .unwrap();
+        for (t, p, r) in [
+            ("2025", "A", 10.0),
+            ("2025", "B", 20.0),
+            ("2026", "A", 30.0),
+        ] {
+            be.execute(
+                "INSERT INTO improv_pg_sales (t, p, revenue) VALUES ($1, $2, $3)",
+                &[Cell::Text(t.into()), Cell::Text(p.into()), Cell::Float(r)],
+            )
+            .unwrap();
+        }
+        let mut model = Model::new();
+        let spec = ImportSpec {
+            query: "SELECT t, p, revenue FROM improv_pg_sales".into(),
+            dimensions: vec![
+                DimensionMapping {
+                    column: "t".into(),
+                    category_id: CategoryId(1),
+                    category_name: "Time".into(),
+                },
+                DimensionMapping {
+                    column: "p".into(),
+                    category_id: CategoryId(2),
+                    category_name: "Product".into(),
+                },
+            ],
+            value_column: "revenue".into(),
+            measure_id: MeasureId(100),
+            measure_name: "Revenue".into(),
+            item_id_base: 1000,
+            refresh_policy: Default::default(),
+        };
+        let n = import_query(&mut be, &mut model, &spec).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(model.inputs.len(), 3);
+        be.execute("DROP TABLE improv_pg_sales", &[]).unwrap();
+    }
+
+    #[test]
+    fn identifier_validation_and_sanitizing() {
+        assert!(ident("ok_1").is_ok());
+        assert!(ident("_x").is_ok());
+        assert!(ident("").is_err());
+        assert!(ident("1abc").is_err());
+        assert!(ident("a-b").is_err());
+        assert_eq!(sanitize_ident("Product Line"), "Product_Line");
+        assert_eq!(sanitize_ident("2025"), "_2025");
+        assert_eq!(sanitize_ident(""), "_");
+        assert_eq!(truncate("abc", 5), "abc");
+        assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    #[test]
+    fn non_numeric_value_column_is_an_import_error() {
+        let raw = rusqlite::Connection::open_in_memory().unwrap();
+        raw.execute_batch("CREATE TABLE s (k TEXT, v TEXT); INSERT INTO s VALUES ('a','x');")
+            .unwrap();
+        let mut spec = revenue_spec();
+        spec.query = "SELECT k, v FROM s".into();
+        spec.dimensions.truncate(1);
+        spec.dimensions[0].column = "k".into();
+        spec.value_column = "v".into();
+        let err = import_query(&raw, &mut Model::new(), &spec).unwrap_err();
+        assert!(err.to_string().contains("is not numeric"), "{err}");
+    }
+
+    #[test]
+    fn long_query_is_truncated_in_the_measure_description() {
+        let mut spec = revenue_spec();
+        spec.query = format!(
+            "SELECT time, product, revenue FROM sales {}",
+            " ".repeat(100)
+        );
+        let mut model = Model::new();
+        import_query(&source_db(), &mut model, &spec).unwrap();
+        let desc = model.measures[&MeasureId(100)].description.clone().unwrap();
+        assert!(desc.ends_with('…'), "{desc}");
+    }
+
+    #[test]
+    fn refresh_rejects_inconsistent_sources() {
+        let mut model = Model::new();
+        add_sql_measure(&source_db(), &mut model, &revenue_spec()).unwrap();
+        // Source maps more columns than the measure has categories.
+        let mut bad = model.clone();
+        bad.sql_sources
+            .get_mut(&MeasureId(100))
+            .unwrap()
+            .dimension_columns
+            .push("extra".into());
+        let err = refresh_sql_measure(&source_db(), &mut bad, MeasureId(100)).unwrap_err();
+        assert!(err.to_string().contains("maps 3 columns"), "{err}");
+        // Source without its measure.
+        let mut orphan = model.clone();
+        orphan.measures.remove(&MeasureId(100));
+        let err = refresh_sql_measure(&source_db(), &mut orphan, MeasureId(100)).unwrap_err();
+        assert!(err.to_string().contains("no measure"), "{err}");
+        // A category missing from the model falls back to its numeric id.
+        model.categories.remove(&CategoryId(2));
+        assert_eq!(
+            refresh_sql_measure(&source_db(), &mut model, MeasureId(100)).unwrap(),
+            3
+        );
+        assert_eq!(model.categories[&CategoryId(2)].name.0, "2");
+    }
+
+    #[test]
+    fn export_skips_other_measures_and_non_numeric_cells() {
+        let mut model = Model::new();
+        import_query(&source_db(), &mut model, &revenue_spec()).unwrap();
+        // A second measure's cell and a non-numeric cell of ours are skipped.
+        let coord = model.inputs.keys().next().unwrap().1.clone();
+        model.set_input(MeasureId(7), coord.clone(), Value::Number(1.0));
+        model.set_input(MeasureId(100), coord, Value::Text("n/a".into()));
+        // A category name that needs sanitizing, and one absent from the model.
+        model.categories.get_mut(&CategoryId(1)).unwrap().name.0 = "Fiscal Year".into();
+        model.categories.remove(&CategoryId(2));
+        let out = rusqlite::Connection::open_in_memory().unwrap();
+        let n = export_measure(&out, &model, MeasureId(100), "o", "v").unwrap();
+        assert_eq!(n, 2);
+        let cols: Vec<String> = out
+            .prepare("SELECT * FROM o")
+            .unwrap()
+            .column_names()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(cols, ["Fiscal_Year", "cat2", "v"]);
+        let err = export_measure(&out, &model, MeasureId(999), "o", "v").unwrap_err();
+        assert!(err.to_string().contains("no measure"), "{err}");
+        assert!(export_measure(&out, &model, MeasureId(100), "o", "1v").is_err());
+    }
+
+    /// Live Postgres export: `$n` placeholders and `DOUBLE PRECISION`.
+    #[test]
+    fn postgres_export_when_available() {
+        let Ok(uri) = std::env::var("IMPROV_TEST_PG") else {
+            println!("skipped: IMPROV_TEST_PG not set");
+            return;
+        };
+        let mut model = Model::new();
+        import_query(&source_db(), &mut model, &revenue_spec()).unwrap();
+        let mut be = crate::connect_postgres(&uri).expect("connect IMPROV_TEST_PG");
+        assert_eq!(
+            (be.placeholder(2), be.real_type()),
+            ("$2".into(), "DOUBLE PRECISION")
+        );
+        be.execute("DROP TABLE IF EXISTS improv_pg_export", &[])
+            .unwrap();
+        let n = export_measure(&mut be, &model, MeasureId(100), "improv_pg_export", "v").unwrap();
+        assert_eq!(n, 3);
+        let t = be
+            .query("SELECT sum(v) AS s FROM improv_pg_export")
+            .unwrap();
+        assert_eq!(t.rows, [[Cell::Float(2700.0)]]);
+        be.execute("DROP TABLE improv_pg_export", &[]).unwrap();
+    }
+}

@@ -1,0 +1,250 @@
+# Improv
+
+A **multidimensional spreadsheet** in Rust, in the line of Lotus Improv and
+Quantrix. You model in named **categories**, **items** and **measures**
+instead of cell addresses, write formulas over dimensions (with the
+spreadsheet functions people know, Excel's names: `IF`, `ROUND`, `NPV`,
+`STDEV`, `TEXT` and some 330 more, plus running totals and `PREV`), and
+every derived value recomputes **incrementally** through a
+differential-dataflow graph. The
+same model opens in a NeXTSTEP-style desktop GUI, the same GUI in a web
+browser, a COSMIC desktop GUI (a preview), a terminal UI, a CLI, a
+streaming pipe, an HTTP server, **inside Postgres** and **inside DuckDB**.
+A model can carry **access policies** in
+[Cedar](https://www.cedarpolicy.com), which the server and pg_improv
+enforce ([Access Policies](docs/src/policies.md)).
+
+[![Docs](https://img.shields.io/badge/docs-gburd.github.io%2Fimprov-blue)](https://gburd.github.io/improv/)
+[![CI](https://github.com/gburd/improv/actions/workflows/ci.yml/badge.svg)](https://github.com/gburd/improv/actions/workflows/ci.yml)
+
+**Documentation:** [the Improv guide on GitHub Pages](https://gburd.github.io/improv/)
+(also on [Codeberg Pages](https://gregburd.codeberg.page/improv/)) ·
+[API reference (rustdoc)](https://gburd.github.io/improv/api/) ·
+[Ways to use Improv](https://gburd.github.io/improv/ways.html) ·
+[Function reference](https://gburd.github.io/improv/functions.html) ·
+[Improv in Postgres](https://gburd.github.io/improv/postgres.html) ·
+[Improv in DuckDB](https://gburd.github.io/improv/duckdb.html)
+
+![The Improv desktop GUI: the main menu, two worksheets on one model with their formulas, the model browser and a color graph](docs/src/img/gui-workspace.png)
+
+```text
+Revenue[Time, Product] = Price[Product] * Quantity[Time, Product]
+Total[Product]         = SUM(Revenue OVER Time)
+```
+
+`Price` is broadcast over `Time`. Editing one Quantity cell recomputes one
+Revenue cell and one Total, not the sheet.
+
+## Ways to use it
+
+| | Use it for | Start with |
+| --- | --- | --- |
+| **GUI** `improv-gui` | building and exploring a model by hand: drag tiles to pivot, edit cells, add formulas, several worksheets at once | `improv-gui sample.db` |
+| **Web GUI** | the same worksheets in a browser, for many users, under the model's access policies | `improv-server sample.db --static web` ([how](docs/src/web-gui.md)) |
+| **COSMIC GUI** `improv-cosmic` (preview) | a native COSMIC desktop application on the same models | `cd crates/gui_cosmic && cargo run --locked --release -- ../../sample.db` |
+| **TUI** `improv-tui` | the same in a terminal or over SSH | `improv-tui sample.db` |
+| **CLI** `improv` | scripting a model, bulk CSV/SQL import and export, CI | `improv --help`, `man improv` |
+| **Streaming** `improv stream` | pushing a live feed through a model and reading the changed results | `producer \| improv stream m.db Revenue` |
+| **Postgres** `pg_improv` | modeling data already in Postgres; results land in tables any SQL client reads | `CREATE EXTENSION pg_improv` |
+| **SQL functions** `LANGUAGE improv` | writing a SQL function as a formula | `CREATE FUNCTION … LANGUAGE improv` |
+| **DuckDB** `improv` extension | a formula or a whole model over a DuckDB table, Parquet or CSV, in one query | `LOAD improv` |
+| **Server** `improv-server` | serving a model to other programs as JSON over HTTP | `improv-server sample.db` |
+
+Each front end takes a model file or a Postgres model URL
+(`postgres://user@host/db?model=plan`). The guide's
+[Ways to Use Improv](docs/src/ways.md) chapter explains when to use which.
+
+### The desktop GUI, in the NeXTSTEP style
+
+`improv-gui` follows Lotus Improv on NeXTSTEP: worksheets in windows, a
+main menu, category tiles you drag to pivot, and the formula pane.
+
+![The GUI: pivoting a tile, paging, editing a cell, a formula typed with autocomplete, a color graph and the Inspector](docs/src/img/gui-demo.gif)
+
+### The COSMIC desktop GUI (preview)
+
+`improv-cosmic` is a native [COSMIC](https://system76.com/cosmic)
+application on the same models, in the desktop's theme.
+
+![improv-cosmic: pivoting the Region tile, Swap, editing a Quantity cell and Revenue following, a formula with completions and a located error, and the chart](docs/src/img/cosmic-demo.gif)
+
+### The web GUI
+
+`improv-server --static` serves the same NeXT-style worksheets to a
+browser, under the model's access policies, with every edit reaching the
+other browsers live.
+
+![The web GUI: a token login, pivoting the Time tile and back, an edit in one browser reaching another with the server's new Revenue, a formula refused with its error located, undo and the Model Browser](docs/src/img/web-demo.gif)
+
+### The terminal UI
+
+![The TUI: editing an input as 1,500 and watching Revenue recompute, a number format, paging, pivoting, a range Sum, a saved view the TUI reopens on](docs/src/img/tui-demo.gif)
+
+### Improv in Postgres
+
+![pg_improv: a model over a sales table, an UPDATE flowing to the results, improv.status, a LANGUAGE improv function, then the TUI editing the same model and the edit back in the table](docs/src/img/pg-demo.gif)
+
+## Install
+
+Pre-built CLI, TUI, GUI and server binaries for Linux, macOS and Windows are
+attached to each [release](https://github.com/gburd/improv/releases). To
+build from source you need Rust **1.97** or newer:
+
+```sh
+git clone https://codeberg.org/gregburd/improv && cd improv
+cargo build --release      # target/release/{improv,improv-tui,improv-gui,improv-server}
+```
+
+The GUI needs the usual Wayland/X11/OpenGL runtime libraries
+(`libxkbcommon-x11-0 libgl1 libegl1` on Debian/Ubuntu). With
+[Nix](https://nixos.org), `nix develop` provides the toolchain, those
+libraries and the dev tools. External functions need `python3` and, on
+Linux, `bubblewrap` for the sandbox.
+
+The Postgres extension is built separately with `cargo-pgrx`; see
+[`crates/pg_improv/README.md`](crates/pg_improv/README.md).
+
+## Quick start
+
+Build the 3-D sample model (Time × Product × Region, with Price, UnitCost,
+Quantity, Revenue, COGS and Margin) and open it:
+
+```sh
+IMPROV=target/release/improv bash docs/demo/sample-model.sh sample.db
+target/release/improv-gui sample.db     # or improv-tui sample.db
+```
+
+Or build a model by hand with the CLI:
+
+```sh
+improv init m.db
+improv add-category m.db 1 Time;    improv add-item m.db 10 1 Q1
+improv add-category m.db 2 Product; improv add-item m.db 20 2 Widget
+improv add-measure m.db 100 Price    number input Product
+improv add-measure m.db 101 Quantity number input Time Product
+improv set m.db 100 10  --at Product=Widget
+improv set m.db 101 100 --at Time=Q1,Product=Widget
+improv define m.db 102 "Revenue = Price * Quantity"
+improv eval m.db 102
+# Revenue[Time=Q1, Product=Widget] = 1000
+```
+
+and stream new data through it:
+
+```sh
+printf 'Price 15 Product=Widget\n' | improv stream m.db Revenue
+# Revenue Time=Q1, Product=Widget = 1500
+```
+
+The CLI also imports and exports CSV and SQLite, runs sandboxed Python
+functions (`register-ext`, then `CALL(...)`), and refreshes external
+measures on a schedule. [Getting Started](docs/src/getting-started.md) is the tutorial;
+[`docs/man/improv.1`](docs/man/improv.1) lists every command.
+
+## In Postgres
+
+```sql
+-- postgresql.conf: shared_preload_libraries = 'pg_improv', wal_level = logical
+CREATE EXTENSION pg_improv;
+SELECT improv.create_model('plan');
+SELECT improv.bind_category('plan', 'Time',    'sales', 'quarter');
+SELECT improv.bind_category('plan', 'Product', 'sales', 'product');
+SELECT improv.bind_measure ('plan', 'Price',    'sales', 'price');
+SELECT improv.bind_measure ('plan', 'Quantity', 'sales', 'qty');
+SELECT improv.define('plan', 'Revenue = Price * Quantity');
+SELECT * FROM improv_plan.revenue;    -- kept current as sales changes
+
+CREATE FUNCTION bonus(sales float8, target float8) RETURNS float8
+  LANGUAGE improv AS $$ Ratio = sales / target
+                        MAX2(Ratio - 1, 0) * 1000 $$;
+```
+
+By default a background worker applies committed changes incrementally (at
+100k cells, a one-row UPDATE shows up about 50 ms after commit, and the
+writer pays nothing). Trigger mode updates the results inside the writer's
+transaction, and `improv.recalc()` updates them when you call it.
+`improv-gui 'postgres://me@host/sales?model=plan'` opens the same model, and
+editing a cell there updates the row in `sales`. See
+[Improv in Postgres](docs/src/postgres.md). For a worked example (statement
+reconciliation, budgets, net worth and savings goals for a family with jobs,
+consulting income, several accounts, cards, crypto, foreign currency, a
+house and cars), see [A family's finances in Postgres](docs/src/postgres-finance.md).
+
+## In DuckDB
+
+```sql
+LOAD improv;
+SELECT improv_calc('ROUND(PMT(rate/12, n, -pv), 2)',
+                   json_object('rate', 0.06, 'n', 360, 'pv', 200000));  -- 1199.1
+SELECT * FROM improv('sales', '
+  category Time = year
+  category Product = product
+  input Price = price
+  input Quantity = qty sum
+  Revenue = Price * Quantity
+  Share = Revenue / SUM(Revenue OVER Product)
+  Growth = Revenue - PREV(Revenue, Time, 1, 0)');
+```
+
+`improv_calc` evaluates any formula on named inputs, `improv_functions()`
+lists the 681 built-in functions, and `improv(source, model)` runs a model
+over a table or query and returns one row per computed cell. One binary
+loads into DuckDB v1.5.6 and v2.0. See [Improv in DuckDB](docs/src/duckdb.md)
+and [`crates/duckdb_improv/README.md`](crates/duckdb_improv/README.md).
+
+## Keys
+
+**TUI:** arrows move · `e`/Enter edit · Tab next measure · `p` pivot ·
+`[` `]` page · Shift+arrows select a range (its sum in the status line) ·
+`f`/`F` filter · `S` save view · `v` cycle views · `I`/`E` CSV import/export ·
+`c` category, `n` input measure, `=` formula · `r`/`D` rename/delete ·
+`#` number format · `u`/Ctrl+R undo/redo · `R` revert to saved ·
+`?`/F1 keys and functions · `q` quit and save.
+
+**GUI:** drag a tile between strips to pivot (or right-click it) ·
+double-click or Enter to edit · type `Name = formula` on the formula list's
+last line · Shift+click or drag selects a range (its Sum in the status bar) ·
+Ctrl+S save, Ctrl+Z undo, Ctrl+Y redo, Ctrl+P print · **File ▸ Revert to
+Saved** after a save conflict · F1 function help, Ctrl+? context help ·
+**Help ▸ Keys…** lists them all.
+
+## Workspace
+
+| Crate | Binary | What it is |
+| --- | --- | --- |
+| `improv_core_model` | | Categories, items, measures, coordinates, formulas, values, views |
+| `improv_engine` | | Formula compiler and differential-dataflow evaluator; the live incremental engine |
+| `improv_nl_formula` | | Controlled-English ⇄ formula |
+| `improv_storage_mentat` | | A model as datoms in an embedded [Mentat](https://codeberg.org/gregburd/mentat) (SQLite) store |
+| `improv_storage_pg` | | A model in a Postgres `improv` catalog, with columns bound to tables |
+| `improv_storage_duckdb` | | A model in an `improv` catalog inside a DuckDB file |
+| `improv_store` | | Opens a file, a `postgres://` URL or a `duckdb:` model |
+| `improv_storage_sql`, `improv_storage_csv`, `improv_data_source` | | SQL and CSV import, export and refresh |
+| `improv_extfn` | | Sandboxed external functions (Python, R, Julia, Pure, Wasm) |
+| `improv_cli` | `improv` | Command-line tool and `stream` |
+| `improv_tui` | `improv-tui` | Terminal UI |
+| `improv_gui` | `improv-gui` | Desktop GUI (egui) |
+| `improv_gui_web` | (wasm) | The web GUI, served by `improv-server --static` |
+| `improv_gui_cosmic` | `improv-cosmic` | COSMIC desktop GUI (libcosmic, its own workspace) |
+| `improv_policy` | | Cedar access policies: schema, evaluator, templates, lint |
+| `improv_client` | | What the front ends share: formula errors, autocomplete, function help |
+| `improv_service` | | The authority the web GUI drives (in `improv-server`) |
+| `improv_server` | `improv-server` | JSON HTTP API |
+| `improv_pg_model` | | Postgres-free core of the extension |
+| `pg_improv` | (extension) | The Postgres extension (pgrx, its own workspace) |
+| `improv_duckdb_model` | | DuckDB-free core of the DuckDB extension |
+| `duckdb_improv` | (extension) | The DuckDB extension `improv` (duckdb-rs, its own workspace) |
+
+## Development
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the quality gate (fmt, clippy
+with `-D warnings`, tests, `cargo deny`, typos, rustdoc, the GUI screenshot
+golden and the ≥ 90% per-crate coverage gate). Design notes are in
+[`docs/reviews/`](docs/reviews/) and [`.agent/steering/`](.agent/steering/).
+The guide's source is [`docs/src/`](docs/src/) (`mdbook build docs`); man
+pages are in [`docs/man/`](docs/man/).
+
+## License
+
+Licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at
+your option.

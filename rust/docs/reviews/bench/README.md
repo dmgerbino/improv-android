@@ -1,0 +1,52 @@
+# The benchmark harnesses and the scale gate
+
+- `bench-*.sh`, `summarize.py`: the release benchmark's harnesses (the
+  v0.10.0 benchmark, `docs/reviews/2026-10-20-v0.10.0-benchmark.md`; A/B
+  runs such as a Mentat bump, AGENTS.md).
+- `j3/`: the release qualification (road-to-1.0 J3): `j3.sh <rev>`, then
+  `j3b.sh`, on a quiet dedicated machine; the 0.11.0 and 0.12.0 runs are
+  `docs/reviews/2026-10-2*-v0.1*.0-qualification.md`.
+- `scale-gate.py`, `reference.rs`, `baseline.json`: the weekly scale
+  regression gate (`.github/workflows/scale-gate.yml`; CONTRIBUTING.md,
+  "The scale gate").
+
+## The scale gate
+
+The probes are the benchmark's shapes at sizes a GitHub runner runs in a few
+minutes; each is the median of 3 runs:
+
+| Probe | What | Benchmark § |
+|---|---|---|
+| `wide.sum.*`, `wide.rank.*` | `tests/probe.rs wide`, 100k items: `evaluate`, `Engine::new`, median one-cell edit (new max, tail) | 3d |
+| `measures.fan.*`, `measures.chain.*` | `tests/probe.rs measures`, 2,000 measures × 100 items: `Engine::new`, median root edit | 3c |
+| `pagerank.*` | `tests/probe.rs pagerank`, 1,500 nodes × 150k edges: `Engine::new` (build + solve), one edge edit | 2 |
+| `stress.100k.evaluate` | `tests/stress.rs scale_evaluate_100k` | 3a |
+| `import_csv.100x1000` | `improv import-csv` of 100k distinct cells into a fresh Mentat file | 3g |
+| `pg_scale.*` | pg_improv `tests/scale.sh` small (50k rows): `improv.recalc`, the worker's initial build | 1 |
+| `reference` | `reference.rs`: no Improv code; the yardstick | — |
+
+`run` times a reference run just before each probe run, and divides the
+probe's time by it: a slower runner, or a few seconds of a noisy neighbour,
+slows both. A probe's ratio is the median of its 3 runs'. `check` compares
+it with the baseline's. It fails a probe when the ratio is more than 25%
+higher **and** the probe is more than its `floor_ms` slower than the
+baseline predicts for this runner. `floor_ms` is the spread of the baseline
+runs' ratios, in ms, at least 1 ms and 5% of the time, so sub-millisecond
+edits cannot fail on jitter alone. A probe in the baseline that did not run
+fails too. `scale-gate.py selftest` checks these rules on made-up runs.
+
+The reference measures CPU, cache and allocator speed. It does not see disk
+speed, so the import and pg_improv probes, which also write files, are only
+partly normalized, and ratios shift a little between CPU models. The
+baseline comes from three runs on GitHub's `ubuntu-latest` runners (the
+first runs, 2026-10-22). One made on the EC2 box (c7i, Sapphire Rapids)
+put pagerank's edit and the CSV import 1.3-1.6x off on those runners even
+after normalizing, so the gate failed on its first run. Rebuild it the
+same way when the runner image changes: dispatch the workflow a few
+times, download each run's `scale-gate` artifact, and run
+`scale-gate.py baseline a.json b.json ...`.
+
+The sub-millisecond probes (`wide.sum.edit_*`) are covered only by the
+1 ms absolute floor: a 40% slowdown of a 0.2 ms edit passes. They catch
+the edit losing its incrementality (milliseconds, not microseconds), not
+small regressions.

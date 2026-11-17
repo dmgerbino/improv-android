@@ -1,0 +1,33 @@
+//! `improv-cosmic`: Improv's COSMIC desktop GUI, on libcosmic and iced.
+//! See `docs/src/cosmic-gui.md`.
+
+mod app;
+mod args;
+mod chart;
+mod clip;
+mod entry;
+mod formulas;
+mod nav;
+mod pivot;
+mod print;
+mod service;
+mod sheet;
+mod shot;
+#[cfg(windows)]
+mod win;
+// Used on Windows; pure, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod winfmt;
+
+use clap::Parser;
+
+fn main() -> cosmic::iced::Result {
+    let cli = args::Cli::parse();
+    let settings = cosmic::app::Settings::default().size(cosmic::iced::Size::new(1200.0, 800.0));
+    cosmic::app::run::<app::App>(
+        settings,
+        app::Flags {
+            target: cli.model.unwrap_or_default(),
+        },
+    )
+}

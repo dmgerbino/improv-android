@@ -1,0 +1,740 @@
+# Improv — Agent Steering (live phase tracker)
+
+This is the **live status tracker**: what is DONE / NEXT right now. The
+*detailed design* lives in `.agent/steering/` (start with
+`STEERING_SYSTEM_OVERVIEW.md`); the *source design of record* is `IMPROV.txt`;
+contributor workflow and the CI quality gate are in the top-level `/AGENTS.md`.
+When a phase lands, update this file.
+
+## Access policies (Cedar), 0.13 (status 2026-11-02)
+
+Design: `docs/reviews/2026-11-02-cedar-policies.md` (approved by the lead;
+the five open questions are with the maintainer, with defaults: `require`
+= verify-full, Admin may grant Admin and the owner is never locked out,
+the lint is enough for 1.0, only the server enforces file policies,
+stages 1-4 in 0.13).
+
+- **Stage 1 DONE** (`work/sec`): `crates/policy` (`improv_policy`), the
+  `:policy/*` Mentat attributes, `improv policy …`, `docs/src/policies.md`.
+- **Stage 2 DONE** (`work/sec-stage2`): `improv_service::cedar::CedarPolicy`
+  behind web's `Policy` seam; improv-server enforces on every route (GUI
+  and older ones), `GET /v1/capabilities`, `/v1/model` refused under
+  policies; the policy version is read per request (part of every
+  session key); the principal is `Caller::principal()` (token name).
+- **Stage 3 DONE** (`work/sec3`): pg_improv 0.13.0 stores and enforces
+  policies (`src/policy.rs`): `improv.policy`/`policy_audit`,
+  `set_policies`, `policies`, `explain_access`, the filtered
+  `categories`/`items`/`measures`/`cells`, `set_cells`, RLS
+  (`improv_access` -> `improv.cell_visible`) on result tables, the
+  catalog's reads behind `improv.unrestricted`, `define`/`drop_measure`
+  through `DefineMeasure`; the owner side bypasses Cedar.
+  storage_pg/store `load_policies`/`save_policies`/`policy_version` call
+  them. `tests/policies.sh` in `ci/pg_improv.sh`. Measured numbers are in
+  the design note's Performance section.
+- **Stage 4 DONE** (released in 0.14.0, `7e13c5e`..`569a933`): `improv_storage_pg::tls`, the
+  one Postgres transport (storage_pg and storage_sql): rustls/ring,
+  `tokio-postgres-rustls`, `rustls-platform-verifier`; sslmode disable/
+  prefer/require/verify-ca/verify-full and sslrootcert parsed by Improv;
+  `require` = verify-full; `prefer` off the host never cleartext; SCRAM
+  channel binding. improv-server `--tls-cert`/`--tls-key`; tokens off
+  loopback without TLS need `IMPROV_ALLOW_PLAIN=1` (the image does not set
+  it). Live TLS tests on `IMPROV_TEST_PG_TLS` (CI coverage job: PG 17 with
+  ssl=on). As built: the design note's "Stage 4 as built".
+- **Stage 7 DONE** (on main, `b6380a1`..`facba7b`, for 0.15): DuckDB-hosted
+  models. `crates/storage_duckdb` (`duckdb:FILE?model=NAME`, the bundled
+  duckdb, an `improv.*` catalog, diff saves, `improv.model_version` as
+  conflict token and high-water, one instance per file per process, a
+  second process refused by name); `improv_store` feature `duckdb` (on in
+  the CLI and server only); improv-server holds the file as its one writer
+  (`hold_duckdb`), Cedar and `/v1/changes` as for other stores. As built:
+  the design note's "Stage 7 as built". No primary key on `improv.cell` (a 1M-cell rewrite
+  was 30x slower with one): a one-cell save scans the model's cells, 14 ms
+  at 1M. The desktop GUI and TUI reach one through the server
+  (`https://…`, stage 5); not yet: the COSMIC GUI, one model per server.
+- **Stages 5 and 6 (`work/live`, for 0.14/0.15), as built** (the design
+  note's "Stages 5 and 6 as built"): `improv_client::remote` (feature
+  `remote`: ureq on rustls/ring, OS roots or `?sslrootcert=`, `http://`
+  loopback only, no redirects) is the native model service over `/v1`;
+  `improv-gui https://…` runs the web GUI's worksheet app natively
+  (`crates/gui/src/served.rs`, shared with gui_web by `#[path]`), greyed
+  by `/v1/capabilities`; `improv-tui https://…` has its own served grid.
+  Both follow `/v1/changes`; the GUI is labeled `server view` (the web
+  GUI's commands, road-to-1.0 I4 for the rest). pg_improv 0.15.0 NOTIFYs
+  `improv_<model id>, '<tx>.<data_gen>'` at commit (`improv.stale.data_gen`
+  moves with inputs applied or results written); storage_pg's `Listener` /
+  `Store::listen`: the GUI and TUI listen for Postgres in place of H9
+  polling, and take others' input cells live when nothing is unsaved.
+- **Also on main for 0.15:** Mentat 1.20.0 with rusqlite 0.41 (bundled
+  SQLite 3.54.1, RUSTSEC-2026-0459; `fresh_for_write` gone,
+  `docs/reviews/2026-11-09-mentat-1.20-upgrade.md`); the libcosmic release
+  patch (`crates/gui_cosmic/release/`: our own MIT OR Apache-2.0
+  `localize.rs` replaces libcosmic's GPL one in release builds,
+  pop-os/libcosmic#1500; the licence scan of vendored crates in CI, LGPL
+  allowed unmodified, `license-allow.txt`); the web GUI movie
+  (`docs/demo/web-movie.sh`); CI fixes (stale DuckDB sources, macOS's
+  untrusted-CA error, Quit/Hide in the browser, flaky e2e picks).
+- **NEXT:** the improv-cosmic redesign
+  (`docs/reviews/2026-11-09-cosmic-gui-design.md`, waiting on the
+  maintainer's answers to its section (j)); the COSMIC GUI's remote
+  service (I4). Before any release: re-record the COSMIC movie
+  (CONTRIBUTING.md, Releasing step 2).
+- **Rule for every front end:** a client under a read policy never
+  computes derived values itself; it reads them, and what-ifs, from the
+  authority. Hidden is absent. Versions are opaque. (`improv_client`'s
+  model service; the note's contract section.)
+
+## Active priority — the road to 1.0.0 (status 2026-11-06, v0.13.0)
+
+The 1.0.0 plan is `docs/reviews/2026-10-21-road-to-1.0.md`; its "1.0.0 exit
+criteria" are the bar. Mark tasks done there as they land.
+
+- **Released 2026-11-08:** tag `v0.14.0` = `de14c77`: Cedar stage 4 (TLS to
+  Postgres with verified certificates and sslmode; improv-server HTTPS, and
+  no tokens over plain HTTP off loopback without `IMPROV_ALLOW_PLAIN=1`),
+  the owner-check REVOKE fix, the COSMIC movie. pg_improv 0.14.0's update
+  from 0.13.0 changes only its version. 43 assets (cosign `verify-blob`
+  OK), PGXN 0.14.0, ghcr `improv:0.14.0`; registry PR
+  duckdb/community-extensions#3568 opened by hand (`COMMUNITY_EXT_PAT`
+  unset; #3551 merged). No announcement (`PGORG_*` unset). Stages 5-7, web
+  accessibility and the COSMIC Windows blockers are in progress for 0.15.
+- **Released 2026-11-06:** tag `v0.13.0` = `6aa70f7` (re-pointed from
+  `b5f3526` before anything published: the first run's attest step looked
+  for pg_improv's SBOM under its pre-pgrx-0.19 name; fixed in 84974bf, and
+  a dispatch now runs the attest step unsigned, 6aa70f7). Cedar access
+  policies (server and pg_improv 0.13.0), the web GUI, improv-cosmic
+  (preview), NeXTSTEP fidelity rounds 1-2, every dependency at its newest
+  release (Mentat 1.19.1, DD 0.26/timely 0.32, pgrx 0.19.3, DuckDB 2.0).
+  43 assets (cosign `verify-blob` OK), PGXN 0.13.0, ghcr `improv:0.13.0`;
+  registry PR duckdb/community-extensions#3551 (opened by hand from the
+  fork branch `improv-v0.12.0`: `COMMUNITY_EXT_PAT` unset; #3416 merged).
+  Not in it: Cedar stage 4 (TLS), moved to 0.14. Known regression: root
+  edits on ~2,000-measure graphs up to 1.34x (timely 0.32 progress
+  tracking; the scale gate fails `measures.chain.root_edit`).
+- **Released 2026-10-29:** tag `v0.12.2` = `b7fc53b`: an idle sync worker
+  keeps its model listing; pg_improv's update from 0.12.1 changes only its
+  version. 43 assets (cosign OK, every Linux file at glibc 2.28), PGXN
+  0.12.2, ghcr `improv:0.12.2`; registry PR duckdb/community-extensions#3416
+  now bumps to 0.12.2 (still opened by hand: `COMMUNITY_EXT_PAT` unset).
+- **Released 2026-10-27:** tag `v0.12.1` = `9378cb8`: the Linux
+  artifacts built on EL8 (glibc 2.28), install-tested on eight
+  distributions; no code change, pg_improv's update from 0.12.0 changes
+  only its version. 43 assets (cosign OK), PGXN 0.12.1, ghcr
+  `improv:0.12.1`; registry PR duckdb/community-extensions#3416 now bumps
+  to 0.12.1.
+- **Released 2026-10-27:** tag `v0.12.0` = `a2a3eda`. GitHub Release with
+  43 assets (cosign `verify-blob` OK); the first `.deb`/`.rpm` (improv and
+  pg_improv per PG major, install-tested in Debian and Fedora), the
+  Homebrew formula `improv.rb`, and `ghcr.io/gburd/improv:0.12.0` (public);
+  PGXN 0.12.0; DuckDB registry bump duckdb/community-extensions#3416, opened
+  by hand (`COMMUNITY_EXT_PAT` unset; #3380, 0.11.0, merged 2026-10-26).
+  The postgresql.org news draft is in the run's Announce log (`PGORG_*`
+  unset). The first tag run's Windows qualify failed the GUI kill -9 test
+  (no kill landed mid-save in nine rounds); the job's rerun passed.
+- **v0.12.0 contents:** H1-22 number formats (model, both stores, GUI,
+  TUI, CLI; pg_improv 0.12.0 with `pg_improv--0.11.0--0.12.0.sql`), B5
+  (RANK/SORTBY order-statistics operator: a tail edit at 1M 0.82 s →
+  1.5 ms), B1 (the sync worker applies models in parallel: a light model
+  beside four 1 s applies 7.9 s → 57–71 ms), H3 done (no UI-thread wait
+  during a recalc, a save or the initial load), the DD review's items 1,
+  2 (B6), 3, 4 step 1, 6, C3/C3b, J2, J5, and every H1 finding (fixed, or
+  H1-33 declined). Found on the way: the worker's standby snapshot never
+  logged on PG 15 (re-decoded up to 15 s of WAL per poll, since 0.8);
+  `SORT`/`SORTBY` could panic on a NaN key; the `.deb`/`.rpm` declared no
+  glibc floor (the binaries need 2.39, pg_improv 2.35). J3:
+  `docs/reviews/2026-10-27-v0.12.0-qualification.md` (all gates green,
+  nothing past 10% unexplained).
+- **v0.11.0 (2026-10-25, `19211d7`):** see its CHANGELOG section and
+  `docs/reviews/2026-10-25-v0.11.0-qualification.md`.
+- **J4 soak: skipped for now** (maintainer's call, 2026-10-27). The first
+  run (from 2026-10-25 19:59 UTC) passed 37 hourly checks with no drift
+  through 224 disruptions (52 failovers, 68 redefinitions, 59 server and
+  45 worker restarts), then stopped at 36.5 h when J3's `cargo pgrx
+  install` overwrote the system PG 18's `pg_improv.so` under its running
+  clusters (a harness collision, not a pg_improv fault). A second run on
+  0.12.0 was stopped by hand after 20 minutes.
+- **0.11's ~5% RANK edit slowdown: code layout, and gone in 0.12.**
+  Bisected on the box (the wide RANK probe at 100k items, interleaved with
+  the base): edit new-max rose in 1–2% steps at commits that do not touch
+  RANK's path, the first at `ebf3db8` (it adds `Engine::estimated_bytes`,
+  which the probe never calls); compiling that function out restores the
+  base time. Evaluate and tail edits did not move. B5 then replaced RANK's
+  path: the scale gate reads `wide.rank.edit_max` 0.26× and `edit_tail`
+  0.00× its baseline.
+- **I2, the web GUI, in progress** (`work/web`): the `/v1` API a GUI
+  drives and `GET /v1/changes` are on main (`improv_client`,
+  `improv_service`, `crates/server/src/gui.rs`); the browser build is
+  `crates/gui_web` (egui on wasm32, the desktop's theme/nxwin/menu by
+  `#[path]`), checked by `crates/gui_web/e2e/e2e.sh` in headless
+  Chromium. Its guide is `docs/src/web-gui.md`; what is left is in the
+  plan's I2 row. Screen-reader and keyboard access (0.15): egui's
+  AccessKit tree mirrored as hidden ARIA DOM in the canvas
+  (`crates/gui_web/src/{a11y,bridge}.rs`), the grid an ARIA grid with a
+  keyboard cursor; design in `docs/reviews/2026-11-08-web-accessibility.md`.
+- **NEXT:** J6 at 1.0 (needs the `COMMUNITY_EXT_PAT` and `PGORG_*`
+  secrets); 1.0.0-rc.1 once the exit criteria hold (J4's soak is skipped
+  for now, the maintainer's call). Not now: a Homebrew tap
+  (the release still attaches `improv.rb`). B8 is done (390 B/edge, warm
+  re-solve 3.5× faster); the plan's row has the numbers.
+
+- **COSMIC GUI (branch `work/cosmic`, 2026-11-02):** `crates/gui_cosmic`
+  (`improv-cosmic`), a second desktop GUI on libcosmic, its own workspace
+  pinned by its `Cargo.lock`. Parity stages 1–10 landed (grid at 10^6
+  cells, entry, formulas with located errors via `improv_client`, tile
+  pivoting, views, charts, TSV+HTML copy/paste, portal open/save/print,
+  undo); guide `docs/src/cosmic-gui.md`, `improv-cosmic(1)`, CI jobs
+  `gui-cosmic` and `cosmic-shot`. Runs on Linux, FreeBSD (Xvfb) and Solnix
+  (its COSMIC session); Windows builds and tests (window unseen: nobody
+  logged on at santorini). Windows release blockers (rich copy, DnD) are
+  worked around in `crates/gui_cosmic/src/win.rs` (0.15, tested
+  in-process on santorini); they close when a person runs the desktop
+  checklist in `docs/reviews/patches/window_clipboard-windows-formats.md`.
+  `tests/windows_gaps.rs` re-checks the pins at each move.
+  Left: the review note's "Parity reached" and the guide's "Not yet".
+
+- **Done since the last status:** H7/H8 (TUI and GUI build models from
+  scratch, define measures and LAMBDAs, undo), H6 (GUI crash safety; two
+  storage_mentat save bugs fixed), H3 partly (frames 125 → 7 ms at 1M
+  cells; the 11 s Mentat autosave fixed by B12), B12 (incremental saves:
+  one cell 4–8 ms at 1M on Mentat, 2–11 ms on Postgres; `improv set` is
+  now all load), H9 (the server sees other
+  writers), F8–F10 (tutorials run in CI, generated SQL/CLI/HTTP references,
+  docs review), D14 (fast shutdown), B9 (per-model memory in status, plus
+  `improv.max_model_memory`), B10 (DuckDB `improv()` 11 s → 4.6 s), and
+  cargo-deny advisories (ctutils, clipboard-win, tokio).
+- **On branch `wip/eng` (Codeberg), not merged:**
+  - `perf(engine): 63% less memory per cell` (B7: 732 → 269 B per cell at
+    5M; heap profile and out-of-core decision included). Gated.
+  - `fix(engine): R.QTUKEY inverts in a dozen integrals` (gated, except
+    coverage).
+  - `wip(engine): B8 in progress` (713 B/edge at 10M, short of 500). Not
+    gated.
+  - Rebase onto main and gate before merging. B8's last step needs a
+    decision: exact summation (correctly rounded) in place of Neumaier
+    would make flat and blocked SUM agree. That would let `Out` go flat
+    and also solve B4(b).
+- **Deferred with a design note:** B1 (parallel apply).
+- **C3:** the checklist document isn't written. The third run's findings
+  before the box went away:
+  - **SQL construction is clean:** every `format!` quotes identifiers or
+    binds `$n`.
+  - **CSV export already guards** `= + - @`.
+  - **Audit lines are `json!`-escaped.**
+  - **The server sends no CORS headers.**
+  - **The token-file check only warns** on a group- or world-readable file.
+  - **One defect:** a long operator chain (about 63 `+` terms) is accepted
+    and saved, then makes the model unopenable (serde_json's recursion
+    limit), and deep nesting overflows a debug stack. Being fixed on
+    `fix/formula-depth`.
+  - **Still to do:** pgspot, the privileges table, the `unsafe` list, and
+    the document itself.
+- **A1 DONE:** `mentatdb` 1.18.0 (`4008f5c`). A 1M-row `import-csv` takes
+  about 105 s; on 1.16.0 it didn't finish in 15 minutes. See
+  `docs/reviews/2026-10-23-mentat-1.18-upgrade.md`. **0.11.0 is unblocked.**
+
+## GUI: NeXTSTEP fidelity pass (2026-11-02, work/next)
+
+Gap list and sources: `docs/reviews/2026-11-02-nextstep-fidelity.md` (target
+Improv 1.0 on NeXTSTEP 2.x; there was no Improv 2.x for NeXT). Done on
+work/next: color graphs in a NeXT graph window (gap 1), Improv 1.0's menus and
+key equivalents (2), NeXTSTEP 2 title and resize bars (3), key/main/other
+title bars, broken close box, miniaturize button (4, 5), the menu frame (6),
+scroller clicks (7), Edit ▸ Copy, Paste, Select All (8), formula status
+indicators (10). Round 2 (work/next2): the Inspector and Format panels (9),
+Print, Page Layout and Report Layout to PDF, PostScript, `lp`/`lpr` and the
+Windows print dialog (11), Edit ▸ Cut and File ▸ Close (8), context help
+(12), structured selection (13); and `ci/solnix-gui.sh` builds improv-gui on
+illumos with `docs/reviews/patches/glutin-illumos.patch` (to send upstream).
+Left: gaps 14–16 are "not planned"; the remainders are listed in each gap's
+row (saving the worksheet options and print layouts with the view, Line
+Style and Color pages, page breaks, per-command help pages).
+
+## Active priority — post-v0.7.0 hardening (2026-10-04)
+
+DONE on `main` (unreleased; see CHANGELOG "Unreleased"):
+
+- **GUI UX batches A–E** (`docs/reviews/2026-10-03-gui-ux-review-plan.md`,
+  spec `docs/reviews/2026-10-03-nextstep-visual-spec.md`): NeXTSTEP palette,
+  Arimo, application menu, worksheet/browser/Info windows, in-window formula
+  pane, NeXT gutters, ruled grid with range selection, scroller bevel +
+  grouped arrows, CLI `save-view`, screenshot golden in CI.
+- **TUI**: 6 bugs fixed (invisible edit prompt, filtered-axis write, text/bool
+  edits, no scrolling, mouse column offset, paging past empty dims); formula
+  status line and Shift+arrow range Sum.
+- **Security + scalability review** (`docs/reviews/2026-10-04-security-scalability.md`):
+  all findings S1–S20 and P1–P4 fixed (P5 deferred, P6 baseline). Highlights:
+  scheduler off by default with an allowlist; host-decided, fail-closed
+  bubblewrap sandbox (no `$HOME`, no network, cleared env, bounded output,
+  process-group kill, wasm fuel/memory caps); nl_formula depth limit (remote
+  stack-overflow crash); slow-loris/body/concurrency limits; read-only SQL
+  refresh; CSV formula-injection neutralization; storage N+1 load (280 s → 0.6 s
+  at 100k cells); copy-on-write engine snapshots (100k-cell edit 5.6 ms → 71 µs).
+  Also: cross-process save conflict detection, measure category order
+  preserved, `init` no longer wipes a store, sandbox works on NixOS.
+- **Coverage gate**: every crate ≥ 90% functions and ≥ 90% branches (workspace
+  ≈ 96% / 95%), `scripts/coverage.sh` + CI `coverage` job. Run guide:
+  `docs/src/running.md`.
+
+**pg_improv: DONE (L0–L5)** — Improv models over Postgres data
+(`crates/pg_improv` pgrx extension + `crates/pg_model` core +
+`crates/storage_pg`/`crates/store` client). Logical-decoding sync (default),
+trigger sync, explicit `improv.recalc`, `what_if`, `status`; GUI/TUI/CLI open
+`postgres://…?model=`. Design: `docs/reviews/2026-10-14-pg-improv-design.md`;
+user guide `docs/src/postgres.md`; e2e `crates/pg_improv/tests/{logical,user-story}.sh`;
+benchmark `docs/reviews/bench/bench-pg-modes.sh`. Logical mode applies changes
+incrementally with a live engine per model (G1 DONE: 100k-cell freshness
+1161 -> 52 ms). Phase 2 (design §9) DONE: `LANGUAGE improv` (SQL functions
+in the formula language, 0.14 µs/call); G2 diff-based saves carried through
+GUI/TUI via `store::SaveToken`; G3 one minter (`improv.mint_items`); G4
+`binding.agg`; G5 boolean/text/date measures and typed result tables; G6 the
+new CI jobs run green in their real container; typed `session::Edit` values,
+so the live worker applies boolean/text/date models cell by cell; `what_if`
+takes and returns typed `jsonb` values. **NEXT for pg_improv:** engine output
+deltas to drop the per-measure diff scan at 1M cells.
+
+**DuckDB extension `improv`: DONE, qualified, registration PR open** — `crates/duckdb_improv` (duckdb-rs C-API
+shell, its own workspace, mentat's layout: extension-ci-tools submodule +
+root `Makefile` for the registry) over `crates/duckdb_model` (pure core,
+reuses `pg_model`). SQL: `improv_calc`/`improv_calc_text`,
+`improv_functions([query :=])`, `improv(source, model)`. **Stable C API**
+(v1.5.6 floor), unlike mentat: the registry builds on DuckDB 2.0 since
+community-extensions #3079 (v2.0.0 final, d54cbbe3, since 2026-10-20), and
+one binary is tested in v1.5.6 and v2.0.0 (`ci/duckdb_improv.sh`,
+`.github/workflows/duckdb.yml`).
+Reasoning: `crates/duckdb_improv/README.md` "Pins". Guide
+`docs/src/duckdb.md`. Qualified at 874a031 on all five registry platforms
+(GitHub run 39177542841, plus the v1.5.6 + v2.0 load check); first
+registration PR duckdb/community-extensions#3139 (from
+gburd/community-extensions branch improv-0.9.0, `repo.ref` 874a031).
+**NEXT:** their review and merge; set `COMMUNITY_EXT_PAT` on gburd/improv
+so release tags open the version-bump PRs.
+
+GUI: E2 DONE (horizontal NeXT scroller inline with the row tiles, arrows
+grouped left; wide grids scroll sideways); typed edits reach the live engine;
+File ▸ Revert to Saved / TUI `R` after a save conflict. CI's pg_improv,
+coverage and gui-shot jobs pass in `rust:1.97-trixie` (run with podman on
+kiwi). Then: P5 per-frame caches if profiling warrants; cut v0.8.0.
+
+Built-in functions (`docs/reviews/2026-10-16-builtin-functions-plan.md`):
+P1–P6 DONE, 418 functions from one registry (`core_model::functions`) that
+drives parser, typing, engine, GUI printer, CNL and `docs/src/functions.md`;
+typed errors, `^ & %`, German entry, dates, positions/recurrences, lookups,
+list results via `INTO` (also `INTO R, C`), `LET`/`LAMBDA`/`MAP`/`SCAN`/
+`REDUCE`/`MAKEARRAY`/`BYROW`/`BYCOL`, named LAMBDAs (`Model::lambdas`,
+expanded at compile time; non-recursive: the language stays total),
+multi-x `LINEST`, multi-key `SORTBY`. P7 DONE (674 functions, 4,103 golden
+rows); the customer requests (2026-10-18) added COALESCE, FILL, RELABEL,
+SWAP, RANK.DENSE, COUNTUNIQUE and FIXPOINT (681). pg_improv `commit` sync
+mode DONE. Customer requests (2026-10-18) DONE, answered in
+`docs/reviews/2026-10-19-customer-requests-response.md`: redefine/drop
+measures, dimensionless results, named LAMBDAs with category parameters
+(`improv.lambda`), `count_distinct`, incremental aggregated bindings and new
+items in logical mode (status counts applies/rebuilds; `tests/scale.sh`),
+scoped trigger loads. FIXPOINT steps run host-side
+(`engine/src/hosteval.rs`, DD fallback): 0.43 s at 1.5k/100k, 6.6 s at
+10k/1M. **Open:** FILL rebuilds on a new item; commit mode still
+recomputes in full. Mentat is `mentatdb` 1.20.0 from
+crates.io (`docs/reviews/2026-11-09-mentat-1.20-upgrade.md`).
+
+## Released: v0.7.0 (2026-09-24)
+
+The reference-backed GUI reconstruction (all five plan steps) plus the
+portability fix shipped as **v0.7.0**. Qualification for that release:
+350 workspace tests, the ignored/stress suite (including 1M-cell evaluate and
+the chunked save spanning many transacts), clippy/fmt/deny/typos clean,
+`cargo doc` warning-free, mdBook + linkcheck, all four binaries smoke-tested,
+and the canonical oracle reverified end-to-end through the CLI
+(Revenue 1000/1000/1200/1600; `SUM(Revenue OVER Time)` 2200/2600).
+
+Two things this release changed structurally:
+
+- **Improv is buildable by anyone.** Mentat moved from a sibling path
+  dependency to a pinned git rev; a fresh clone previously could not even parse
+  its manifest, and CI masked that by cloning Mentat beside the checkout.
+  Verified by building and testing a bare clone with no sibling present.
+- **The EDN string-corruption bug is fixed at the source** (mentat
+  `1af15e15` on `improv-base`, pinned here), not just worked around in
+  `storage_mentat`.
+
+## Earlier active priority — post-v0.6.0 qualification (2026-09-22)
+
+Earlier DONE labels are implementation milestones, not release-readiness or
+Lotus Improv parity certification. The source audit found correctness gaps
+behind passing helper tests. See
+`docs/reviews/2026-09-22-status-and-gui-direction.md` for findings and an EC2
+baseline on hotdog; its temporary instance was terminated after collection.
+
+- **NEXT: GUI correctness** — reproduced Unicode highlighter panic; empty
+  filtered axes; displayed-formula round-trip; focus; typed edits; preserving
+  the working model/engine on failed formula edits and saves.
+
+  **First repair batch landed 2026-09-22** (`6a4b862`, `8241d81`, `5d80eba`,
+  `b81abc3`, `3b8f725`), each with a regression verified to fail pre-fix:
+  - Unicode highlighter panic and the empty-axis divide-by-zero fixed; an axis
+    filtered to empty now renders zero lines and refuses under-specified
+    coordinates, with the genuinely-scalar case preserved.
+  - Formula bar now round-trips: a DSL printer was added (none existed) with a
+    CNL fallback for ASTs the v1 DSL provably cannot spell, and commit accepts
+    either language.
+  - `save()` returns `Result` and is `#[must_use]`; `commit_formula` publishes
+    through a validated clone, so a bad formula or failed write can no longer
+    leave a saved-but-broken model reported as success.
+  - CSV import no longer aliases item ids across repeated imports, and
+    validates before mutating (a failed import leaves the model untouched).
+  - `load_partial` now binds the closure in the query (`ground`), so returned
+    rows and per-row work are closure-bounded. **Residual, not yet fixed:**
+    SQLite still index-scans the cell attribute slice inside the query, so
+    latency is not fully bounded; that needs an AVET-indexed `:cell/measure`
+    in Mentat.
+  - **`save_model` could not save any model over ~5461 cells at all** (a hard
+    Mentat assert). Transacts are now chunked at 2000 datoms inside the single
+    existing transaction. This had invalidated the advertised multi-million-cell
+    scale for every save path; the 5M stress tests missed it because they only
+    call `evaluate()`. **Scale claims must be re-derived end-to-end (save +
+    reload), not from `evaluate()` alone.**
+
+  **Second batch landed 2026-09-22** after an independent review found 7 real
+  defects in the first, including the original bug RELOCATED into the new DSL
+  printer and a `.max(1)` fix applied to the grid but left in `chart.rs`:
+  `ec51384` (formula bar shows only text that re-commits; chart agrees with the
+  grid on empty axes), `25ba0b6` (refuse an un-chunkable wide measure instead of
+  aborting the process), `148c1cd` (a stale non-dimension category no longer
+  blanks an addressable grid; cell edits roll back on save failure). A
+  re-reviewer verified round two. Every fix has a regression confirmed to fail
+  on revert.
+
+  Process note: the worker->reviewer->re-reviewer pattern paid for itself here.
+  The first round's formula test was 12 hand-picked shapes that all happened to
+  round-trip, which is exactly why it missed two defects; the second round
+  enumerates the argument space instead.
+
+  **Third batch landed 2026-09-22** — the remaining audit items, each verified
+  by mutation rather than only by a passing test:
+  - `790127e` typed cell display/editing: Text/Boolean/Date inputs rendered
+    BLANK and could be overwritten as numbers. Parsing now switches on the
+    measure's DECLARED type, so '42' into a Text measure stores Text; an empty
+    commit clears the cell. One of the agent's own new tests was found
+    decorative under mutation and rewritten.
+  - `db8cfa4` derived CSV export evaluated instead of reading empty input
+    storage (a derived measure used to export a header and zero rows).
+  - `74e7f38` focus-aware shortcuts (typing in any text field no longer pivots
+    the grid) and model undo/redo (bounded snapshot stacks reusing publish()'s
+    consistency guarantee; all four mutation paths wired).
+
+  **GUI reconstruction executed 2026-09-22/23 — all five plan steps landed**
+  (`a48ecdd` gutters, `dba846d` formula list + quoted printing, `f8eb0bc`
+  schema, `91bf2bc` grammar, `a2a5f94` canvas + chrome). Multi-measure display
+  is delivered as Step 3's canvas of matrices. Execution record, deferred items
+  and the fidelity caveat are in
+  `docs/reviews/2026-09-22-gui-reconstruction-plan.md`. One data-loss bug was
+  found on the way and fixed (`596082c`): strings containing newlines or tabs
+  were silently corrupted on save. Pre-existing and unfixed: stale
+  `:measure/categories` refs are never retracted, so changing a measure's
+  category set accumulates the union across saves.
+- **NEXT: data integrity/security review** — repeated CSV item IDs/import
+  rollback, computed exports, concurrent scheduler writes, private-file
+  isolation and termination of timed-out WASM execution.
+- **GUI reconstruction: design pending approval.** NeXTSTEP Lotus Improv is
+  the explicit target. Establish historical references, then a worksheet-first
+  design with real grid-edge category handles, multi-measure presentation,
+  formula area, menus/inspectors, undo and clipboard. See GUI steering's
+  current-direction section for acceptance gates. NeXTSTEP spec step 2 landed:
+  the application menu (C1) replaces the tool palette and tab strip (B4 in
+  part), per `docs/reviews/2026-10-03-nextstep-visual-spec.md` §7. Step 3, first
+  half: each matrix is a NeXT worksheet window (`nxwin`) on a `#555555`
+  workspace. Step 3, second half: the explorer and inspector became the model
+  browser and Info panel windows, so the workspace is full width (B1, B4
+  done). Step 4 (formula pane, B5/B6) landed: the formula list lives in each
+  worksheet window, the selected row edits in place, and `Name = formula` on
+  its last line adds a measure; the top formula bar is gone. Step 6 (grid,
+  C2/C3/C5) landed: plain ruled cells, `#AAAAAA` selection and header
+  highlight, double-click to edit, input underline, and range selection with
+  Sum over the range.
+- **Scale remains unfinished:** partial loads still enumerate all coordinate
+  rows before filtering; GUI charts and columns materialize products. No
+  billion-cell usability claim follows from row virtualization.
+- **Validation:** deterministic frame/event regressions and reproducible EC2
+  baselines; measure before claiming improvement. Keep engine and storage
+  correctness ahead of additional backend/runtime breadth.
+
+## Mission
+
+A cross-platform, standalone multidimensional spreadsheet inspired by Lotus
+Improv / Quantrix, in Rust, with incremental recalculation and separation of
+structure, logic, and data. First iteration: TUI (VisiCalc-like) + CLI + server;
+GUI later.
+
+## Mandated substrate (from IMPROV.txt)
+
+- **Computation engine: differential dataflow.** `differential-dataflow` +
+  `timely` (TimelyDataflow crates). This is a hard requirement in the design
+  (52 references; "uses differential dataflow at its core" is in the v1
+  definition of done). Pinned in the workspace `Cargo.toml`.
+- **Storage: the embedded SQLite Mentat fork** (`mentatdb` on crates.io; Datomic-style
+  datom store). NOT Postgres. Model persists as categories/items/measures/cells
+  as datoms (see IMPROV.txt "Mentat schema (steering version)").
+- Formula language: dimension-aware DSL + (later) controlled-English
+  bidirectional translation.
+
+## Constraints & Contracts (the load-bearing risks)
+
+1. **DD key-type viability (GATE for Phase 1).** `Coordinate` is a `BTreeMap`
+   (dynamic arity) and `Value` carries `f64` (not `Ord`/`Eq`). Differential
+   dataflow keys must be fixed, `Ord`+`Hash`, and diffs need well-behaved
+   arithmetic. Before building the engine on DD, a spike MUST prove a workable
+   encoding (e.g. per-measure fixed-arity key tuples, or a canonical serialized
+   `Coordinate` key; values as a separate non-diffed payload). If DD can't be
+   made to fit cleanly, fall back to a hand-rolled incremental dependency-graph
+   evaluator behind the same engine API. Do not write the whole engine before
+   this spike passes.
+   - **STATUS: GATE CLEARED.** `crates/engine` spike `dd_revenue_is_incremental`
+     computes `Revenue = Price * Quantity` incrementally and passes, incl. a
+     delta round proving unaffected cells don't recompute. Viable encoding:
+     **DD key = serialized coordinate `Vec<(u32,u32)>`** (sorted, `Ord+Hash`,
+     exchange-safe), **numeric value = `f64::to_bits()` as `u64`** in data
+     position, diff = `isize` multiplicity, `reduce` collapses to one value/key.
+   - **Version pin (delicate, do not bump blindly):** `differential-dataflow =
+     "=0.26.0"`, `timely = "=0.32.0"` (was 0.13.0 + 0.13.0 until 2026-11).
+     Every DD minor breaks the API, so a bump is a port of the engine; the
+     rationale and what moved are in `AGENT_ENGINE_STEERING.md` §2.
+2. **Toolchain:** rustc 1.97+ (matches the mentat workspace).
+3. **Determinism:** the core engine must be deterministic and unit/property
+   tested (Time x Product revenue is the canonical fixture with known results).
+4. **NL translation is CNL-only for v1** (controlled grammar), not open English
+   — keeps the "deterministic core" honest.
+
+## Crate layout
+
+- `crates/core_model` — categories, items, measures, coordinates, formulas,
+  value types. GUI/storage-free. **[Phase 0: DONE]**
+- `crates/storage_mentat` — persistence via the embedded Mentat. [Phase 0]
+- `crates/storage_sql` — SQL import/export (SQLite). [Phase 7]
+- `crates/storage_pg` — Postgres-hosted model store (`improv.*` catalog). [pg_improv L3]
+- `crates/store` — `Store::open`: Mentat path or `postgres://` URL. [pg_improv L3]
+- `crates/engine` — formula compiler (AST -> typed -> plan) + DD integration. [Phase 1]
+- `crates/cli` — headless model runner / import-export. [Phase 2]
+- `crates/tui` — VisiCalc-like terminal UI. [Phase 2]
+- `crates/server` — HTTP/RPC API. [Phase 3]
+- `crates/nl_formula` — CNL <-> formula. [Phase 4]
+- `crates/gui` — egui/eframe desktop app (`improv-gui`). [Phase 5]
+- `crates/extfn` — external-language function runtime (Python). [Phase 6]
+- `crates/duckdb_model` — DuckDB-free core of the DuckDB extension.
+- `crates/duckdb_improv` — the DuckDB extension `improv` (own workspace).
+- `crates/gui_cosmic` — the COSMIC desktop GUI `improv-cosmic` (libcosmic on
+  iced; own workspace, `deny.toml` and CI job `gui-cosmic`). Spike and
+  staged plan: `docs/reviews/2026-11-02-cosmic-gui.md`. [preview]
+
+## Phases (build in order)
+
+The authoritative roadmap and Phase 5–7 invariants live in
+`.agent/steering/AGENT_MASTER_STEERING.md` §6–§7. Summary:
+
+- **Phase 0 — Foundations:** core_model + storage_mentat + tests.
+- **Phase 1 — Engine + formula compiler:** typed inference, plan (joins/aggs),
+  differential-dataflow evaluation.
+- **Phase 2 — CLI + TUI.**
+- **Phase 3 — Server.**
+- **Phase 4 — CNL natural-language formulas.**
+- **Phase 5 — Desktop GUI** (toolkit chosen at phase start; no new modeling
+  semantics).
+- **Phase 6 — External-language functions** (`CALL(func, ...)`; Python first,
+  then R/Julia/WASM; pure, typed, dimension-declaring).
+- **Phase 7 — SQL database connectivity** (import/export + `SQL("...")`
+  live-query measures; external SQL is a source/sink, never the system of
+  record).
+
+## Phase status (live)
+
+- **Phase 0 — Foundations: DONE.** `core_model` (4 tests), `storage_mentat`
+  round-trips a model through embedded SQLite Mentat (1 test).
+- **Phase 1 — Engine: DONE (numeric core).**
+  - DD-viability spike: cleared (`engine` `dd_revenue_is_incremental`).
+  - Formula compiler `Formula -> TypedExpr -> PlanNode` (`compiler.rs`): type +
+    dimension inference, Join insertion for broadcast, Aggregate for SUM/AVG/
+    MIN/MAX. Convention: aggregation `Call` takes one measure-ref arg whose
+    `DimensionSpec.over` names collapsed categories; func ids 1=SUM 2=AVG 3=MIN
+    4=MAX.
+  - Dataflow builder + `evaluate(model, targets)` (`dataflow.rs`): compiles each
+    derived measure, builds a DD graph (InputMeasure / MapUnary / MapBinary /
+    Join / Aggregate), feeds numeric input cells, returns computed values.
+    Verified against the canonical Time×Product revenue results
+    (1000/1000/1200/1600).
+  - Multi-layer derived measures: DONE — `evaluate` builds derived measures in
+    topological dependency order (cycles rejected), so a derived measure may
+    reference another derived measure.
+  - **Textual formula parser: DONE.** `core_model::parser::parse_formula` parses
+    the v1 EBNF grammar into a `Formula` (used by the CLI's `add-derived`).
+  - **Scalar functions: DONE.** ABS/ROUND/FLOOR/CEIL/SQRT/NEG/MIN2/MAX2 and
+    numeric comparison/logical ops evaluate through the engine.
+  - **Live incremental edit API: DONE.** `session::Engine` builds the dataflow
+    once on a worker thread; `set`/`clear`/`apply` push input-cell edits as
+    deltas, recomputing only affected coordinates (4 session tests).
+  - **Non-numeric value lane: DONE.** The dataflow carries `CellValue`
+    (`Num`/`Bool`/`Text`/`Err`), so boolean/text derived measures work
+    end-to-end (`Hot = Price > 15` → `Bool`). Consumers (CLI/TUI/server) render
+    via `CellValue`'s `Display`/`as_num`.
+  - **Phase 1 follow-ups (deferred):** `Date` values in the DD lane;
+    standalone/broadcast literals.
+- **Phase 2 — CLI: DONE.** `crates/cli` `improv` binary: init / add-category /
+  add-item / add-measure (with dimensions) / add-derived (textual formula) /
+  set / list / show / eval (engine compute) / export over a Mentat-backed store
+  (4 tests). The full v1 flow works end-to-end from the CLI.
+- **Phase 2 — TUI: DONE (viewer).** `improv_tui` renders a measure as a pivot
+  grid with keyboard navigation and measure cycling (4 tests). Live editing /
+  re-pivot is the next increment.
+- **Phase 3 — Server: DONE.** `improv_server` JSON HTTP API over a model store
+  (10 tests): model/measures/values, NL parse/describe, set-cell. **Bearer-token
+  auth** (Auth::Tokens from `IMPROV_API_TOKEN`/`IMPROV_API_TOKENS`; `/health`
+  public, 401/403 otherwise; open mode when unset).
+- **Phase 4 — CNL: DONE (initial grammar).** `crates/nl_formula` parse/describe
+  with a controlled grammar + round-trip (10 tests).
+- **v1 core (Phases 0–4): DONE.** v1 follow-ups now done too: `Date` values in
+  the DD lane (`CellValue::Date`) and standalone/broadcast literal measures
+  (a bare `X = 5` scalar broadcasts by reference).
+- **Phase 5 (Desktop GUI): DONE.** `crates/gui` `improv-gui` in the NeXTSTEP
+  look-and-feel: explorer, editable pivot grid, on-grid margin category tiles,
+  top formula bar, inspector, charts, saved views, filters, keyboard nav,
+  multi-category-per-axis stacking, and **virtualized rendering** (mixed-radix
+  `nth_tuple` + `body.rows`, so a row axis of millions of lines never
+  materializes). Charts plot the full Cartesian product of stacked axes.
+- **Scenario management (what-if): DONE.** First-class `Scenario` = a named
+  overlay of input-cell overrides (`Model.scenarios`, `with_scenario`);
+  deterministic (the engine sees ordinary inputs). Persisted via Mentat; CLI
+  `scenario` + `eval --scenario`.
+- **Phase 6 (External-language functions): IN PROGRESS.** In-process named
+  scalar functions are callable from formula text — `ABS`/`ROUND`/`FLOOR`/
+  `CEIL`/`SQRT`/`NEG`/`MIN2`/`MAX2` via `core_model::parser::scalar_func`,
+  evaluated deterministically by the engine. The external runtime lives in
+  `crates/extfn` (`improv_extfn`): a `Registry` of typed, purity-asserted
+  `ExternalFn`s (defined in `core_model`) evaluated in an isolated Python
+  subprocess (timeout + JSON marshalling). **Integrated host-side**:
+  `Model.external_calls` marks a measure as `func(arg_measures...)`, and
+  `engine::external::refresh_external_measure` evaluates it per coordinate and
+  writes input cells — external calls stay OFF the differential-dataflow hot
+  path, so the engine core stays pure/deterministic. Persisted via Mentat
+  `:meta/*` blobs. A `CALL(func, args...)` formula-grammar form parses (via
+  `core_model::parser::parse_definition`) to an `ExternalCall`; the CLI exposes
+  `register-ext` / `define` / `refresh-ext` end to end. Runtimes: **Python, R,
+  Julia, WASM (in-process wasmi), and Pure-lang** (per-language runners sharing
+  a spawn/timeout/JSON-envelope helper; wasm has a numeric f64 ABI). REMAINING:
+  an OS-level sandbox (seccomp/namespaces) — currently isolated-mode + timeout.
+- **Phase 7 (SQL connectivity): IN PROGRESS.** `crates/storage_sql` imports a
+  `SELECT` into an input measure (columns → categories/items/cells), exports a
+  measure's cells to a SQL table, and supports **live-query refresh**
+  (`SqlSource` on the model + `refresh_sql_measure`). Works over a
+  backend abstraction (`SqlConn`/`Backend`): **SQLite and PostgreSQL** (pg via
+  `postgres 0.19`). **Connection management**: serde `Connection` descriptors
+  hold a password-less DSN + `password_env`; the secret is read from the
+  environment at connect time and redacted from logs (credentials out of band).
+  CLI `import-sql` / `refresh-sql` / `export-sql`. SQL data enters as ordinary
+  input cells (deterministic core untouched); identifiers validated, values
+  bound (injection-safe). A `SQL("...")` definition-grammar form parses (via
+  `parse_definition`) as a whole-RHS source; column→dimension mapping stays with
+  the `import-sql` CLI command. Refresh-policy metadata (`RefreshPolicy`:
+  manual/on-load/interval) is recordable per SQL *and* external-call measure
+  (`--refresh` flag), `refresh-all` re-runs every external-sourced measure at
+  once, and `serve-refresh` is a daemon that *honors* the policy timing
+  automatically (pure decision in `core_model::schedule`). PLANNED: GUI
+  import/export wizards. **DuckDB** is a first-class backend (bundled build;
+  Backend::Duckdb + ConnKind::Duckdb; deny allows the build-time
+  CDLA-Permissive-2.0 it pulls).
+
+## Definition of done for v1
+
+Define categories/items/measures (input + formula); build a multidimensional
+pivot view; enter data and edit formulas; instant incremental recalculation on
+non-trivial models; save/reopen across Linux/macOS/Windows; deterministic,
+tested engine.
+
+## Post-v0.5.0 plan (re-prioritized toward credibility & usability)
+
+v0.5.0 delivered engine breadth (5 extfn languages, 3 SQL backends, scenarios,
+a scheduler daemon, a NeXTSTEP-styled GUI with stacking/virtualization) faster
+than table-stakes usability. The plan now re-orders toward what makes people
+*trust and adopt* the tool, in phases:
+
+- **Phase A — credibility gaps:**
+  1. **CSV/TSV import/export: DONE (incl. GUI/TUI wiring).**
+     `improv_storage_csv` (`import_csv`/`export_measure_csv`); CLI
+     `import-csv`/`export-csv`; a GUI wizard (toggle-able Import/Export window,
+     dimension-mapping rows, pure builders); a TUI `I`/`E` command prompt
+     reusing the cell-edit buffer machinery (compact CLI-like syntax).
+  2. **Crash-safety: DONE.** `save_model` used to transact the model in up to
+     6 separate SQLite transactions (a crash between them left a partial
+     save); it now opens ONE `InProgress` and commits once, so a save is
+     all-or-nothing. Proven by a regression test that forces a genuine
+     mid-save failure and asserts nothing leaks through. See
+     `.agent/steering/AGENT_DATABASE_CONNECTIVITY.md` §9.
+  3. **Honest GUI L&F labeling: DONE.** README/steering now say
+     "NeXTSTEP-inspired, unverified" rather than implying parity with real
+     Lotus Improv 3.0 / Quantrix Modeler (see §6.5 in
+     `.agent/steering/AGENT_GUI_STEERING.md`).
+- **Phase B — formula editor UX: DONE.** Syntax highlighting (identifiers,
+  functions, numbers, strings, date literals, operators) + inline error
+  position highlighting in the GUI formula bar, via a pure
+  `gui::formula_highlight::scan`/`highlight_formula`.
+- **Phase C — harden what exists:**
+  1. **Formula-parser fuzz target: DONE**
+     (`fuzz/fuzz_targets/fuzz_formula_parser.rs`) — and it found two real bugs,
+     both fixed: a tokenizer panic on multi-byte UTF-8 (byte-cast-to-`char`
+     walking off a UTF-8 boundary), and an unbounded-recursion stack overflow
+     on deeply-nested parens (now bounded by `MAX_PARSE_DEPTH`). This validates
+     the whole point of Phase C.
+  2. **extfn OS-level sandbox: DONE.** `extfn::sandbox::{SandboxPolicy,apply}`:
+     on Linux, wraps subprocess runtimes in `bwrap` (read-only root, no
+     network/IPC/UTS namespace, fresh tmpfs `/tmp`) when available, plus
+     `setrlimit` (CPU/address-space/FDs/procs) always; macOS gets the rlimits;
+     Windows is a documented no-op (timeout only). Fail-open by design
+     (never breaks functionality if bwrap/rlimits are unavailable) — a
+     best-effort boundary, not a hard guarantee (upgrade path: require
+     bwrap/gVisor). `ExternalFn.pure` maps to `Restricted` by default.
+- **Phase D — reach (after A–C):**
+  1. **Import/export "plugin" dedup: DONE.** New tiny `improv_data_source`
+     crate holds the import logic byte-for-byte duplicated between
+     `storage_sql`/`storage_csv` (category/measure setup + name→id item
+     interning); both delegate to it. No trait/dynamic-loading system built
+     — there is exactly one real caller per backend today, so a generic
+     `DataSource` abstraction would be pure indirection (ponytail: no
+     interface for a plugin loader nobody's asked to use at runtime). Every
+     public function signature is unchanged; zero call-site changes anywhere.
+  2. **Out-of-core storage: step 1 DONE, remainder investigated-not-built.**
+     `Model::measure_dependency_closure` + `ModelStore::load_partial` (the
+     design doc's recommended first step) now load only a bounded operation's
+     dependency closure, not the whole model — wired into CLI `eval`/`show`.
+     `engine::dataflow`/`engine::session` needed zero changes (proven by a
+     full-vs-partial `evaluate()` parity test). This does NOT raise the
+     hard memory ceiling for an operation that touches the whole model by
+     definition (a grand total, `stream`'s arbitrary-measure edits) — only
+     for the common case (one measure's formula chain) does it avoid loading
+     data the operation never touches. Empirically-verified whole-model
+     ceiling is still **5,000,000 cells** in-memory (~3.5GB peak RSS,
+     ~2.5-4 min `evaluate()`; `cargo test -p improv_engine --test stress --
+     --ignored --nocapture scale_evaluate_5m`); 10M is estimated (~7GB RSS)
+     but was not run to avoid risking an OOM. Dimension-partitioning (3a) and
+     waiting on DD to grow disk-spilling (3b) remain un-built, per the design
+     doc at `.agent/steering/AGENT_OUT_OF_CORE_DESIGN.md`.
+  3. **GUI import/export wizards: DONE.** A toggle-able Import/Export CSV
+     window in the GUI (dimension-mapping rows, pure builders); a TUI
+     `I`/`E` command prompt. (Same landing as the Phase A CSV item above.)
+  4. **Hosted refresh-scheduler service: DONE.** `improv-server` now runs the
+     same due-measure/refresh loop as the CLI's `serve-refresh` daemon as a
+     background tokio task (`IMPROV_SCHEDULER`/`IMPROV_SCHEDULER_TICK_SECS`),
+     so CALL measures refresh automatically while the API runs, no separate
+     process needed. `GET /scheduler/status` (bearer-protected) reports it.
+     SQL-sourced measures stay CLI-only (`SqlSource` carries no connection
+     string on the model; inventing one would be scope creep).
+  5. **`improv stream` (stdin→stdout incremental compute): DONE.**
+     `improv stream <db> <target-measure> [...]` reads
+     `<measure> <value> [Cat=Item,...]` lines from stdin (measure by id or
+     name), applies each via the live `session::Engine::set`/`apply`
+     (delta-only recompute, not a full reload/re-eval per line), and prints
+     only the CHANGED cells of the target measure(s) to stdout as
+     `<measure> <Cat=Item,...> = <value>` — diffed against the prior
+     snapshot host-side (the engine itself always returns a full snapshot).
+     A malformed line warns on stderr and is skipped, not fatal; on EOF the
+     final state saves back to `<db>`. Verified end to end:
+     `producer | improv stream model.db Revenue | consumer`. 3 new tests
+     (pure `resolve_measure`/`apply_stream_line`/diff logic; no process
+     spawning needed — `apply_stream_line` takes the `Model`+`Engine`
+     directly, the natural test seam).
+
+Phase status is tracked per-item above as it lands.
